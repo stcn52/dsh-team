@@ -726,7 +726,7 @@ var TeamError = class extends Error {
 * authorization, the shared task list, and the team lifecycle.
 *
 * Teammates are NOT a private runtime. Each one is a continuable subagent of
-* the leader (`ctx.subagents.startContinuable`), so the harness owns identity,
+* the leader (`ctx.subagents.startActivation`), so the harness owns identity,
 * residency, cold resume after a restart, interrupt, and the `origin:
 * 'subagent'` session header that keeps a teammate out of the session tree and
 * out of generic Host routing. What this service adds is what the subagent
@@ -845,7 +845,7 @@ var TeamService = class extends Service {
 		this.pending.set(leader.id, pending);
 		let childId;
 		try {
-			childId = (await this.ctx.subagents.startContinuable({
+			childId = (await this.ctx.subagents.startActivation({
 				provider: this.config.provider,
 				label: request.role === void 0 ? request.name : `${request.name} (${request.role})`,
 				request: {
@@ -857,7 +857,8 @@ var TeamService = class extends Service {
 					...request.persona !== void 0 ? { persona: request.persona } : {},
 					...Object.keys(agentOptions).length > 0 ? { agentOptions } : {}
 				},
-				signal
+				signal,
+				delivery: "parent"
 			})).childId;
 		} catch (error) {
 			for (const claimed of pending.claimed) team.members.delete(claimed);

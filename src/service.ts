@@ -3,7 +3,7 @@
  * authorization, the shared task list, and the team lifecycle.
  *
  * Teammates are NOT a private runtime. Each one is a continuable subagent of
- * the leader (`ctx.subagents.startContinuable`), so the harness owns identity,
+ * the leader (`ctx.subagents.startActivation`), so the harness owns identity,
  * residency, cold resume after a restart, interrupt, and the `origin:
  * 'subagent'` session header that keeps a teammate out of the session tree and
  * out of generic Host routing. What this service adds is what the subagent
@@ -227,7 +227,7 @@ export class TeamService extends Service {
     this.pending.set(leader.id, pending)
     let childId: SessionIdType
     try {
-      const started = await this.ctx.subagents.startContinuable({
+      const started = await this.ctx.subagents.startActivation({
         provider: this.config.provider,
         label: request.role === undefined ? request.name : `${request.name} (${request.role})`,
         request: {
@@ -237,6 +237,9 @@ export class TeamService extends Service {
           ...Object.keys(agentOptions).length > 0 ? { agentOptions } : {},
         },
         signal,
+        // DSH 0.2.1: startActivation replaced startContinuable; parenting delivery
+        // matches the old continuable behaviour (the leader's model is notified).
+        delivery: 'parent',
       })
       childId = started.childId
     } catch (error: unknown) {
