@@ -226,15 +226,6 @@ export class FakeLlm {
   }
 }
 
-/** The `ctx.skills` double: just the catalog read the team validates spawns against. */
-export class FakeSkills {
-  constructor(private readonly names: readonly string[] = ['deep-brief']) {}
-
-  async list(): Promise<Array<{ name: string }>> {
-    return await Promise.resolve(this.names.map(name => ({ name })))
-  }
-}
-
 /** One tool registration a scoped registry double accepted. */
 export interface RegisteredTool {
   readonly name: string

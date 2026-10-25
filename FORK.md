@@ -40,14 +40,14 @@ with `this.ctx.subagents.startContinuable is not a function`.
 - `0.2.15` — per-member skills:
   - `team_spawn` takes `skills: [...]`, the skill names that teammate must load
     before working; each member carries only what its own job needs.
-  - an unknown name is refused at spawn (`UNKNOWN_SKILL`); a deployment with no
-    mounted skill catalog leaves the assignment advisory instead of refusing.
+  - the assignment is advisory by design: the plugin cannot see the catalog a
+    session's own preset mounts (preset-scoped services), so names are checked by
+    the member's `skill` tool in its own turn rather than refused at spawn.
   - the assignment rides the roster row (folded, projected, shown by the team
     tools) and the teammate's own briefing tells it to load those skills first.
-  - the spawn validates against the LEADER's catalog, not the root service:
-    presets isolate services per agent, so the root registry can be empty while
-    the session's own catalog is full. An empty catalog leaves the assignment
-    advisory instead of refusing every name.
+  - dropped the spawn-time name check: even the leader's service handle resolved
+    a catalog without the user-level skills, and refusing valid names is worse
+    than letting the member report a missing one itself.
 
 `dist/` is committed, so installing straight from git needs no build step.
 

@@ -228,7 +228,6 @@ export class TeamService extends Service {
     if (findByName(team, request.name) !== undefined) throw new TeamError('DUPLICATE_NAME', request.name)
     const route = this.resolveRoute(leader, request)
     await this.assertProviderRegistered(leader, route.provider)
-    await this.assertSkillsKnown(leader, request.skills)
     await this.assertEffortOffered(leader, request, route)
     const agentOptions: AgentOptions = {
       ...route.provider !== undefined ? { provider: route.provider } : {},
@@ -684,35 +683,6 @@ export class TeamService extends Service {
       'UNKNOWN_PROVIDER',
       `${provider}; registered: ${registered.map(entry => entry.id).join(', ')}`,
     )
-  }
-
-  /**
-   * Reject a spawn that names a skill this deployment does not publish, before
-   * the teammate starts looking for it. A catalog that is absent or unreadable
-   * leaves the assignment advisory: the member still finds whatever its own
-   * catalog offers, so a missing registry must not refuse the spawn.
-   * @param skills - the names the leader assigned, if any.
-   */
-  private async assertSkillsKnown(leader: Agent, skills: readonly string[] | undefined): Promise<void> {
-    if (skills === undefined || skills.length === 0) return
-    // The catalog that matters is the one the LEADER sees: presets isolate
-    // services per agent, so the root context can expose an empty registry even
-    // while the session's own catalog is full.
-    const catalog = leader.ctx.get('skills') ?? this.ctx.get('skills')
-    if (catalog === undefined) return
-    let published: readonly { name: string }[]
-    try {
-      published = await catalog.list()
-    } catch {
-      return
-    }
-    // No provider produced a catalog: the assignment stays advisory rather than
-    // refusing every name against an empty list.
-    if (published.length === 0) return
-    const names = new Set(published.map(skill => skill.name))
-    const missing = skills.filter(skill => !names.has(skill))
-    if (missing.length === 0) return
-    throw new TeamError('UNKNOWN_SKILL', missing.join(', '))
   }
 
   /**

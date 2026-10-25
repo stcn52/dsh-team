@@ -11,7 +11,7 @@ import { TeamError } from '../src/errors.ts'
 import { TeamService } from '../src/service.ts'
 import type { TeamConfig } from '../src/config.ts'
 import {
-  FakeAgents, FakeLlm, FakeSkills, FakeSubagents, fakeAgent, toolResultEvent, type FakeAgent,
+  FakeAgents, FakeLlm, FakeSubagents, fakeAgent, toolResultEvent, type FakeAgent,
 } from './harness.ts'
 
 const CONFIG: TeamConfig = {
@@ -56,7 +56,6 @@ function world(options: {
   readonly leader?: FakeAgent
   readonly efforts?: readonly string[]
   readonly providers?: readonly string[]
-  readonly publishedSkills?: readonly string[]
 } = {}): World {
   const ctx = new Context()
   const agents = new FakeAgents(ctx)
@@ -78,10 +77,6 @@ function world(options: {
   if (llm !== undefined) ctx.provide('llm', llm)
   const service = new TeamService(ctx, options.config ?? CONFIG)
   const leader = agents.add(options.leader ?? fakeAgent('leader-1', { provider: 'deepseek', model: 'chat' }))
-  // Presets isolate services per agent: the catalog that counts is the leader's own.
-  if (options.publishedSkills !== undefined) {
-    leader.ctx.provide('skills', new FakeSkills(options.publishedSkills) as never)
-  }
   return { ctx, service, agents, subagents, leader, ...llm !== undefined ? { llm } : {} }
 }
 
@@ -273,7 +268,7 @@ describe('provider routing', () => {
 
 describe('assigned skills', () => {
   it('records the skills a leader assigned, per member', async () => {
-    const scene = world({ publishedSkills: ['deep-brief', 'requirements', 'design'] })
+    const scene = world()
     await spawn(scene, 'Alice', { skills: ['deep-brief'] })
     await spawn(scene, 'Bob', { skills: ['requirements', 'design'] })
 
@@ -284,36 +279,14 @@ describe('assigned skills', () => {
     ])
   })
 
-  it('refuses a skill the catalog does not publish, before any child starts', async () => {
-    const scene = world({ publishedSkills: ['deep-brief'] })
-    await expect(spawn(scene, 'Alice', { skills: ['deep-brief', 'no-such-skill'] }))
-      .rejects.toMatchObject({ code: 'UNKNOWN_SKILL' })
-    await expect(spawn(scene, 'Alice', { skills: ['no-such-skill'] }))
-      .rejects.toThrow(/no-such-skill/)
-    expect(scene.subagents.started).toHaveLength(0)
-  })
-
-  it('validates against the leader catalog even when the root registry is empty', async () => {
-    const scene = world({ publishedSkills: ['deep-brief'] })
-    scene.ctx.provide('skills', new FakeSkills([]) as never)
-    await expect(spawn(scene, 'Alice', { skills: ['deep-brief'] })).resolves.toBeDefined()
-    await expect(spawn(scene, 'Bob', { skills: ['nope'] })).rejects.toMatchObject({ code: 'UNKNOWN_SKILL' })
-  })
-
-  it('leaves the assignment advisory when the catalog has no provider behind it', async () => {
+  it('keeps the names as given, so the member can check them with its own skill tool', async () => {
     const scene = world()
-    scene.leader.ctx.provide('skills', new FakeSkills([]) as never)
-    await expect(spawn(scene, 'Alice', { skills: ['anything'] })).resolves.toBeDefined()
-  })
-
-  it('leaves the assignment advisory when no skill catalog is mounted', async () => {
-    const scene = world()
-    await expect(spawn(scene, 'Alice', { skills: ['deep-brief'] })).resolves.toBeDefined()
-    expect(scene.service.list(scene.leader.agent).members[0]?.skills).toEqual(['deep-brief'])
+    await expect(spawn(scene, 'Alice', { skills: ['no-such-skill'] })).resolves.toBeDefined()
+    expect(scene.service.list(scene.leader.agent).members[0]?.skills).toEqual(['no-such-skill'])
   })
 
   it('keeps a plain spawn free of skills, so nothing implies an assignment', async () => {
-    const scene = world({ publishedSkills: ['deep-brief'] })
+    const scene = world()
     await spawn(scene, 'Alice')
     expect(scene.service.list(scene.leader.agent).members[0]?.skills).toBeUndefined()
   })

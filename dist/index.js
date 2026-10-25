@@ -714,7 +714,6 @@ const MESSAGES = {
 	SELF_MESSAGE: "a member cannot message itself",
 	UNAUTHORIZED: "this team operation is not available to you",
 	UNKNOWN_PROVIDER: "no LLM provider with that id is registered here — spawn with the leader's own route, or name one of the registered providers",
-	UNKNOWN_SKILL: "that skill is not in this deployment's skill catalog — check the name, or omit skills and the teammate works with whatever its own catalog offers",
 	MODEL_REQUIRED: "a teammate on a provider other than the leader's needs an explicit model id: model ids are provider-scoped, so the leader's model usually does not exist on the other route",
 	UNKNOWN_EFFORT: "that reasoning effort is not offered by the selected model",
 	CHAIN_EXHAUSTED: "this conversation has relayed as far as it may between teammates — settle it yourself and report to the leader, which is never refused",
@@ -850,7 +849,6 @@ var TeamService = class extends Service {
 		if (findByName(team, request.name) !== void 0) throw new TeamError("DUPLICATE_NAME", request.name);
 		const route = this.resolveRoute(leader, request);
 		await this.assertProviderRegistered(leader, route.provider);
-		await this.assertSkillsKnown(leader, request.skills);
 		await this.assertEffortOffered(leader, request, route);
 		const agentOptions = {
 			...route.provider !== void 0 ? { provider: route.provider } : {},
@@ -1271,29 +1269,6 @@ var TeamService = class extends Service {
 		throw new TeamError("UNKNOWN_PROVIDER", `${provider}; registered: ${registered.map((entry) => entry.id).join(", ")}`);
 	}
 	/**
-	* Reject a spawn that names a skill this deployment does not publish, before
-	* the teammate starts looking for it. A catalog that is absent or unreadable
-	* leaves the assignment advisory: the member still finds whatever its own
-	* catalog offers, so a missing registry must not refuse the spawn.
-	* @param skills - the names the leader assigned, if any.
-	*/
-	async assertSkillsKnown(leader, skills) {
-		if (skills === void 0 || skills.length === 0) return;
-		const catalog = leader.ctx.get("skills") ?? this.ctx.get("skills");
-		if (catalog === void 0) return;
-		let published;
-		try {
-			published = await catalog.list();
-		} catch {
-			return;
-		}
-		if (published.length === 0) return;
-		const names = new Set(published.map((skill) => skill.name));
-		const missing = skills.filter((skill) => !names.has(skill));
-		if (missing.length === 0) return;
-		throw new TeamError("UNKNOWN_SKILL", missing.join(", "));
-	}
-	/**
 	* Reject a reasoning effort the selected model does not offer, at spawn
 	* rather than on the teammate's every later request. Validation needs an
 	* exact provider/model route: without one the adapter stays the authority.
@@ -1692,7 +1667,7 @@ function spawnTool(ctx) {
 			skills: {
 				type: "array",
 				items: { type: "string" },
-				description: "Optional skill names this teammate must load before working, e.g. [\"deep-brief\"]. Give each member only the skills its job needs; an unknown name is refused at spawn. The rest of the catalog stays readable to it."
+				description: "Optional skill names this teammate must load before working, e.g. [\"deep-brief\"]. Give each member only the skills its job needs; the assignment is recorded on the roster and the member is told to load them first. Names are checked by the member's own skill tool, not here."
 			}
 		},
 		output: {

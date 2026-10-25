@@ -159,8 +159,8 @@ export function spawnTool(ctx: Context): ToolDefinition {
         type: 'array',
         items: { type: 'string' },
         description: 'Optional skill names this teammate must load before working, e.g. ["deep-brief"]. '
-          + 'Give each member only the skills its job needs; an unknown name is refused at spawn. The rest of '
-          + 'the catalog stays readable to it.',
+          + 'Give each member only the skills its job needs; the assignment is recorded on the roster and the '
+          + 'member is told to load them first. Names are checked by the member\'s own skill tool, not here.',
       },
     },
     output: {
