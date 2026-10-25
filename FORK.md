@@ -29,6 +29,14 @@ with `this.ctx.subagents.startContinuable is not a function`.
   - new deployment knobs `teammateProvider` / `teammateModel` default every
     teammate route (empty = inherit the leader's), which is what makes "the
     whole team works on the local model" a two-line profile patch.
+- `0.2.14` — the brain gets what it needs to make that call:
+  - a dynamic `team-routing` system-prompt section on every leader session:
+    the leader's own route, every registered provider at prompt-assembly time,
+    the configured teammate default, and the selection rule (machine-checkable
+    work → cheap/local route, judgement and long chains → frontier route,
+    mixed work → split it).
+  - the brief is rendered per turn, so a provider mounted after the session
+    started is selectable without a restart.
 
 `dist/` is committed, so installing straight from git needs no build step.
 

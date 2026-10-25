@@ -23,6 +23,7 @@ import { teamProjection } from './projection.ts'
 import { TeamService } from './service.ts'
 import { installTeammateWorkspace, installTeammateWorld } from './teammate.ts'
 import { boardTool, dismissTool, listTool, noteTool, relationTool, sendTool, spawnTool, taskTool } from './tools.ts'
+import { installLeaderRouting } from './routing.ts'
 import { TeamWorkspace } from './workspace.ts'
 
 export const name = 'team'
@@ -58,8 +59,9 @@ function leads(agent: Agent): boolean {
  * @param agent - the session agent to equip.
  * @returns the disposer for every registration made here.
  */
-function installLeaderTools(ctx: Context, agent: Agent): () => void {
+function installLeaderTools(ctx: Context, config: TeamConfig, agent: Agent): () => void {
   const disposers = [
+    installLeaderRouting(ctx, config, agent),
     agent.ctx.tools.register(spawnTool(ctx)),
     agent.ctx.tools.register(sendTool(ctx, 'leader')),
     agent.ctx.tools.register(taskTool(ctx)),
@@ -161,7 +163,7 @@ export function apply(ctx: Context, config: TeamConfig): void {
     )
     teamCtx.effect(() => installTeammateWorld(teamCtx), 'team: teammate world')
     teamCtx.effect(
-      () => equipLeaders(teamCtx, agent => installLeaderTools(teamCtx, agent)),
+      () => equipLeaders(teamCtx, agent => installLeaderTools(teamCtx, config, agent)),
       'team: leader tools',
     )
     installWorkspaces(teamCtx, config)

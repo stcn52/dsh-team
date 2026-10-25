@@ -2401,6 +2401,48 @@ function installTeammateWorkspace(ctx, workspace) {
 		};
 	});
 }
+/** How one registered route is named in prose. */
+function routeName(provider, model) {
+	if (provider === void 0) return "the deployment default route";
+	return model === void 0 ? provider : `${provider}/${model}`;
+}
+/**
+* Compose the routing brief for one leader.
+* @param ctx - context that may carry the `llm` service.
+* @param agent - the leader session the brief is written for.
+* @param config - the validated row configuration.
+* @returns prompt text naming the reachable routes and how to choose one.
+*/
+function routingBriefing(ctx, agent, config) {
+	const providers = ctx.get("llm")?.listProviders().map((entry) => entry.id) ?? [];
+	const fallback = config.teammateProvider === "" ? "your own route" : routeName(config.teammateProvider, config.teammateModel === "" ? void 0 : config.teammateModel);
+	return [
+		"Teammate routing — you decide which model each teammate runs on:",
+		`• This session runs on ${routeName(agent.options.provider, agent.options.model)}. A teammate may run on any other route: name provider + model when you spawn it.`,
+		providers.length === 0 ? "• No provider directory is mounted here, so leave the route out and every teammate inherits yours." : `• Routes registered in this deployment: ${providers.join(", ")}.`,
+		`• A spawn that names no route lands on ${fallback}.`,
+		"• Choose by the shape of the work, not by habit:",
+		"  – mechanical, machine-checkable work (inventory, counting, format conversion, summarising logs or test output, template edits, checklist checks) belongs on a cheap or local route;",
+		"  – judgement and long chains (cross-repository design, architecture calls, ambiguous debugging, multi-step planning, anything whose answer you will have to trust) belong on a frontier route;",
+		"  – work that mixes both should be split: collection on the cheap route, conclusion on the frontier route.",
+		"• A different provider needs its own model id; model ids are provider-scoped, and a spawn that omits the model is refused.",
+		"• Put the chosen route and a one-clause reason into the task you give the teammate, so the team record shows why that model got the work."
+	].join("\n");
+}
+/**
+* Register the routing brief on one leader session.
+* @param ctx - context carrying the `llm` service, if any.
+* @param config - the validated row configuration.
+* @param agent - the leader session to equip.
+* @returns the disposer removing the section.
+*/
+function installLeaderRouting(ctx, config, agent) {
+	return agent.ctx.systemPrompt.section({
+		name: "team-routing",
+		order: 117,
+		text: () => routingBriefing(ctx, agent, config)
+	});
+}
 //#endregion
 //#region src/index.ts
 const name = "team";
@@ -2428,8 +2470,9 @@ function leads(agent) {
 * @param agent - the session agent to equip.
 * @returns the disposer for every registration made here.
 */
-function installLeaderTools(ctx, agent) {
+function installLeaderTools(ctx, config, agent) {
 	const disposers = [
+		installLeaderRouting(ctx, config, agent),
 		agent.ctx.tools.register(spawnTool(ctx)),
 		agent.ctx.tools.register(sendTool(ctx, "leader")),
 		agent.ctx.tools.register(taskTool(ctx)),
@@ -2511,7 +2554,7 @@ function apply(ctx, config) {
 	ctx.inject(["team"], (teamCtx) => {
 		teamCtx.effect(() => teamCtx.sessionProjections.register(teamProjection(config.maxRecentMessages)), "team: durable projection unit");
 		teamCtx.effect(() => installTeammateWorld(teamCtx), "team: teammate world");
-		teamCtx.effect(() => equipLeaders(teamCtx, (agent) => installLeaderTools(teamCtx, agent)), "team: leader tools");
+		teamCtx.effect(() => equipLeaders(teamCtx, (agent) => installLeaderTools(teamCtx, config, agent)), "team: leader tools");
 		installWorkspaces(teamCtx, config);
 	});
 }
