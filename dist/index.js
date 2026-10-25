@@ -226,6 +226,7 @@ function readDispatchFact(view, data, time) {
 			const provider = asText$1(args["provider"]);
 			const model = asText$1(args["model"]);
 			const effort = asText$1(args["reasoning_effort"]);
+			const skills = Array.isArray(args["skills"]) ? args["skills"].filter((entry) => typeof entry === "string" && entry.trim().length > 0) : [];
 			return {
 				team: "member-added",
 				member: {
@@ -235,7 +236,8 @@ function readDispatchFact(view, data, time) {
 					...role !== void 0 ? { role } : {},
 					...provider !== void 0 ? { provider } : {},
 					...model !== void 0 ? { model } : {},
-					...effort !== void 0 ? { effort } : {}
+					...effort !== void 0 ? { effort } : {},
+					...skills.length > 0 ? { skills } : {}
 				}
 			};
 		}
@@ -318,6 +320,12 @@ function asRecord(value) {
 function asText(value) {
 	return typeof value === "string" && value.length > 0 ? value : void 0;
 }
+/** Narrow one logged skill list: names only, blank entries dropped. */
+function asSkillNames(value) {
+	if (!Array.isArray(value)) return void 0;
+	const names = value.filter((entry) => typeof entry === "string" && entry.trim().length > 0).map((entry) => entry.trim());
+	return names.length === 0 ? void 0 : names;
+}
 function asCount(value) {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : void 0;
 }
@@ -339,6 +347,7 @@ function readMember(value) {
 	const provider = asText(record["provider"]);
 	const model = asText(record["model"]);
 	const effort = asText(record["effort"]);
+	const skills = asSkillNames(record["skills"]);
 	return {
 		memberId,
 		name,
@@ -346,7 +355,8 @@ function readMember(value) {
 		...role !== void 0 ? { role } : {},
 		...provider !== void 0 ? { provider } : {},
 		...model !== void 0 ? { model } : {},
-		...effort !== void 0 ? { effort } : {}
+		...effort !== void 0 ? { effort } : {},
+		...skills !== void 0 ? { skills } : {}
 	};
 }
 /** Narrow one logged task fact, or reject it whole. */
@@ -635,6 +645,7 @@ const teamViewSchema = z$1.object({
 		provider: z$1.string().optional(),
 		model: z$1.string().optional(),
 		effort: z$1.string().optional(),
+		skills: z$1.array(z$1.string()).optional(),
 		joinedAt: z$1.number()
 	})),
 	tasks: z$1.array(z$1.object({
@@ -703,6 +714,7 @@ const MESSAGES = {
 	SELF_MESSAGE: "a member cannot message itself",
 	UNAUTHORIZED: "this team operation is not available to you",
 	UNKNOWN_PROVIDER: "no LLM provider with that id is registered here — spawn with the leader's own route, or name one of the registered providers",
+	UNKNOWN_SKILL: "that skill is not in this deployment's skill catalog — check the name, or omit skills and the teammate works with whatever its own catalog offers",
 	MODEL_REQUIRED: "a teammate on a provider other than the leader's needs an explicit model id: model ids are provider-scoped, so the leader's model usually does not exist on the other route",
 	UNKNOWN_EFFORT: "that reasoning effort is not offered by the selected model",
 	CHAIN_EXHAUSTED: "this conversation has relayed as far as it may between teammates — settle it yourself and report to the leader, which is never refused",
@@ -838,6 +850,7 @@ var TeamService = class extends Service {
 		if (findByName(team, request.name) !== void 0) throw new TeamError("DUPLICATE_NAME", request.name);
 		const route = this.resolveRoute(leader, request);
 		await this.assertProviderRegistered(leader, route.provider);
+		await this.assertSkillsKnown(request.skills);
 		await this.assertEffortOffered(leader, request, route);
 		const agentOptions = {
 			...route.provider !== void 0 ? { provider: route.provider } : {},
@@ -851,7 +864,8 @@ var TeamService = class extends Service {
 				...request.role !== void 0 ? { role: request.role } : {},
 				...route.provider !== void 0 ? { provider: route.provider } : {},
 				...route.model !== void 0 ? { model: route.model } : {},
-				...request.reasoningEffort !== void 0 ? { effort: request.reasoningEffort } : {}
+				...request.reasoningEffort !== void 0 ? { effort: request.reasoningEffort } : {},
+				...request.skills !== void 0 && request.skills.length > 0 ? { skills: [...request.skills] } : {}
 			},
 			claimed: []
 		};
@@ -1257,6 +1271,28 @@ var TeamService = class extends Service {
 		throw new TeamError("UNKNOWN_PROVIDER", `${provider}; registered: ${registered.map((entry) => entry.id).join(", ")}`);
 	}
 	/**
+	* Reject a spawn that names a skill this deployment does not publish, before
+	* the teammate starts looking for it. A catalog that is absent or unreadable
+	* leaves the assignment advisory: the member still finds whatever its own
+	* catalog offers, so a missing registry must not refuse the spawn.
+	* @param skills - the names the leader assigned, if any.
+	*/
+	async assertSkillsKnown(skills) {
+		if (skills === void 0 || skills.length === 0) return;
+		const catalog = this.ctx.get("skills");
+		if (catalog === void 0) return;
+		let published;
+		try {
+			published = await catalog.list();
+		} catch {
+			return;
+		}
+		const names = new Set(published.map((skill) => skill.name));
+		const missing = skills.filter((skill) => !names.has(skill));
+		if (missing.length === 0) return;
+		throw new TeamError("UNKNOWN_SKILL", missing.join(", "));
+	}
+	/**
 	* Reject a reasoning effort the selected model does not offer, at spawn
 	* rather than on the teammate's every later request. Validation needs an
 	* exact provider/model route: without one the adapter stays the authority.
@@ -1307,7 +1343,8 @@ function memberFact(member) {
 		...member.role !== void 0 ? { role: member.role } : {},
 		...member.provider !== void 0 ? { provider: member.provider } : {},
 		...member.model !== void 0 ? { model: member.model } : {},
-		...member.effort !== void 0 ? { effort: member.effort } : {}
+		...member.effort !== void 0 ? { effort: member.effort } : {},
+		...member.skills !== void 0 ? { skills: [...member.skills] } : {}
 	};
 }
 /** One ordered pair, as the chain ledger keys it. */
@@ -1537,7 +1574,11 @@ const MEMBER_PROPERTIES = {
 	},
 	provider: { type: "string" },
 	model: { type: "string" },
-	effort: { type: "string" }
+	effort: { type: "string" },
+	skills: {
+		type: "array",
+		items: { type: "string" }
+	}
 };
 /** Task facts as one output value and one durable fact share them. */
 const TASK_PROPERTIES = {
@@ -1570,7 +1611,8 @@ function memberValue(member) {
 		...member.role !== void 0 ? { role: member.role } : {},
 		...member.provider !== void 0 ? { provider: member.provider } : {},
 		...member.model !== void 0 ? { model: member.model } : {},
-		...member.effort !== void 0 ? { effort: member.effort } : {}
+		...member.effort !== void 0 ? { effort: member.effort } : {},
+		...member.skills !== void 0 ? { skills: member.skills } : {}
 	};
 }
 /**
@@ -1645,6 +1687,11 @@ function spawnTool(ctx) {
 			reasoning_effort: {
 				type: "string",
 				description: "Optional provider-owned reasoning effort for this teammate, e.g. high. Rejected when the model does not offer it."
+			},
+			skills: {
+				type: "array",
+				items: { type: "string" },
+				description: "Optional skill names this teammate must load before working, e.g. [\"deep-brief\"]. Give each member only the skills its job needs; an unknown name is refused at spawn. The rest of the catalog stays readable to it."
 			}
 		},
 		output: {
@@ -1680,7 +1727,8 @@ function spawnTool(ctx) {
 				...args.persona !== void 0 ? { persona: args.persona } : {},
 				...args.provider !== void 0 ? { provider: args.provider } : {},
 				...args.model !== void 0 ? { model: args.model } : {},
-				...args.reasoning_effort !== void 0 ? { reasoningEffort: args.reasoning_effort } : {}
+				...args.reasoning_effort !== void 0 ? { reasoningEffort: args.reasoning_effort } : {},
+				...args.skills !== void 0 ? { skills: args.skills } : {}
 			}, exec.signal));
 		}
 	}));
@@ -2325,12 +2373,14 @@ function briefing(ctx, team, child) {
 	const identity = self.role === void 0 ? `You are ${self.name}, a teammate on an agent team.` : `You are ${self.name}, the ${self.role} on an agent team.`;
 	const reach = self.relation === "peer" ? "You are a peer member: team_send reaches the leader (\"leader\") and any teammate by name." : "You are a managed member: team_send reaches the leader (\"leader\") only.";
 	const list = others.length === 0 ? "You are currently the only teammate." : `The rest of the team: ${others.map(memberLine).join("; ")}.`;
+	const assigned = self.skills === void 0 || self.skills.length === 0 ? void 0 : `Skills your leader assigned you for this job: ${self.skills.join(", ")}. Load each one with the skill tool before you start — they carry the method, not just background reading.`;
 	const mine = team.list(child).tasks.filter((task) => task.assigneeId === self.memberId && task.status !== "done");
 	return [
 		identity,
 		reach,
 		list,
 		mine.length === 0 ? "No task on the shared list is assigned to you right now." : `Assigned to you on the shared task list: ${mine.map((task) => `${task.taskId} "${task.title}"`).join("; ")}.`,
+		...assigned === void 0 ? [] : [assigned],
 		"Nobody sees your session but you, so deliver results to the leader with team_send — a self-contained answer, not \"done\". Use team_send when you need something FROM a member mid-task; the reply arrives later as its own turn, so do not wait for it in place. team_list shows the roster, the shared task list, and recent traffic. When you have sent the outcome, stop and wait for the next message instead of starting work nobody asked for. A conversation between teammates is budgeted: it may only relay so far and one pair may not keep trading messages inside it, so put everything you need into one message rather than negotiating. Reaching the leader is never refused — when an exchange with a peer stops converging, say so to the leader and move on."
 	].join("\n");
 }

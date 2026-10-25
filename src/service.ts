@@ -28,6 +28,7 @@ import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import type {} from '@deepseek-ai/dsh-session-projection'
@@ -92,6 +93,12 @@ export interface TeamSpawnRequest {
   readonly provider?: string
   readonly model?: string
   readonly reasoningEffort?: string
+  /**
+   * Skills this teammate must load before working. Each member carries only the
+   * skills its own job needs; the catalog stays readable, so it may still find
+   * more, but the leader's assignment is what it is told to put first.
+   */
+  readonly skills?: readonly string[]
 }
 
 /** The route one spawn resolves to, after request and deployment defaults. */
@@ -221,6 +228,7 @@ export class TeamService extends Service {
     if (findByName(team, request.name) !== undefined) throw new TeamError('DUPLICATE_NAME', request.name)
     const route = this.resolveRoute(leader, request)
     await this.assertProviderRegistered(leader, route.provider)
+    await this.assertSkillsKnown(request.skills)
     await this.assertEffortOffered(leader, request, route)
     const agentOptions: AgentOptions = {
       ...route.provider !== undefined ? { provider: route.provider } : {},
@@ -237,6 +245,7 @@ export class TeamService extends Service {
         ...route.provider !== undefined ? { provider: route.provider } : {},
         ...route.model !== undefined ? { model: route.model } : {},
         ...request.reasoningEffort !== undefined ? { effort: request.reasoningEffort } : {},
+        ...request.skills !== undefined && request.skills.length > 0 ? { skills: [...request.skills] } : {},
       },
       claimed: [],
     }
@@ -678,6 +687,29 @@ export class TeamService extends Service {
   }
 
   /**
+   * Reject a spawn that names a skill this deployment does not publish, before
+   * the teammate starts looking for it. A catalog that is absent or unreadable
+   * leaves the assignment advisory: the member still finds whatever its own
+   * catalog offers, so a missing registry must not refuse the spawn.
+   * @param skills - the names the leader assigned, if any.
+   */
+  private async assertSkillsKnown(skills: readonly string[] | undefined): Promise<void> {
+    if (skills === undefined || skills.length === 0) return
+    const catalog = this.ctx.get('skills')
+    if (catalog === undefined) return
+    let published: readonly { name: string }[]
+    try {
+      published = await catalog.list()
+    } catch {
+      return
+    }
+    const names = new Set(published.map(skill => skill.name))
+    const missing = skills.filter(skill => !names.has(skill))
+    if (missing.length === 0) return
+    throw new TeamError('UNKNOWN_SKILL', missing.join(', '))
+  }
+
+  /**
    * Reject a reasoning effort the selected model does not offer, at spawn
    * rather than on the teammate's every later request. Validation needs an
    * exact provider/model route: without one the adapter stays the authority.
@@ -743,6 +775,7 @@ function memberFact(member: TeamMemberView): TeamMemberFact {
     ...member.provider !== undefined ? { provider: member.provider } : {},
     ...member.model !== undefined ? { model: member.model } : {},
     ...member.effort !== undefined ? { effort: member.effort } : {},
+    ...member.skills !== undefined ? { skills: [...member.skills] } : {},
   }
 }
 

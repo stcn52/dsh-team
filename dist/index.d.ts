@@ -76,6 +76,8 @@ interface TeamMemberView {
   readonly model?: string;
   /** Provider-owned reasoning effort recorded at spawn, when one was requested. */
   readonly effort?: string;
+  /** Skill names the leader assigned to this teammate at spawn, in the order given. */
+  readonly skills?: string[];
   /** Epoch ms of the spawn that added this member. */
   readonly joinedAt: number;
 }
@@ -179,6 +181,7 @@ interface TeamMemberFact {
   readonly provider?: string;
   readonly model?: string;
   readonly effort?: string;
+  readonly skills?: string[];
 }
 /**
  * One settled team-tool result, projected through `presentationMeta`. Every
@@ -261,6 +264,12 @@ interface TeamSpawnRequest {
   readonly provider?: string;
   readonly model?: string;
   readonly reasoningEffort?: string;
+  /**
+   * Skills this teammate must load before working. Each member carries only the
+   * skills its own job needs; the catalog stays readable, so it may still find
+   * more, but the leader's assignment is what it is told to put first.
+   */
+  readonly skills?: readonly string[];
 }
 /** One roster row with its live runtime state. */
 interface TeamMemberStatusView extends TeamMemberView {
@@ -467,6 +476,14 @@ declare class TeamService extends Service {
    */
   private assertProviderRegistered;
   /**
+   * Reject a spawn that names a skill this deployment does not publish, before
+   * the teammate starts looking for it. A catalog that is absent or unreadable
+   * leaves the assignment advisory: the member still finds whatever its own
+   * catalog offers, so a missing registry must not refuse the spawn.
+   * @param skills - the names the leader assigned, if any.
+   */
+  private assertSkillsKnown;
+  /**
    * Reject a reasoning effort the selected model does not offer, at spawn
    * rather than on the teammate's every later request. Validation needs an
    * exact provider/model route: without one the adapter stays the authority.
@@ -491,7 +508,7 @@ declare class TeamService extends Service {
  * @module dsh-team/errors
  */
 /** Every way a team operation refuses. */
-type TeamErrorCode = 'NO_TEAM' | 'LEADER_AWAY' | 'NESTED_TEAM' | 'MAX_TEAMMATES' | 'DUPLICATE_NAME' | 'UNKNOWN_MEMBER' | 'UNKNOWN_TASK' | 'TASK_TITLE_REQUIRED' | 'SELF_MESSAGE' | 'UNAUTHORIZED' | 'UNKNOWN_PROVIDER' | 'MODEL_REQUIRED' | 'UNKNOWN_EFFORT' | 'CHAIN_EXHAUSTED' | 'PING_PONG' | 'REPEATED_MESSAGE' | 'INVALID_NOTE_KEY' | 'NOTE_TOO_LONG' | 'WORKSPACE_FULL' | 'UNKNOWN_NOTE';
+type TeamErrorCode = 'NO_TEAM' | 'LEADER_AWAY' | 'NESTED_TEAM' | 'MAX_TEAMMATES' | 'DUPLICATE_NAME' | 'UNKNOWN_MEMBER' | 'UNKNOWN_TASK' | 'TASK_TITLE_REQUIRED' | 'SELF_MESSAGE' | 'UNAUTHORIZED' | 'UNKNOWN_PROVIDER' | 'UNKNOWN_SKILL' | 'MODEL_REQUIRED' | 'UNKNOWN_EFFORT' | 'CHAIN_EXHAUSTED' | 'PING_PONG' | 'REPEATED_MESSAGE' | 'INVALID_NOTE_KEY' | 'NOTE_TOO_LONG' | 'WORKSPACE_FULL' | 'UNKNOWN_NOTE';
 /** One refused team operation. */
 declare class TeamError extends Error {
   readonly code: TeamErrorCode;

@@ -156,6 +156,9 @@ export function readDispatchFact(view: TeamView, data: unknown, time: number): u
       const provider = asText(args['provider'])
       const model = asText(args['model'])
       const effort = asText(args['reasoning_effort'])
+      const skills = Array.isArray(args['skills'])
+        ? args['skills'].filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+        : []
       return {
         team: 'member-added',
         member: {
@@ -166,6 +169,7 @@ export function readDispatchFact(view: TeamView, data: unknown, time: number): u
           ...provider !== undefined ? { provider } : {},
           ...model !== undefined ? { model } : {},
           ...effort !== undefined ? { effort } : {},
+          ...skills.length > 0 ? { skills } : {},
         },
       }
     }

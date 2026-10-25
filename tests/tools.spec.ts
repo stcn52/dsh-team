@@ -100,13 +100,13 @@ describe('team_spawn', () => {
     const tool = spawnTool(ctx)
     const value = await run(tool, {
       name: 'Alice', task: 'review the diff', relation: 'peer', role: 'reviewer',
-      persona: 'terse', provider: 'qwen-local', model: 'qwen3.8', reasoning_effort: 'high',
+      persona: 'terse', provider: 'qwen-local', model: 'qwen3.8', reasoning_effort: 'high', skills: ['deep-brief'],
     }, leader)
 
     expect(team.calls[0]?.op).toBe('spawn')
     expect(team.calls[0]?.args[1]).toEqual({
       name: 'Alice', task: 'review the diff', relation: 'peer', role: 'reviewer',
-      persona: 'terse', provider: 'qwen-local', model: 'qwen3.8', reasoningEffort: 'high',
+      persona: 'terse', provider: 'qwen-local', model: 'qwen3.8', reasoningEffort: 'high', skills: ['deep-brief'],
     })
     expect(value).toEqual({
       memberId: 'child-1', name: 'Alice', role: 'reviewer', relation: 'peer', model: 'reasoner',
@@ -128,6 +128,12 @@ describe('team_spawn', () => {
     const properties = (spawnTool(ctx).parameters?.properties ?? {}) as Record<string, unknown>
     expect(Object.keys(properties)).toContain('provider')
     expect(JSON.stringify(properties['provider'])).toContain('qwen-local')
+  })
+
+  it('declares the per-member skill assignment', () => {
+    const properties = (spawnTool(ctx).parameters?.properties ?? {}) as Record<string, unknown>
+    expect(Object.keys(properties)).toContain('skills')
+    expect(JSON.stringify(properties['skills'])).toContain('deep-brief')
   })
 
   it('rejects arguments the model got wrong before reaching the service', async () => {

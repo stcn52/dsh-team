@@ -11,7 +11,7 @@ import { TeamError } from '../src/errors.ts'
 import { TeamService } from '../src/service.ts'
 import type { TeamConfig } from '../src/config.ts'
 import {
-  FakeAgents, FakeLlm, FakeSubagents, fakeAgent, toolResultEvent, type FakeAgent,
+  FakeAgents, FakeLlm, FakeSkills, FakeSubagents, fakeAgent, toolResultEvent, type FakeAgent,
 } from './harness.ts'
 
 const CONFIG: TeamConfig = {
@@ -56,6 +56,7 @@ function world(options: {
   readonly leader?: FakeAgent
   readonly efforts?: readonly string[]
   readonly providers?: readonly string[]
+  readonly publishedSkills?: readonly string[]
 } = {}): World {
   const ctx = new Context()
   const agents = new FakeAgents(ctx)
@@ -75,6 +76,9 @@ function world(options: {
     ? undefined
     : new FakeLlm(options.efforts ?? [], options.providers)
   if (llm !== undefined) ctx.provide('llm', llm)
+  if (options.publishedSkills !== undefined) {
+    ctx.provide('skills', new FakeSkills(options.publishedSkills) as never)
+  }
   const service = new TeamService(ctx, options.config ?? CONFIG)
   const leader = agents.add(options.leader ?? fakeAgent('leader-1', { provider: 'deepseek', model: 'chat' }))
   return { ctx, service, agents, subagents, leader, ...llm !== undefined ? { llm } : {} }
@@ -88,6 +92,7 @@ async function spawn(scene: World, name: string, options: {
   readonly provider?: string
   readonly model?: string
   readonly effort?: string
+  readonly skills?: readonly string[]
 } = {}): Promise<FakeAgent> {
   scene.subagents.nextChildId = options.childId ?? `child-${scene.subagents.started.length + 1}`
   const member = await scene.service.spawn(scene.leader.agent, {
@@ -98,6 +103,7 @@ async function spawn(scene: World, name: string, options: {
     ...options.provider !== undefined ? { provider: options.provider } : {},
     ...options.model !== undefined ? { model: options.model } : {},
     ...options.effort !== undefined ? { reasoningEffort: options.effort } : {},
+    ...options.skills !== undefined ? { skills: options.skills } : {},
   }, signal)
   const child = scene.agents.getFake(member.memberId)
   if (child === undefined) throw new Error(`published child ${member.memberId} is missing`)
@@ -261,6 +267,41 @@ describe('provider routing', () => {
     const scene = world({ efforts: ['low'], providers: ['deepseek', 'qwen-local'] })
     await spawn(scene, 'Alice', { provider: 'qwen-local', model: 'qwen3.8', effort: 'low' })
     expect(scene.llm?.resolved).toEqual([{ provider: 'qwen-local', model: 'qwen3.8' }])
+  })
+})
+
+describe('assigned skills', () => {
+  it('records the skills a leader assigned, per member', async () => {
+    const scene = world({ publishedSkills: ['deep-brief', 'requirements', 'design'] })
+    await spawn(scene, 'Alice', { skills: ['deep-brief'] })
+    await spawn(scene, 'Bob', { skills: ['requirements', 'design'] })
+
+    const members = scene.service.list(scene.leader.agent).members
+    expect(members.map(member => member.skills)).toEqual([
+      ['deep-brief'],
+      ['requirements', 'design'],
+    ])
+  })
+
+  it('refuses a skill the catalog does not publish, before any child starts', async () => {
+    const scene = world({ publishedSkills: ['deep-brief'] })
+    await expect(spawn(scene, 'Alice', { skills: ['deep-brief', 'no-such-skill'] }))
+      .rejects.toMatchObject({ code: 'UNKNOWN_SKILL' })
+    await expect(spawn(scene, 'Alice', { skills: ['no-such-skill'] }))
+      .rejects.toThrow(/no-such-skill/)
+    expect(scene.subagents.started).toHaveLength(0)
+  })
+
+  it('leaves the assignment advisory when no skill catalog is mounted', async () => {
+    const scene = world()
+    await expect(spawn(scene, 'Alice', { skills: ['deep-brief'] })).resolves.toBeDefined()
+    expect(scene.service.list(scene.leader.agent).members[0]?.skills).toEqual(['deep-brief'])
+  })
+
+  it('keeps a plain spawn free of skills, so nothing implies an assignment', async () => {
+    const scene = world({ publishedSkills: ['deep-brief'] })
+    await spawn(scene, 'Alice')
+    expect(scene.service.list(scene.leader.agent).members[0]?.skills).toBeUndefined()
   })
 })
 

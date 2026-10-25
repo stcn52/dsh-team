@@ -115,6 +115,10 @@ function briefing(ctx: Context, team: TeamService, child: Agent): string {
   const list = others.length === 0
     ? 'You are currently the only teammate.'
     : `The rest of the team: ${others.map(memberLine).join('; ')}.`
+  const assigned = self.skills === undefined || self.skills.length === 0
+    ? undefined
+    : `Skills your leader assigned you for this job: ${self.skills.join(', ')}. Load each one with the skill tool `
+      + 'before you start — they carry the method, not just background reading.'
   const mine = team.list(child).tasks.filter(task => task.assigneeId === self.memberId && task.status !== 'done')
   const tasks = mine.length === 0
     ? 'No task on the shared list is assigned to you right now.'
@@ -124,6 +128,7 @@ function briefing(ctx: Context, team: TeamService, child: Agent): string {
     reach,
     list,
     tasks,
+    ...assigned === undefined ? [] : [assigned],
     'Nobody sees your session but you, so deliver results to the leader with team_send — a self-contained answer, '
     + 'not "done". Use team_send when you need something FROM a member mid-task; the reply arrives later as its '
     + 'own turn, so do not wait for it in place. team_list shows the roster, the shared task list, and recent '

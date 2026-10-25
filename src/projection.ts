@@ -27,6 +27,7 @@ const teamViewSchema = z.object({
     provider: z.string().optional(),
     model: z.string().optional(),
     effort: z.string().optional(),
+    skills: z.array(z.string()).optional(),
     joinedAt: z.number(),
   })),
   tasks: z.array(z.object({

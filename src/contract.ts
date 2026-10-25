@@ -35,6 +35,8 @@ export interface TeamMemberView {
   readonly model?: string
   /** Provider-owned reasoning effort recorded at spawn, when one was requested. */
   readonly effort?: string
+  /** Skill names the leader assigned to this teammate at spawn, in the order given. */
+  readonly skills?: string[]
   /** Epoch ms of the spawn that added this member. */
   readonly joinedAt: number
 }

@@ -32,6 +32,7 @@ export interface TeamMemberFact {
   readonly provider?: string
   readonly model?: string
   readonly effort?: string
+  readonly skills?: string[]
 }
 
 /**
@@ -67,6 +68,14 @@ function asText(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
+/** Narrow one logged skill list: names only, blank entries dropped. */
+function asSkillNames(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const names = value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .map(entry => entry.trim())
+  return names.length === 0 ? undefined : names
+}
+
 function asCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
 }
@@ -91,6 +100,7 @@ function readMember(value: unknown): TeamMemberFact | undefined {
   const provider = asText(record['provider'])
   const model = asText(record['model'])
   const effort = asText(record['effort'])
+  const skills = asSkillNames(record['skills'])
   return {
     memberId,
     name,
@@ -99,6 +109,7 @@ function readMember(value: unknown): TeamMemberFact | undefined {
     ...provider !== undefined ? { provider } : {},
     ...model !== undefined ? { model } : {},
     ...effort !== undefined ? { effort } : {},
+    ...skills !== undefined ? { skills } : {},
   }
 }
 

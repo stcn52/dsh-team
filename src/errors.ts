@@ -19,6 +19,7 @@ export type TeamErrorCode =
   | 'SELF_MESSAGE'
   | 'UNAUTHORIZED'
   | 'UNKNOWN_PROVIDER'
+  | 'UNKNOWN_SKILL'
   | 'MODEL_REQUIRED'
   | 'UNKNOWN_EFFORT'
   | 'CHAIN_EXHAUSTED'
@@ -47,6 +48,9 @@ const MESSAGES: Record<TeamErrorCode, string> = {
   UNKNOWN_PROVIDER:
     'no LLM provider with that id is registered here — spawn with the leader\'s own route, or name one of '
     + 'the registered providers',
+  UNKNOWN_SKILL:
+    'that skill is not in this deployment\'s skill catalog — check the name, or omit skills and the teammate '
+    + 'works with whatever its own catalog offers',
   MODEL_REQUIRED:
     'a teammate on a provider other than the leader\'s needs an explicit model id: model ids are '
     + 'provider-scoped, so the leader\'s model usually does not exist on the other route',

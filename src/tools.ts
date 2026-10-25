@@ -58,6 +58,7 @@ const MEMBER_PROPERTIES = {
   provider: { type: 'string' },
   model: { type: 'string' },
   effort: { type: 'string' },
+  skills: { type: 'array', items: { type: 'string' } },
 } as const
 
 /** Task facts as one output value and one durable fact share them. */
@@ -72,7 +73,7 @@ const TASK_PROPERTIES = {
 /** Drop the undefined optional members a JSON fact must not carry. */
 function memberValue(member: TeamMemberFact): {
   memberId: string; name: string; role?: string; relation: 'managed' | 'peer'
-  provider?: string; model?: string; effort?: string
+  provider?: string; model?: string; effort?: string; skills?: string[]
 } {
   return {
     memberId: member.memberId,
@@ -82,6 +83,7 @@ function memberValue(member: TeamMemberFact): {
     ...member.provider !== undefined ? { provider: member.provider } : {},
     ...member.model !== undefined ? { model: member.model } : {},
     ...member.effort !== undefined ? { effort: member.effort } : {},
+    ...member.skills !== undefined ? { skills: member.skills } : {},
   }
 }
 
@@ -153,6 +155,13 @@ export function spawnTool(ctx: Context): ToolDefinition {
           + 'so a local route needs its own model id rather than your model.',
       },
       reasoning_effort: { type: 'string', description: 'Optional provider-owned reasoning effort for this teammate, e.g. high. Rejected when the model does not offer it.' },
+      skills: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Optional skill names this teammate must load before working, e.g. ["deep-brief"]. '
+          + 'Give each member only the skills its job needs; an unknown name is refused at spawn. The rest of '
+          + 'the catalog stays readable to it.',
+      },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: MEMBER_PROPERTIES },
@@ -184,6 +193,7 @@ export function spawnTool(ctx: Context): ToolDefinition {
         ...args.provider !== undefined ? { provider: args.provider } : {},
         ...args.model !== undefined ? { model: args.model } : {},
         ...args.reasoning_effort !== undefined ? { reasoningEffort: args.reasoning_effort } : {},
+        ...args.skills !== undefined ? { skills: args.skills } : {},
       }, exec.signal)
       return memberValue(member)
     },

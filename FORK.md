@@ -37,6 +37,13 @@ with `this.ctx.subagents.startContinuable is not a function`.
     mixed work → split it).
   - the brief is rendered per turn, so a provider mounted after the session
     started is selectable without a restart.
+- `0.2.15` — per-member skills:
+  - `team_spawn` takes `skills: [...]`, the skill names that teammate must load
+    before working; each member carries only what its own job needs.
+  - an unknown name is refused at spawn (`UNKNOWN_SKILL`); a deployment with no
+    mounted skill catalog leaves the assignment advisory instead of refusing.
+  - the assignment rides the roster row (folded, projected, shown by the team
+    tools) and the teammate's own briefing tells it to load those skills first.
 
 `dist/` is committed, so installing straight from git needs no build step.
 

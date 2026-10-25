@@ -36,6 +36,13 @@ describe('readFact', () => {
     expect(readFact({ team: 'message', messageId: 'm1' })).toBeUndefined()
   })
 
+  it('keeps a member\'s assigned skill names, and drops blank entries', () => {
+    const member = { memberId: 'child-1', name: 'Alice', relation: 'peer', skills: ['deep-brief'] }
+    expect(readFact({ team: 'member-added', member })).toEqual({ team: 'member-added', member })
+    expect(readFact({ team: 'member-added', member: { ...member, skills: ['deep-brief', '', 7] } }))
+      .toEqual({ team: 'member-added', member })
+  })
+
   it('folds an unknown fact kind to nothing instead of corrupting the view', () => {
     expect(readFact({ team: 'member-promoted-to-leader', member: alice })).toBeUndefined()
     expect(readFact('member-added')).toBeUndefined()
