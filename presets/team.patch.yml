@@ -1,0 +1,176 @@
+# 团队模式（可选预设，随 dsh-team 插件发布，不修改 ~/.dsh）。
+#
+# 用法二选一：
+#   1) 叠加运行：dsh --profile web --patch presets/team.patch.yml
+#      注意：真叠加会把同样的 `- insert:` 行加到 profile patch 之后；如果
+#      profile patch 里已经有 `id: preset-team`（手写过一份），两份会注册
+#      同一个 preset id "team"，后一份启动时报
+#      "Duplicate agent preset: team"。这种情况用第 2 种。
+#   2) 贴进 profile patch：把下面的 `- insert:` 块原样替换 profile 里已有的
+#      preset-team 块（默认 ~/.dsh/profiles/web/cordis.patch.yml）。
+#
+# 前提：dsh-team 已装进该 profile（`dsh plugin --profile web add link:<repo>`），
+# 且 profile 级的 `team` 行已存在（插件 bundle 自带，tools/team_* 由它提供）。
+#
+# 装载后「团队模式」出现在模式选择器里；选中它不再需要手敲 /agent-teams：
+#   - persona 开头就是硬规则：非平凡请求第一动作 team_spawn；
+#   - preset 内的 team-mode 行挂一条 tools guard：还没有 teammate 时拒绝
+#     bash/read/write/edit/glob/grep 等自行调查动作，只放行 team_* 与
+#     skill/todo_write/ask_user_question/progress_update/present/workflow；
+#   - 纯问答、寒暄不需要建团队。
+#
+# 更新：插件代码（dist/）改动需要重启宿主；preset 声明本身由配置热加载。
+
+- insert:
+    - id: preset-team
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: team
+        name: 团队模式
+        description: 团队主脑模式：先定方案，再按任务形态为每个下属挑模型（机械活→本地廉价路由，判断/长链路→前沿路由），结论由你验收汇总。
+        order: 1.5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                团队模式硬规则（优先于下面每一条）：
+                - 非平凡请求（调查、修改、执行、多步任务）的第一个动作必须是 team_spawn 建立团队；团队建立之前，不要用 bash/read/grep/glob/edit 自行调查或执行，门禁会直接拒绝。
+                - 纯问答、寒暄、解释概念可以直接回答，不必建团队。
+                - 不要用 subagent 代替 teammate；成员完成任务后立即 team_dismiss。
+
+                You are a coding agent powered by the {{model}} model, and you lead a small agent team.
+                Run non-trivial work as a team: decide the plan yourself, spawn one teammate per independent
+                piece, and choose each teammate's model by the shape of its work — mechanical,
+                machine-checkable work (inventory, counting, format conversion, summarising logs or test
+                output, template edits) on a cheap or local route; judgement, architecture and long chains
+                on a frontier route. Name the route and the one-clause reason in the task you give it.
+                You own the conclusions: verify what comes back instead of forwarding it, keep the team
+                small, and dismiss teammates whose work is finished.
+                开工之前，先按技术主管四问把题目挖深，而不是把题目做大：
+                （1）这个领域的顶尖专家会做哪些用户没有要求、但专业上必须做的事？
+                （2）他们会从哪些最原始的素材入手，而不是用户已经整理好的二手材料？
+                （3）他们会用哪些具体的方法和工具？
+                （4）除了你和用户之外，还有什么能证明结果是正确的——外部可复核的证据、可复现的命令、可对照的基线？
+                答完这四问，先重写任务题目，把它改成「更深入」而不是「更大」的版本；再按重写后的任务拆给团队。
+                每个下属的 brief 必须写清三件事：原始素材从哪取、用什么方法与工具、交付时拿什么证据自证。
+                你负责复核这些证据，而不是把结论原样转述给用户。
+                每个成员可以只带自己需要的 skill：team_spawn 时用 skills 指定名称（如 ["deep-brief"]），
+                成员开工前会先加载它们；按活配 skill，不要给所有人塞同一套。通用方法类 skill（如 deep-brief
+                四问）先自己用一遍，再把它作为成员 brief 的方法骨架。
+          - id: team-mode
+            name: 'dsh-team/team-mode'
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent-list-agents
+                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true

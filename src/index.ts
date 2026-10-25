@@ -3,10 +3,12 @@
  *
  * One plugin row, four registrations: the `ctx.team` service, the leader tool
  * set on every ordinary session, the teammate world on every continuable child
- * that belongs to a team, and the human `/agent-teams` slash command.
- * Teammates themselves are `ctx.subagents` continuable children — the harness
- * owns their sessions, residency, cold resume, and the `origin: 'subagent'`
- * classification that keeps them out of the session tree.
+ * that belongs to a team, and the human `/agent-teams` slash command. Over the
+ * storage domain form ride two more durable contributions: the virtual
+ * workspaces (per team) and the member dossiers (per name, outliving every
+ * team). Teammates themselves are `ctx.subagents` continuable children — the
+ * harness owns their sessions, residency, cold resume, and the `origin:
+ * 'subagent'` classification that keeps them out of the session tree.
  *
  * @module dsh-team
  */
@@ -19,10 +21,14 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from './types.ts'
 import { Config, type TeamConfig } from './config.ts'
 import { installCommand } from './command.ts'
+import { MemberDossiers } from './dossier.ts'
 import { teamProjection } from './projection.ts'
 import { TeamService } from './service.ts'
-import { installTeammateWorkspace, installTeammateWorld } from './teammate.ts'
-import { boardTool, dismissTool, listTool, noteTool, relationTool, sendTool, spawnTool, taskTool } from './tools.ts'
+import { installTeammateDossier, installTeammateWorkspace, installTeammateWorld } from './teammate.ts'
+import {
+  boardTool, dismissTool, dossierNameOf, forgetTool, listTool, noteTool, profileTool, relationTool,
+  reviewTool, sendTool, spawnTool, taskTool,
+} from './tools.ts'
 import { installLeaderRouting } from './routing.ts'
 import { TeamWorkspace } from './workspace.ts'
 
@@ -44,6 +50,8 @@ export type { TeamFact, TeamMemberFact } from './fold.ts'
 export { teamProjection } from './projection.ts'
 export { TeamWorkspace, WORKSPACE_DOMAIN, SHARED_AREA } from './workspace.ts'
 export type { WorkspaceEntry } from './workspace.ts'
+export { MemberDossiers, DOSSIER_DOMAIN, REVIEW_EVIDENCE } from './dossier.ts'
+export type { MemberRecord, DossierEntry, DossierKind } from './dossier.ts'
 export * from './contract.ts'
 
 /** A team leader is any ordinary session; a teammate never leads its own team. */
@@ -140,6 +148,40 @@ function installWorkspaces(ctx: Context, config: TeamConfig): void {
 }
 
 /**
+ * The member dossiers, when the deployment composed a storage domain form.
+ * Deliberately its own installation, not a rider on {@link installWorkspaces}:
+ * the workspace is cleared on `team/changed` — notes outlive turns, not teams
+ * — while the dossier must outlive exactly those events. No `team/changed`
+ * handler touches this domain: the record has to survive the team that wrote
+ * it, which is the whole point of keying it by name.
+ * @param ctx - a context whose `team` service is resolved.
+ * @param config - the validated row configuration.
+ */
+function installDossiers(ctx: Context, config: TeamConfig): void {
+  ctx.inject(['storageDomain'], (dossierCtx: Context) => {
+    const dossiers = new MemberDossiers(dossierCtx, config)
+    dossierCtx.effect(() => () => { dossiers.dispose() }, 'team: dossier domain')
+
+    dossierCtx.effect(() => equipLeaders(dossierCtx, agent => {
+      const nameOf = dossierNameOf(dossierCtx)
+      const disposers = [
+        agent.ctx.tools.register(profileTool(dossiers, 'leader', nameOf)),
+        agent.ctx.tools.register(reviewTool(dossiers, nameOf)),
+        agent.ctx.tools.register(forgetTool(dossiers, nameOf)),
+      ]
+      return () => {
+        for (const dispose of disposers.reverse()) dispose()
+      }
+    }), 'team: leader dossier tools')
+
+    dossierCtx.effect(
+      () => installTeammateDossier(dossierCtx, dossiers),
+      'team: teammate dossier world',
+    )
+  })
+}
+
+/**
  * Compose the team capability: the service, the durable projection unit, the
  * teammate world, the per-session leader tools, the virtual workspaces, and
  * the human `/agent-teams` command.
@@ -167,5 +209,6 @@ export function apply(ctx: Context, config: TeamConfig): void {
       'team: leader tools',
     )
     installWorkspaces(teamCtx, config)
+    installDossiers(teamCtx, config)
   })
 }

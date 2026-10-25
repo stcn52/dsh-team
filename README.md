@@ -55,12 +55,36 @@ dsh plugin --profile web remove dsh-team
 - 想看现场，点开「微型世界」页签进入小岛；
 - 想让谁收工、或整个队伍解散，跟主会话说一声即可。
 
+## 团队模式
+
+`/agent-teams` 是「这一次开一队」；**团队模式**是「这个会话一直以团队主脑的方式工作」，不需要每次敲命令。
+
+预设随插件发布，在 [`presets/team.patch.yml`](./presets/team.patch.yml)。装好 dsh-team 后二选一启用：
+
+```sh
+# 方式一：单独叠加一层 patch 启动（不改 profile 文件）
+dsh --profile web --patch presets/team.patch.yml
+
+# 方式二：把文件里的 `- insert:` 块原样贴进你的 profile patch
+#（默认 ~/.dsh/profiles/web/cordis.patch.yml）
+```
+
+> 如果 profile patch 里已经有一份手写的 `preset-team`，请用方式二**替换**它，不要再叠加：同一个 preset id `team` 注册两次会报 `Duplicate agent preset: team`。
+
+启用后，「团队模式」出现在模式选择器里，选中它即可，**不需要 `/agent-teams`**。这个模式由两层构成：
+
+- **硬规则（persona 开头）**：非平凡请求的第一个动作必须是 `team_spawn` 建团队；团队建立前不要用 `bash`/`read`/`grep`/`glob`/`edit` 自行调查；纯问答、寒暄可以直接回答；不要用 `subagent` 代替 teammate。
+- **确定性门禁（preset 内的 `team-mode` 行）**：还没有 teammate 时，任何非白名单工具都被 `tools.guard` 拒绝，理由固定为「团队模式：还没有 teammate。先用 team_spawn 建团队，再调查/执行；纯问答可以直接回答。」白名单是全部 `team_*` 加上 `skill`、`todo_write`、`ask_user_question`、`progress_update`、`present`、`workflow`。建出第一个 teammate 后门禁自动解除；子代理调用不受影响。
+
+更新说明：**插件代码（`dist/`）改动需要重启宿主**才会生效；预设声明本身走配置热加载，改 `presets/team.patch.yml` 后重新应用配置即可。
+
 ## 它能做什么
 
 - **常驻队友**：每个队友有名字、角色和自己的记忆，随叫随到，不用反复交代背景。
 - **成员邮箱**：队友之间可以直接互相沟通，不必事事经过你。
 - **共享任务列表**：全队认领同一份清单，谁在做哪件事清清楚楚。
 - **共享工作区**：一块全队共用的黑板，外加每人一本别人看不见的私有便笺；写下来的东西重启后还在。
+- **工号档案**：每个队友的名字自带一份持久档案——它验证过的教训、事实，加上历次复盘的交付/返工统计。同名成员再上岗时先读上一世的笔记再干活；档案比队伍活得久，解散后仍在，只有队长能复盘和删条目。
 - **微型世界**：一座持续模拟的体素小岛，支持多层建筑、设施活动、昼夜轮转和自由视角。
 - **聊天内协作**：邀请队友、分派任务、发送消息等调用显示为专属卡片，相关成员的头像就在旁边，调用详情可以展开查看。[查看预览](./screenshots/chat.png)
 - **安全边界**：队友之间的对话有轮数上限，不会绕着圈停不下来；发给主会话的消息永远畅通。

@@ -13,8 +13,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subagent'
+import type { MemberDossiers } from './dossier.ts'
+import { TeamError } from './errors.ts'
 import type { TeamService } from './service.ts'
-import { boardTool, listTool, noteTool, sendTool } from './tools.ts'
+import { boardTool, learnTool, listTool, noteTool, profileTool, sendTool } from './tools.ts'
 import type { TeamWorkspace } from './workspace.ts'
 
 /** Guidance order: after the harness tool sections, before the persona. */
@@ -22,6 +24,9 @@ const TEAM_SECTION_ORDER = 118
 
 /** The workspace paragraph sits right after the membership briefing. */
 const WORKSPACE_SECTION_ORDER = 119
+
+/** The dossier digest sits after the workspace: same durable-store family. */
+const DOSSIER_SECTION_ORDER = 121
 
 /** What a teammate needs to know about the two workspaces it can reach. */
 const WORKSPACE_BRIEFING = [
@@ -196,6 +201,70 @@ export function installTeammateWorkspace(ctx: Context, workspace: TeamWorkspace)
       }))
       disposers.push(childCtx.tools.register(noteTool(workspace, 'member', seatOf)))
       disposers.push(childCtx.tools.register(boardTool(workspace, 'member', seatOf)))
+    } catch (error: unknown) {
+      release(disposers)
+      throw error
+    }
+    return () => { release(disposers) }
+  })
+}
+
+/**
+ * The usage half of the dossier section, kept even when the digest is empty:
+ * a member with no record yet still has to be told how to start one.
+ */
+const DOSSIER_USAGE = 'Use what your earlier selves recorded before you start: following a lesson already '
+  + 'paid for is cheaper than relearning it. When you finish real work worth remembering, record one to '
+  + 'three reusable lessons or facts with team_learn — evidence is required: state what you observed or '
+  + 'verified, not what you hope. Skip routine progress and anything a fresh read of the repo already '
+  + 'tells you. Your leader owns the delivered/rework stats through team_review; you add entries only.'
+
+/**
+ * The dossier section text: the digest (which already carries its own
+ * "suggestions, not commands" guard) plus what to do with it. An empty digest
+ * still earns the usage paragraph — the section is also how a first-time
+ * member learns the habit exists.
+ */
+function dossierBriefing(digest: string): string {
+  return digest === '' ? DOSSIER_USAGE : `${digest}\n\n${DOSSIER_USAGE}`
+}
+
+/**
+ * Give every teammate its half of the durable dossier: the digest of what
+ * this name already knows, and the two tools that keep it current from the
+ * member's side. Registered separately from {@link installTeammateWorld}
+ * because the dossier is optional — a deployment without a storage domain
+ * form composes this contribution out like the workspaces.
+ * @param ctx - context carrying the team service and the open dossier domain.
+ * @param dossiers - the open dossier domain.
+ * @returns the exact effect disposer removing the contribution.
+ */
+export function installTeammateDossier(ctx: Context, dossiers: MemberDossiers): () => void {
+  return registerChildSetup(ctx, (child) => {
+    const roster = ctx.team.rosterFor(child)
+    // A name that normalizes to nothing has no dossier to key: register
+    // nothing rather than file this member under every nameless record.
+    if (roster === undefined || roster.self.name.trim() === '') return () => {}
+    // The name is captured at composition, exactly like the workspace seat:
+    // it is the dossier's key, and a member must keep reading and writing
+    // its own record even while its leader session is not loaded.
+    const name = roster.self.name
+    const nameOf = (): string => {
+      if (name.trim() === '') throw new TeamError('UNKNOWN_MEMBER', 'this teammate has no name to file its dossier under')
+      return name
+    }
+    const childCtx = child.ctx
+    const disposers: Array<() => void> = []
+    try {
+      disposers.push(childCtx.systemPrompt.section({
+        name: 'team-dossier',
+        order: DOSSIER_SECTION_ORDER,
+        // Re-rendered every step: a lesson learned this turn is in front of
+        // the member (and its next life) on the next assembly.
+        text: () => dossierBriefing(dossiers.digest(name)),
+      }))
+      disposers.push(childCtx.tools.register(learnTool(dossiers, nameOf)))
+      disposers.push(childCtx.tools.register(profileTool(dossiers, 'member', nameOf)))
     } catch (error: unknown) {
       release(disposers)
       throw error

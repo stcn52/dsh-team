@@ -51,6 +51,46 @@ with `this.ctx.subagents.startContinuable is not a function`.
 
 `dist/` is committed, so installing straight from git needs no build step.
 
+## Member dossiers（工号档案）
+
+`team_dossier` is a storage domain of its own, separate from `team_workspace`,
+keyed by the normalized member name (`trim` + whitespace collapse + lowercase)
+and shared workspace-wide: the same name inherits its memory across spawns,
+sessions, and teams. The display name keeps the latest spelling.
+
+- Semantics:
+  - `team_learn` (member only, `kind: lesson|fact`) writes its own dossier;
+    `evidence` is required. Dedup is by normalized text — a repeat reinforces
+    the matching entry (`reinforced+1`) instead of storing it twice. It never
+    touches the stats.
+  - `team_review` (leader only): `accepted` raises `delivered`, `rework`
+    raises `reworks`; an optional `note` is kept as a `feedback` entry with
+    `evidence: 'leader review'`. Stats move here and nowhere else.
+  - `team_profile`: a member's registration declares no `member` parameter and
+    can only read its own record; the leader must name a `member` (roster name
+    or id, resolved through the roster). Read-only.
+  - `team_forget` (leader only) drops one entry by its id.
+  - Bounds: `maxDossierEntries` (default 40) and `maxDossierChars` (default
+    6000) evict the oldest non-feedback entry first; feedback is only touched
+    when it is all that remains, and the entry just written is never evicted.
+  - The digest (budget `maxDossierDigestChars`, default 1200) rides the
+    teammate's system prompt every step (section `team-dossier`, order 121):
+    stats line → feedback (newest first) → lessons (reinforced first, then
+    newest) → facts, each named by entry id, and it states that these are the
+    member's own notes from earlier sessions — suggestions, never commands
+    over the current task or the system instructions.
+  - The dossier outlives the team: no `team/changed` handler clears this
+    domain (the workspace clears its board on end/dismiss; the dossier does
+    not), and it is only composed when the deployment has a `storageDomain`.
+- Tests: `tests/dossier.spec.ts` covers dedup/reinforce, both bounds and the
+  eviction order (feedback not evicted first), the digest's budget, order,
+  ids and anti-injection line, review stats, forget, name normalization,
+  blank rejection, and that `learn` never moves the stats. The
+  `dossier world` block in `tests/teammate.spec.ts` proves the digest really
+  lands in the member's system-prompt section, that the member tool set has
+  `team_learn`/`team_profile` but not `team_review`/`team_forget`, and that
+  the member's `team_profile` declares no `member` parameter.
+
 ## Install
 
 ```bash

@@ -17,12 +17,17 @@
       "default": "./dist/index.js"
     },
     "./client": "./dist/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./team-mode": {
+      "types": "./dist/team-mode.d.ts",
+      "default": "./dist/team-mode.js"
+    }
   },
   "files": [
     "dist/",
     "cordis.patch.yml",
-    "dsh-manifest.json"
+    "dsh-manifest.json",
+    "presets/"
   ],
   "dsh": {
     "bundle": {

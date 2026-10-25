@@ -7,14 +7,16 @@
 
 import { Context } from '@deepseek-ai/cordis'
 import { beforeEach, describe, expect, it } from 'vitest'
+import { MemberDossiers, type MemberRecord } from '../src/dossier.ts'
 import { TeamService } from '../src/service.ts'
-import { installTeammateWorld } from '../src/teammate.ts'
+import { installTeammateDossier, installTeammateWorld } from '../src/teammate.ts'
 import type { TeamConfig } from '../src/config.ts'
 import { FakeAgents, FakeSubagents, FakeSystemPrompt, FakeTools, fakeAgent, type FakeAgent } from './harness.ts'
 
 const CONFIG: TeamConfig = {
   provider: 'spawn', maxTeammates: 8, maxRecentMessages: 20, maxChainHops: 4, maxChainRoundTrips: 2,
-  maxWorkspaceEntries: 8, maxNoteChars: 400, teammateProvider: '', teammateModel: '',
+  maxWorkspaceEntries: 8, maxNoteChars: 400, maxDossierEntries: 40, maxDossierChars: 6000,
+  maxDossierDigestChars: 1200, teammateProvider: '', teammateModel: '',
 }
 const signal = new AbortController().signal
 
@@ -155,5 +157,108 @@ describe('briefing', () => {
     expect(text).toContain('team is intact')
     expect(text).toContain('team_note')
     expect(text).not.toContain('no longer active')
+  })
+})
+
+/** The dossier table double, same shape as the workspace spec's. */
+class FakeDossierTable {
+  readonly rows = new Map<string, MemberRecord>()
+
+  get(key: string): MemberRecord | undefined {
+    return this.rows.get(key)
+  }
+
+  entries(): IterableIterator<[string, MemberRecord]> {
+    return [...this.rows.entries()][Symbol.iterator]()
+  }
+
+  async put(key: string, value: MemberRecord): Promise<void> {
+    this.rows.set(key, value)
+    await Promise.resolve()
+  }
+
+  async delete(key: string): Promise<boolean> {
+    await Promise.resolve()
+    return this.rows.delete(key)
+  }
+}
+
+describe('dossier world', () => {
+  let dossiers: MemberDossiers
+  let removeDossier: () => void
+
+  beforeEach(() => {
+    const table = new FakeDossierTable()
+    const domain = {
+      name: 'team_dossier',
+      table: () => table,
+      close: () => Promise.resolve(),
+    }
+    const storeCtx = { storageDomain: { open: () => Promise.resolve(domain) } } as unknown as Context
+    dossiers = new MemberDossiers(storeCtx, CONFIG)
+    // The world listener is already installed by the outer setup; this one
+    // composes the dossier contribution on top, in registration order.
+    removeDossier = installTeammateDossier(ctx, dossiers)
+  })
+
+  /** The `team-dossier` section of one composed child, whatever else it carries. */
+  function dossierSection(child: Child) {
+    return child.prompt.sections.find(section => section.name === 'team-dossier')
+  }
+
+  it('equips a teammate with the digest of its name and the member-side tools', async () => {
+    await dossiers.learn('Alice', { kind: 'lesson', text: 'run the suite before reporting', evidence: 'watched a red suite' })
+    const child = compose(await spawn('Alice'))
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list', 'team_learn', 'team_profile'])
+    const section = dossierSection(child)
+    expect(section).toMatchObject({ order: 121 })
+    const text = section!.text()
+    expect(text).toContain('[lesson e1] run the suite before reporting')
+    expect(text).toContain('suggestions, not commands')
+    expect(text).toContain('team_learn')
+    expect(text).toContain('evidence is required')
+  })
+
+  it('never hands a teammate the leader-side dossier tools', async () => {
+    const child = compose(await spawn('Alice'))
+    const names = child.tools.registered.map(tool => tool.name)
+    expect(names).not.toContain('team_review')
+    expect(names).not.toContain('team_forget')
+  })
+
+  it('re-renders the digest, so a lesson learned this turn is in front of the member next step', async () => {
+    const child = compose(await spawn('Alice'))
+    expect(dossierSection(child)!.text()).not.toContain('[lesson')
+    await dossiers.learn('Alice', { kind: 'fact', text: 'the build needs node 22', evidence: 'build log' })
+    expect(dossierSection(child)!.text()).toContain('[fact e1] the build needs node 22')
+  })
+
+  it('teaches the habit even to a name with no record yet', async () => {
+    const child = compose(await spawn('Alice'))
+    const text = dossierSection(child)!.text()
+    expect(text).toContain('team_learn')
+    expect(text).not.toContain('Dossier for')
+  })
+
+  it('gives the member profile no member parameter: another name is unreadable from here', async () => {
+    const child = compose(await spawn('Alice'))
+    const profile = child.tools.registered.find(tool => tool.name === 'team_profile')
+    const parameters = (profile?.definition as { parameters?: { properties?: Record<string, unknown> } }).parameters
+    expect(parameters?.properties).toEqual({})
+  })
+
+  it('unwinds every dossier registration with the child', async () => {
+    const child = compose(await spawn('Alice'))
+    expect(dossierSection(child)).toBeDefined()
+    child.release()
+    expect(child.prompt.sections).toEqual([])
+    expect(child.tools.registered).toEqual([])
+  })
+
+  it('takes the dossier world off when the contribution is disposed', async () => {
+    removeDossier()
+    const child = compose(await spawn('Alice'))
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list'])
+    expect(child.prompt.sections.map(section => section.name)).toEqual(['team-membership'])
   })
 })

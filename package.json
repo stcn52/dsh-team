@@ -1,6 +1,6 @@
 {
   "name": "dsh-team",
-  "version": "0.2.17",
+  "version": "0.2.18",
   "description": "Agent teams for DeepSeek Harness: named long-lived teammates over ctx.subagents, a shared task list, a member-to-member mailbox, virtual workspaces, and an interactive voxel world in the conversation view (stcn52 fork: DSH 0.2.1 subagent API)",
   "type": "module",
   "main": "dist/index.js",
@@ -11,12 +11,17 @@
       "default": "./dist/index.js"
     },
     "./client": "./dist/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./team-mode": {
+      "types": "./dist/team-mode.d.ts",
+      "default": "./dist/team-mode.js"
+    }
   },
   "files": [
     "dist/",
     "cordis.patch.yml",
-    "dsh-manifest.json"
+    "dsh-manifest.json",
+    "presets/"
   ],
   "license": "MIT",
   "dsh": {

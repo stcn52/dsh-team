@@ -28,6 +28,16 @@ export interface TeamConfig {
   /** Longest single note body. */
   readonly maxNoteChars: number
   /**
+   * Entries one member dossier may hold. Over the bound the oldest
+   * non-feedback entry goes first; feedback is only touched when it is all
+   * that remains, because the leader's correction is not re-derivable.
+   */
+  readonly maxDossierEntries: number
+  /** Total entry characters (text plus evidence) one member dossier may hold. */
+  readonly maxDossierChars: number
+  /** Longest dossier digest injected into a teammate's system prompt. */
+  readonly maxDossierDigestChars: number
+  /**
    * Default LLM provider route for a teammate the leader does not address
    * explicitly. Empty inherits the leader's own route. Set it together with
    * {@link teammateModel} to run every teammate on another route — a locally
@@ -51,6 +61,9 @@ export const Config: z<Partial<TeamConfig>, TeamConfig> = z.object({
   maxChainRoundTrips: z.number().step(1).min(1).max(64).default(2),
   maxWorkspaceEntries: z.number().step(1).min(1).max(500).default(32),
   maxNoteChars: z.number().step(1).min(200).max(200_000).default(4000),
+  maxDossierEntries: z.number().step(1).min(1).max(500).default(40),
+  maxDossierChars: z.number().step(1).min(200).max(200_000).default(6000),
+  maxDossierDigestChars: z.number().step(1).min(200).max(8000).default(1200),
   teammateProvider: z.string().default(''),
   teammateModel: z.string().default(''),
 })

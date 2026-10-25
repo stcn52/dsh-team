@@ -12,7 +12,8 @@ import { FakeLlm, fakeAgent } from './harness.ts'
 
 const CONFIG: TeamConfig = {
   provider: 'spawn', maxTeammates: 8, maxRecentMessages: 50, maxChainHops: 4, maxChainRoundTrips: 2,
-  maxWorkspaceEntries: 8, maxNoteChars: 400, teammateProvider: '', teammateModel: '',
+  maxWorkspaceEntries: 8, maxNoteChars: 400, maxDossierEntries: 40, maxDossierChars: 6000,
+  maxDossierDigestChars: 1200, teammateProvider: '', teammateModel: '',
 }
 
 /** A leader session on a named route, with the provider directory mounted. */

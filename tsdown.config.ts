@@ -42,10 +42,15 @@ const INLINE_SAFE = /^@deepseek-ai\/dsh-(host-apiproxy|session|llm|tools|brand|s
 const CSS_VIRTUAL_PREFIX = '\0dsh-css:'
 const CSS_VIRTUAL_SUFFIX = '.mjs'
 
-/** The node half: ESM plus declarations into dist/. */
+/**
+ * The node half: ESM plus declarations into dist/. `team-mode` is a second
+ * entry rather than a re-export of the main bundle: the team preset mounts
+ * `dsh-team/team-mode` on its own, so that subpath must be importable without
+ * pulling in the whole leader plugin graph.
+ */
 const library: UserConfig = {
   name: ID,
-  entry: ['src/index.ts'],
+  entry: ['src/index.ts', 'src/team-mode.ts'],
   outDir: 'dist',
   format: ['esm'],
   platform: 'node',

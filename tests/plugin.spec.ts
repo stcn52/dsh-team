@@ -18,7 +18,8 @@ describe('config', () => {
   it('runs on defaults, so a deployment adds the row with no knobs', () => {
     expect(Config({})).toEqual({
       provider: 'spawn', maxTeammates: 8, maxRecentMessages: 50, maxChainHops: 4, maxChainRoundTrips: 2,
-      maxWorkspaceEntries: 32, maxNoteChars: 4000, teammateProvider: '', teammateModel: '',
+      maxWorkspaceEntries: 32, maxNoteChars: 4000, maxDossierEntries: 40, maxDossierChars: 6000,
+      maxDossierDigestChars: 1200, teammateProvider: '', teammateModel: '',
     })
   })
 
@@ -26,7 +27,8 @@ describe('config', () => {
     expect(Config({ provider: 'fork', maxTeammates: 3, maxRecentMessages: 100, maxChainHops: 2 }))
       .toEqual({
         provider: 'fork', maxTeammates: 3, maxRecentMessages: 100, maxChainHops: 2, maxChainRoundTrips: 2,
-        maxWorkspaceEntries: 32, maxNoteChars: 4000, teammateProvider: '', teammateModel: '',
+        maxWorkspaceEntries: 32, maxNoteChars: 4000, maxDossierEntries: 40, maxDossierChars: 6000,
+        maxDossierDigestChars: 1200, teammateProvider: '', teammateModel: '',
       })
   })
 
@@ -35,5 +37,10 @@ describe('config', () => {
     expect(() => Config({ maxTeammates: 65 })).toThrow()
     expect(() => Config({ maxRecentMessages: 0 })).toThrow()
     expect(() => Config({ maxTeammates: 2.5 })).toThrow()
+    expect(() => Config({ maxDossierEntries: 0 })).toThrow()
+    expect(() => Config({ maxDossierEntries: 501 })).toThrow()
+    expect(() => Config({ maxDossierChars: 199 })).toThrow()
+    expect(() => Config({ maxDossierDigestChars: 199 })).toThrow()
+    expect(() => Config({ maxDossierDigestChars: 8001 })).toThrow()
   })
 })

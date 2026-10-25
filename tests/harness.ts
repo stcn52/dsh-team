@@ -232,9 +232,17 @@ export interface RegisteredTool {
   readonly definition: { readonly name: string }
 }
 
-/** The `ctx.tools` double: registration plus exact-disposer semantics. */
+/** The narrow call view a guard sees in this double: name plus its agent. */
+export interface FakeGuardExecution {
+  readonly name: string
+  readonly agent?: unknown
+}
+
+/** The `ctx.tools` double: registration, guards, and exact-disposer semantics. */
 export class FakeTools {
   readonly registered: RegisteredTool[] = []
+  /** Monotonic guards, in registration order; the first denial wins. */
+  readonly guards: Array<(execution: FakeGuardExecution) => string | undefined> = []
 
   register(definition: { name: string }): () => void {
     const entry: RegisteredTool = { name: definition.name, definition }
@@ -242,6 +250,19 @@ export class FakeTools {
     return () => {
       const index = this.registered.indexOf(entry)
       if (index >= 0) this.registered.splice(index, 1)
+    }
+  }
+
+  /**
+   * The `ToolRuntime.guard` seam, narrowed to what a guard reads here. The
+   * real pipeline calls it with a `ToolExecution`; a double passing
+   * `{ name, agent }` satisfies every team-mode guard.
+   */
+  guard(guard: (execution: FakeGuardExecution) => string | undefined): () => void {
+    this.guards.push(guard)
+    return () => {
+      const index = this.guards.indexOf(guard)
+      if (index >= 0) this.guards.splice(index, 1)
     }
   }
 }

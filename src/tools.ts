@@ -18,6 +18,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolCallView, ToolDefinition, ToolResultView } from '@deepseek-ai/dsh-tools'
 import type { TeamMemberFact } from './fold.ts'
 import { DISPATCH_FACT_PREFIX } from './fold-dispatch.ts'
+import { TeamError } from './errors.ts'
+import type { DossierEntry, MemberDossiers } from './dossier.ts'
 import type { TeamSeat, TeamService } from './service.ts'
 import { SHARED_AREA, type TeamWorkspace } from './workspace.ts'
 
@@ -689,4 +691,307 @@ export function boardTool(
       }
     },
   }))
+}
+
+/** One dossier entry as both the profile read and its fact shape carry it. */
+const ENTRY_PROPERTIES = {
+  id: { type: 'string', required: true },
+  kind: { type: 'string', required: true, enum: ['lesson', 'fact', 'feedback'] },
+  text: { type: 'string', required: true },
+  evidence: { type: 'string', required: true },
+  createdAt: { type: 'number', required: true },
+  reinforced: { type: 'number', required: true },
+} as const
+
+/** The dossier stats, shared by the profile read and the review result. */
+const STATS_PROPERTIES = {
+  delivered: { type: 'number', required: true },
+  reworks: { type: 'number', required: true },
+} as const
+
+/** Dossier record as a tool output value; an unread name reads as an empty career. */
+function profileValue(name: string, entries: readonly DossierEntry[] | undefined, stats: { delivered: number; reworks: number } | undefined): {
+  name: string
+  stats: { delivered: number; reworks: number }
+  entries: DossierEntry[]
+} {
+  return {
+    name,
+    stats: stats ?? { delivered: 0, reworks: 0 },
+    entries: entries ? [...entries] : [],
+  }
+}
+
+/**
+ * How the dossier tools learn whose record a call addresses. A teammate's
+ * registration closes over the name it was composed with — the dossier, like
+ * the workspace, must keep working while the leader session is unloaded. A
+ * leader addresses a roster member, by name or id; the roster resolves the
+ * canonical display name, because the dossier is keyed by name and the leader
+ * may hold only the id.
+ */
+export type DossierNameResolver = (agent: Agent, member?: string) => string
+
+/**
+ * The leader-side resolver: roster address (id or name) to canonical name.
+ * @param ctx - context carrying the team service.
+ * @returns a resolver that refuses anything off the roster.
+ */
+export function dossierNameOf(ctx: Context): DossierNameResolver {
+  return (agent, member) => {
+    const address = (member ?? '').trim()
+    if (address === '') {
+      throw new TeamError('UNKNOWN_MEMBER', 'name the teammate whose dossier you mean')
+    }
+    const wanted = address.toLowerCase()
+    const found = ctx.team.list(agent).members.find(
+      row => row.memberId === address || row.name.toLowerCase() === wanted,
+    )
+    if (found === undefined) throw new TeamError('UNKNOWN_MEMBER', address)
+    return found.name
+  }
+}
+
+/**
+ * `team_learn` — a member records in its own dossier. Member-only: the
+ * dossier is what the member carries, and only its own work earns an entry.
+ * @param dossiers - the open dossier domain.
+ * @param nameOf - the member's own name, resolved at call time so a dismissed
+ *   member's stray call errors instead of filing under a stale name.
+ * @returns the tool definition.
+ */
+export function learnTool(dossiers: MemberDossiers, nameOf: () => string): ToolDefinition {
+  return defineTool({
+    name: 'team_learn',
+    description:
+      'Record one reusable lesson or fact in your own durable dossier. The dossier follows the name, not the '
+      + 'session: it is the one thing that survives your dismissal, and the next member spawned under this '
+      + 'name starts by reading it. Record what would change how you work next time, and evidence — what you '
+      + 'observed or verified, not what you hope. One to three entries per finished job is enough; routine '
+      + 'progress and anything a fresh read of the repo already states are noise. Repeating a point you '
+      + 'already recorded reinforces it instead of duplicating it. You can only add entries: the delivered '
+      + 'and rework stats belong to your leader\'s review.',
+    parameters: {
+      kind: {
+        type: 'string',
+        required: true,
+        enum: ['lesson', 'fact'],
+        description: 'lesson: how to work better next time. fact: a durable truth about the terrain you worked on.',
+      },
+      text: { type: 'string', required: true, description: 'The reusable point in one or two sentences, written so whoever inherits this name can act on it.' },
+      evidence: { type: 'string', required: true, description: 'What you observed or verified that makes this worth keeping: a command you ran and what it printed, a file you read, a failure you watched happen.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          entryId: { type: 'string', required: true },
+          deduplicated: { type: 'boolean', required: true },
+          entries: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.deduplicated
+          ? `already in your dossier — entry ${value.entryId} reinforced instead (${value.entries} entries held)`
+          : `recorded entry ${value.entryId} in your dossier (${value.entries} entries held)`,
+      }],
+    },
+    presentCall: args => call(`Learn a ${args.kind}`, { kind: args.kind, text: args.text, evidence: args.evidence }),
+    presentResult: (_args, result) => result.isError
+      ? done('Learn', `failed: ${failureText(result)}`)
+      : done('Dossier updated'),
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const outcome = await dossiers.learn(nameOf(), {
+        kind: args.kind,
+        text: args.text,
+        evidence: args.evidence,
+      })
+      return { entryId: outcome.entry.id, deduplicated: outcome.deduplicated, entries: outcome.entries }
+    },
+  })
+}
+
+/** The profile read, shared verbatim by both audience registrations. */
+const PROFILE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    name: { type: 'string', required: true },
+    stats: { type: 'object', required: true, additionalProperties: false, properties: STATS_PROPERTIES },
+    entries: { type: 'array', required: true, items: { type: 'object', additionalProperties: false, properties: ENTRY_PROPERTIES } },
+  },
+} as const
+
+/** The one render both `team_profile` registrations share. */
+function profileRender(
+  _args: unknown,
+  value: { name: string; stats: { delivered: number; reworks: number }; entries: DossierEntry[] },
+) {
+  return [{
+    type: 'text' as const,
+    text: value.entries.length === 0 && value.stats.delivered === 0 && value.stats.reworks === 0
+      ? `${value.name} has no dossier yet — nothing recorded under this name`
+      : `${value.name}: ${value.stats.delivered} delivered, ${value.stats.reworks} reworked, `
+        + `${value.entries.length} entries\n`
+        + value.entries.map(entry => `[${entry.kind} ${entry.id}] ${entry.text} (evidence: ${entry.evidence})`).join('\n'),
+  }]
+}
+
+/**
+ * `team_profile` — read a dossier. The audience split is the hard invariant:
+ * the member registration declares no `member` parameter and can only ever
+ * read its own record; only the leader names whose career to look at. Two
+ * registrations rather than conditional parameters: the parameter map is part
+ * of the tool's type, and a member must not even see a parameter it may not
+ * use — a parameter it can fill is a parameter it can reach another name
+ * with.
+ * @param dossiers - the open dossier domain.
+ * @param audience - whose reach this registration serves.
+ * @param nameOf - where the caller's (or the named member's) dossier name comes from.
+ * @returns the tool definition.
+ */
+export function profileTool(
+  dossiers: MemberDossiers,
+  audience: 'leader' | 'member',
+  nameOf: DossierNameResolver,
+): ToolDefinition {
+  const output = { schema: PROFILE_SCHEMA, render: profileRender }
+  if (audience === 'leader') {
+    return defineTool({
+      name: 'team_profile',
+      description:
+        'Read one teammate\'s durable dossier: the delivered/rework stats and every entry with its id. '
+        + 'Read-only — team_review records outcomes, team_forget drops one entry. The dossier follows the '
+        + 'name across teams and restarts, so this is what a member carries with it; reading it before you '
+        + 'assign work tells you what this name already knows.',
+      parameters: {
+        member: { type: 'string', required: true, description: 'Teammate name or member id.' },
+      },
+      output,
+      presentCall: args => ({ card: 'generic', title: `Read ${args.member}'s dossier`, kind: 'read' }),
+      presentResult: (_args, result) => result.isError ? done('Read the dossier', 'failed') : done('Dossier'),
+      async execute(args, exec) {
+        const name = nameOf(actor(exec.agent), args.member)
+        const record = await dossiers.read(name)
+        return profileValue(record?.name ?? name, record?.entries, record?.stats)
+      },
+    })
+  }
+  return defineTool({
+    name: 'team_profile',
+    description:
+      'Read your own dossier: the stats your leaders have built up under your name, and every entry you '
+      + 'or your earlier selves recorded, with ids. Read-only; team_learn adds entries. There is no member '
+      + 'parameter because there is no other dossier you may read.',
+    parameters: {},
+    output,
+    presentCall: () => ({ card: 'generic', title: 'Read your dossier', kind: 'read' }),
+    presentResult: (_args, result) => result.isError ? done('Read the dossier', 'failed') : done('Dossier'),
+    async execute(_args, exec) {
+      const name = nameOf(actor(exec.agent))
+      const record = await dossiers.read(name)
+      return profileValue(record?.name ?? name, record?.entries, record?.stats)
+    },
+  })
+}
+
+/**
+ * `team_review` — the leader records an outcome. The only door to the stats:
+ * `accepted` and `rework` move delivered/reworks, and an optional note is
+ * kept as feedback the next member under that name reads first.
+ * @param dossiers - the open dossier domain.
+ * @param nameOf - roster address to canonical name.
+ * @returns the tool definition.
+ */
+export function reviewTool(dossiers: MemberDossiers, nameOf: DossierNameResolver): ToolDefinition {
+  return defineTool({
+    name: 'team_review',
+    description:
+      'Record what you made of one teammate\'s work in its durable dossier: accepted raises its delivered '
+        + 'count, rework raises its rework count, and an optional note is kept as feedback that member (and '
+        + 'whoever later wears the name) reads before its own lessons. This is how a team teaches its names: '
+        + 'the stats and the feedback survive every dismissal and restart. Review the work you actually '
+        + 'judged — these numbers are the dossier\'s spine, and only this tool moves them.',
+    parameters: {
+      member: { type: 'string', required: true, description: 'Teammate name or member id.' },
+      outcome: { type: 'string', required: true, enum: ['accepted', 'rework'], description: 'accepted: the work landed. rework: it came back.' },
+      note: { type: 'string', description: 'Optional feedback kept as a dossier entry: what to do differently next time, said once and concretely.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string', required: true },
+          stats: { type: 'object', required: true, additionalProperties: false, properties: STATS_PROPERTIES },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `${value.name}: ${value.stats.delivered} delivered, ${value.stats.reworks} reworked`,
+      }],
+    },
+    presentCall: args => call(`Review ${args.member}: ${args.outcome}`, args.note === undefined ? undefined : { note: args.note }),
+    presentResult: (args, result) => result.isError
+      ? done(`Review ${args.member}`, `failed: ${failureText(result)}`)
+      : done(`${args.member} reviewed (${args.outcome})`),
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const record = await dossiers.review(
+        nameOf(actor(exec.agent), args.member),
+        args.outcome,
+        args.note,
+      )
+      return { name: record.name, stats: record.stats }
+    },
+  })
+}
+
+/**
+ * `team_forget` — the leader drops one entry by id. Leader-only: a wrong
+ * lesson teaches the wrong thing, and only the leader can tell a lesson from
+ * a wish.
+ * @param dossiers - the open dossier domain.
+ * @param nameOf - roster address to canonical name.
+ * @returns the tool definition.
+ */
+export function forgetTool(dossiers: MemberDossiers, nameOf: DossierNameResolver): ToolDefinition {
+  return defineTool({
+    name: 'team_forget',
+    description:
+      'Drop one entry from a teammate\'s dossier by its id — ids come from team_profile, or from the digest '
+        + 'the member itself sees. Use it when a note is wrong or obsolete: a lesson that no longer holds '
+        + 'teaches the wrong thing to everyone who inherits the name. The stats are untouched; only the '
+        + 'leader forgets.',
+    parameters: {
+      member: { type: 'string', required: true, description: 'Teammate name or member id.' },
+      entry_id: { type: 'string', required: true, description: 'The entry id, e.g. "e3", as team_profile showed it.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          removed: { type: 'string', required: true },
+          remaining: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `dropped entry ${value.removed}; ${value.remaining} entries left in the dossier`,
+      }],
+    },
+    presentCall: args => call(`Forget ${args.member}'s entry ${args.entry_id}`),
+    presentResult: (args, result) => result.isError
+      ? done(`Forget ${args.member}'s entry`, `failed: ${failureText(result)}`)
+      : done(`Entry ${args.entry_id} forgotten`),
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const remaining = await dossiers.forget(nameOf(actor(exec.agent), args.member), args.entry_id)
+      return { removed: args.entry_id.trim(), remaining }
+    },
+  })
 }

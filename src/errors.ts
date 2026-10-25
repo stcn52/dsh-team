@@ -28,6 +28,9 @@ export type TeamErrorCode =
   | 'NOTE_TOO_LONG'
   | 'WORKSPACE_FULL'
   | 'UNKNOWN_NOTE'
+  | 'EMPTY_LEARNING'
+  | 'UNKNOWN_DOSSIER'
+  | 'UNKNOWN_ENTRY'
 
 /** Stable sentence per code; `detail` appends the caller-specific part. */
 const MESSAGES: Record<TeamErrorCode, string> = {
@@ -62,6 +65,11 @@ const MESSAGES: Record<TeamErrorCode, string> = {
   NOTE_TOO_LONG: 'that note is longer than this workspace accepts — keep the conclusion, drop the transcript',
   WORKSPACE_FULL: 'this workspace area is full',
   UNKNOWN_NOTE: 'no note with that name is in this workspace area',
+  EMPTY_LEARNING:
+    'a dossier entry needs both the point and the evidence — say what you observed or verified that makes '
+    + 'this worth keeping',
+  UNKNOWN_DOSSIER: 'nobody under that name has a dossier yet — there is nothing recorded to read or forget',
+  UNKNOWN_ENTRY: 'no entry with that id is in this dossier — team_profile lists the ids it holds',
 }
 
 /** One refused team operation. */
