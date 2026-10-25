@@ -94,7 +94,7 @@ export function fakeAgent(id: string, options: {
   return self
 }
 
-/** One `startContinuable` call the subagent double accepted. */
+/** One `startActivation` call the subagent double accepted. */
 export interface StartedChild {
   readonly provider: string
   readonly label: string
@@ -102,6 +102,8 @@ export interface StartedChild {
   readonly prompt: readonly ContentBlock[]
   readonly persona?: string
   readonly agentOptions?: Record<string, unknown>
+  /** DSH 0.2.1 result-delivery policy the team asks for. */
+  readonly delivery?: string
 }
 
 /** One queued delivery the subagent double accepted. */
@@ -119,17 +121,18 @@ export class FakeSubagents {
   readonly interrupted: string[] = []
   /** Next child id handed out; the team never chooses one itself. */
   nextChildId = 'child-1'
-  /** When set, `startContinuable` rejects with it. */
+  /** When set, `startActivation` rejects with it. */
   failStart: Error | undefined
   /** Runs while a start is in flight, so a test can observe the composition window. */
   onStart: ((childId: SessionIdType) => void) | undefined
   publishChild: ((childId: SessionIdType, parentId: SessionIdType, options?: Record<string, unknown>) => void) | undefined
 
-  async startContinuable(spec: {
+  async startActivation(spec: {
     provider: string
     label: string
     request: { parent: Agent; prompt: ContentBlock[]; persona?: string; agentOptions?: Record<string, unknown> }
     signal: AbortSignal
+    delivery: 'parent' | 'caller'
   }): Promise<{ childId: SessionIdType; messageId: string }> {
     if (this.failStart !== undefined) throw this.failStart
     const childId = SessionId(this.nextChildId)
@@ -140,6 +143,7 @@ export class FakeSubagents {
       prompt: spec.request.prompt,
       ...spec.request.persona !== undefined ? { persona: spec.request.persona } : {},
       ...spec.request.agentOptions !== undefined ? { agentOptions: spec.request.agentOptions } : {},
+      delivery: spec.delivery,
     })
     this.onStart?.(childId)
     this.publishChild?.(childId, spec.request.parent.id, spec.request.agentOptions)

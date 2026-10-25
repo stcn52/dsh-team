@@ -6,6 +6,7 @@ import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionListState } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { ToolCallBlock, ToolResultNode } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { TeamPresence, type TeamPresenceProps } from '../src/client/TeamPresence.tsx'
 import { TeamToolCard, type TeamToolCardProps } from '../src/client/TeamToolCard.tsx'
 import type { TeamPanelState } from '../src/client/TeamStage.tsx'
@@ -43,7 +44,8 @@ function presence(snapshot = state) {
 
 function result(name: string, args: Record<string, unknown>, extra: Partial<ToolResultNode> = {}): ToolResultNode {
   return {
-    kind: 'tool-result', callId: 'call-1', call: { name, argsRaw: JSON.stringify(args) },
+    kind: 'tool-result', callId: 'call-1', name, args: PartialArguments.fromText(JSON.stringify(args)),
+    call: { name, argsRaw: JSON.stringify(args) },
     seq: 2, time: 2000, callTime: 1000, content: [], isError: false, subCalls: [], ...extra,
   }
 }
@@ -188,7 +190,7 @@ describe('team tool cards', () => {
 
   it('keeps partial arguments inspectable while a call is running', () => {
     const raw = '{"name":"Alice","task":'
-    const view = toolCard('team_spawn', { phase: 'start', callId: 'call-1', name: 'team_spawn', argsRaw: raw, time: 1000, turn: 1, step: 1, subCalls: [] })
+    const view = toolCard('team_spawn', { phase: 'start', callId: 'call-1', name: 'team_spawn', argsRaw: raw, args: PartialArguments.fromText(raw), time: 1000, turn: 1, step: 1, subCalls: [] })
     expect(screen.getByRole('status').textContent).toBe('In progress')
 
     fireEvent.click(screen.getByRole('button', { name: 'Expand call details' }))

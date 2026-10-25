@@ -173,23 +173,34 @@ describe('dispatch envelopes', () => {
 
 describe('host registry integration', () => {
   it('persists nested facts through run_code while preserving native results and program values', async () => {
-    const host = new Context()
-    host.provide('systemPrompt', { tools() {}, section() {}, getSectionOrder() { return 0 } })
-    host.provide('team', { spawn: async () => alice })
     const args = { name: 'Alice', relation: 'peer', task: 'review', reasoning_effort: 'high' }
-    host.provide('ptcRuntime', {
-      resolve: (request: unknown) => request,
-      language: 'typescript',
-      async run(request: { bindings: Array<{ functions: Record<string, (args: unknown) => Promise<unknown>> }> }) {
-        const functions = request.bindings[0]!.functions
-        const value = await functions['team_spawn']!(args)
-        expect(value).toEqual(alice)
-        await expect(functions['team_spawn']!({ name: 'invalid' })).rejects.toThrow()
-        return { logs: [], value }
-      },
-    })
-    const runtime = new ToolRuntime(host, { mode: 'both' })
-    runtime.register(spawnTool(host))
+    const makeHost = () => {
+      const h = new Context()
+      h.provide('systemPrompt', { tools() {}, section() {}, getSectionOrder() { return 0 } })
+      h.provide('team', { spawn: async () => alice })
+      // 0.2.1: run_code with an Agent resolves through the workingDirectory service.
+      h.provide('workingDirectory', { ensure: async () => '/tmp' })
+      h.provide('ptcRuntime', {
+        resolve: (request: unknown) => request,
+        language: 'typescript',
+        async run(request: { bindings: Array<{ functions: Record<string, (args: unknown) => Promise<unknown>> }> }) {
+          const functions = request.bindings[0]!.functions
+          const value = await functions['team_spawn']!(args)
+          expect(value).toEqual(alice)
+          await expect(functions['team_spawn']!({ name: 'invalid' })).rejects.toThrow()
+          return { logs: [], value }
+        },
+      })
+      return h
+    }
+    // 0.2.1 made the presentation exclusive ('native' XOR 'ptc'), so the two
+    // surfaces need their own registry: one runtime cannot hold both.
+    const host = makeHost()
+    const nativeRuntime = new ToolRuntime(host, { mode: 'native' })
+    nativeRuntime.register(spawnTool(host))
+    const ptcHost = makeHost()
+    const runtime = new ToolRuntime(ptcHost, { mode: 'ptc' })
+    runtime.register(spawnTool(ptcHost))
     const leader = fakeAgent('leader-1')
     const events: SessionEvent[] = []
     Object.assign(leader.session, {
@@ -198,9 +209,9 @@ describe('host registry integration', () => {
       },
     })
     const signal = new AbortController().signal
-    const native = await runtime.execute({ callId: ToolCallId('native'), name: 'team_spawn', arguments: args, agent: leader.agent, signal })
+    const native = await nativeRuntime.execute({ callId: ToolCallId('native'), name: 'team_spawn', arguments: args, agent: leader.agent, signal })
     expect(native.isError).toBe(false)
-    expect(native.content).toEqual(spawnTool(host).output.render(args, alice))
+    expect(native.content).toEqual(spawnTool(ptcHost).output.render(args, alice))
     expect(native.meta).toEqual({ team: 'member-added', member: alice })
 
     const result = await runtime.execute({

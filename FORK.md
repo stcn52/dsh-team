@@ -30,12 +30,23 @@ The `--config.auto-install-peers=false` matters on pnpm < 9.15: the profile's
 ignores, so pnpm otherwise tries to install the prerelease-only
 `@deepseek-ai/*` peers and fails on `No matching version found`.
 
-## Known limits
+## Building
 
-- `devDependencies` still pin `@deepseek-ai/dsh-*` at `0.1.7-rc.2`, so `pnpm
-  typecheck` compiles against the *old* API and cannot catch 0.2.1 drift. The
-  shipped `dist/` is what runs, so this does not affect installs — but anyone
-  rebuilding should bump those dev deps to `0.2.1-rc.3` first.
+`pnpm typecheck`, `pnpm test` and `pnpm build` all run against `0.2.1-rc.3`:
+
+- `devDependencies` are on `0.2.1-rc.3`, and `pnpm-workspace.yaml` pins the
+  whole `@deepseek-ai/*` family to the same line through `overrides`
+  (`packages: ['.']` is declared explicitly because pnpm 9 rejects a
+  workspace file without it).
+- `unrun`, `zustand`, `immer` and `@testing-library/dom` are explicit dev
+  dependencies; upstream relied on pnpm auto-installing peers, which a
+  profile-style `auto-install-peers=false` install does not do.
+- The test doubles were moved to `ctx.subagents.startActivation` (and
+  `workingDirectory` is stubbed for `run_code`); the PTC test now builds a
+  separate `ptc` registry because 0.2.1 made native/PTC presentation
+  exclusive.
+
+## Known limits
 - The client bundle is unchanged from upstream; it was built against the 0.1.7
   client packages and happens to keep working on 0.2.1-rc.3 (verified: the
   「微型世界」 view, header presence, composer dock and tool cards all render).
