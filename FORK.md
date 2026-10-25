@@ -44,6 +44,10 @@ with `this.ctx.subagents.startContinuable is not a function`.
     mounted skill catalog leaves the assignment advisory instead of refusing.
   - the assignment rides the roster row (folded, projected, shown by the team
     tools) and the teammate's own briefing tells it to load those skills first.
+  - the spawn validates against the LEADER's catalog, not the root service:
+    presets isolate services per agent, so the root registry can be empty while
+    the session's own catalog is full. An empty catalog leaves the assignment
+    advisory instead of refusing every name.
 
 `dist/` is committed, so installing straight from git needs no build step.
 

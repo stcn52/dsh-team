@@ -76,11 +76,12 @@ function world(options: {
     ? undefined
     : new FakeLlm(options.efforts ?? [], options.providers)
   if (llm !== undefined) ctx.provide('llm', llm)
-  if (options.publishedSkills !== undefined) {
-    ctx.provide('skills', new FakeSkills(options.publishedSkills) as never)
-  }
   const service = new TeamService(ctx, options.config ?? CONFIG)
   const leader = agents.add(options.leader ?? fakeAgent('leader-1', { provider: 'deepseek', model: 'chat' }))
+  // Presets isolate services per agent: the catalog that counts is the leader's own.
+  if (options.publishedSkills !== undefined) {
+    leader.ctx.provide('skills', new FakeSkills(options.publishedSkills) as never)
+  }
   return { ctx, service, agents, subagents, leader, ...llm !== undefined ? { llm } : {} }
 }
 
@@ -290,6 +291,19 @@ describe('assigned skills', () => {
     await expect(spawn(scene, 'Alice', { skills: ['no-such-skill'] }))
       .rejects.toThrow(/no-such-skill/)
     expect(scene.subagents.started).toHaveLength(0)
+  })
+
+  it('validates against the leader catalog even when the root registry is empty', async () => {
+    const scene = world({ publishedSkills: ['deep-brief'] })
+    scene.ctx.provide('skills', new FakeSkills([]) as never)
+    await expect(spawn(scene, 'Alice', { skills: ['deep-brief'] })).resolves.toBeDefined()
+    await expect(spawn(scene, 'Bob', { skills: ['nope'] })).rejects.toMatchObject({ code: 'UNKNOWN_SKILL' })
+  })
+
+  it('leaves the assignment advisory when the catalog has no provider behind it', async () => {
+    const scene = world()
+    scene.leader.ctx.provide('skills', new FakeSkills([]) as never)
+    await expect(spawn(scene, 'Alice', { skills: ['anything'] })).resolves.toBeDefined()
   })
 
   it('leaves the assignment advisory when no skill catalog is mounted', async () => {

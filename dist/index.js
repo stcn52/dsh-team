@@ -850,7 +850,7 @@ var TeamService = class extends Service {
 		if (findByName(team, request.name) !== void 0) throw new TeamError("DUPLICATE_NAME", request.name);
 		const route = this.resolveRoute(leader, request);
 		await this.assertProviderRegistered(leader, route.provider);
-		await this.assertSkillsKnown(request.skills);
+		await this.assertSkillsKnown(leader, request.skills);
 		await this.assertEffortOffered(leader, request, route);
 		const agentOptions = {
 			...route.provider !== void 0 ? { provider: route.provider } : {},
@@ -1277,9 +1277,9 @@ var TeamService = class extends Service {
 	* catalog offers, so a missing registry must not refuse the spawn.
 	* @param skills - the names the leader assigned, if any.
 	*/
-	async assertSkillsKnown(skills) {
+	async assertSkillsKnown(leader, skills) {
 		if (skills === void 0 || skills.length === 0) return;
-		const catalog = this.ctx.get("skills");
+		const catalog = leader.ctx.get("skills") ?? this.ctx.get("skills");
 		if (catalog === void 0) return;
 		let published;
 		try {
@@ -1287,6 +1287,7 @@ var TeamService = class extends Service {
 		} catch {
 			return;
 		}
+		if (published.length === 0) return;
 		const names = new Set(published.map((skill) => skill.name));
 		const missing = skills.filter((skill) => !names.has(skill));
 		if (missing.length === 0) return;
