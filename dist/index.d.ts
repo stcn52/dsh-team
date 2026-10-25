@@ -25,6 +25,15 @@ interface TeamConfig {
   readonly maxWorkspaceEntries: number;
   /** Longest single note body. */
   readonly maxNoteChars: number;
+  /**
+   * Default LLM provider route for a teammate the leader does not address
+   * explicitly. Empty inherits the leader's own route. Set it together with
+   * {@link teammateModel} to run every teammate on another route — a locally
+   * served model, for instance — without repeating the route on every spawn.
+   */
+  readonly teammateProvider: string;
+  /** Default model id paired with {@link teammateProvider}; empty inherits the leader's. */
+  readonly teammateModel: string;
 }
 /**
  * The row's config schema; the loader validates before the service is built.
@@ -61,6 +70,8 @@ interface TeamMemberView {
   readonly name: string;
   readonly role?: string;
   readonly relation: TeamRelation;
+  /** Provider route recorded at spawn, when it differs from the leader's own. */
+  readonly provider?: string;
   /** Model route recorded at spawn, when the leader overrode its own. */
   readonly model?: string;
   /** Provider-owned reasoning effort recorded at spawn, when one was requested. */
@@ -165,6 +176,7 @@ interface TeamMemberFact {
   readonly name: string;
   readonly role?: string;
   readonly relation: TeamRelation;
+  readonly provider?: string;
   readonly model?: string;
   readonly effort?: string;
 }
@@ -241,6 +253,12 @@ interface TeamSpawnRequest {
   readonly persona?: string;
   readonly relation: TeamRelation;
   readonly task: string;
+  /**
+   * LLM provider route for this teammate. Omitted inherits the leader's route
+   * (or the deployment's `teammateProvider` default); naming another route is
+   * how one teammate runs on a locally served model.
+   */
+  readonly provider?: string;
   readonly model?: string;
   readonly reasoningEffort?: string;
 }
@@ -432,6 +450,23 @@ declare class TeamService extends Service {
   /** Deliver one message, choosing the transport the recipient's runtime requires. */
   private deliver;
   /**
+   * The route this spawn runs on. A request that names its own provider or
+   * model wins exactly as given; one that names neither falls back to the
+   * deployment's teammate route, so a single `teammateProvider` pair turns
+   * every teammate local without overriding a leader that asked for a
+   * specific route. Model ids are provider-scoped, so a route change without
+   * a model is refused instead of sending the leader's model id to a provider
+   * that never advertised it.
+   */
+  private resolveRoute;
+  /**
+   * Reject a spawn aimed at a provider this deployment never registered, at
+   * spawn rather than on the teammate's first request: the failure would
+   * otherwise arrive as an adapter error inside the teammate's own turn,
+   * where the leader cannot see it or correct the route.
+   */
+  private assertProviderRegistered;
+  /**
    * Reject a reasoning effort the selected model does not offer, at spawn
    * rather than on the teammate's every later request. Validation needs an
    * exact provider/model route: without one the adapter stays the authority.
@@ -456,7 +491,7 @@ declare class TeamService extends Service {
  * @module dsh-team/errors
  */
 /** Every way a team operation refuses. */
-type TeamErrorCode = 'NO_TEAM' | 'LEADER_AWAY' | 'NESTED_TEAM' | 'MAX_TEAMMATES' | 'DUPLICATE_NAME' | 'UNKNOWN_MEMBER' | 'UNKNOWN_TASK' | 'TASK_TITLE_REQUIRED' | 'SELF_MESSAGE' | 'UNAUTHORIZED' | 'UNKNOWN_EFFORT' | 'CHAIN_EXHAUSTED' | 'PING_PONG' | 'REPEATED_MESSAGE' | 'INVALID_NOTE_KEY' | 'NOTE_TOO_LONG' | 'WORKSPACE_FULL' | 'UNKNOWN_NOTE';
+type TeamErrorCode = 'NO_TEAM' | 'LEADER_AWAY' | 'NESTED_TEAM' | 'MAX_TEAMMATES' | 'DUPLICATE_NAME' | 'UNKNOWN_MEMBER' | 'UNKNOWN_TASK' | 'TASK_TITLE_REQUIRED' | 'SELF_MESSAGE' | 'UNAUTHORIZED' | 'UNKNOWN_PROVIDER' | 'MODEL_REQUIRED' | 'UNKNOWN_EFFORT' | 'CHAIN_EXHAUSTED' | 'PING_PONG' | 'REPEATED_MESSAGE' | 'INVALID_NOTE_KEY' | 'NOTE_TOO_LONG' | 'WORKSPACE_FULL' | 'UNKNOWN_NOTE';
 /** One refused team operation. */
 declare class TeamError extends Error {
   readonly code: TeamErrorCode;

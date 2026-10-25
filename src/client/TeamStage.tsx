@@ -99,7 +99,16 @@ function TeamWorld(props: TeamStageProps & { readonly state: TeamPanelState & { 
       return {
         id, name: names.get(id)!, seat: index - 1, running: running.has(id),
         task: task?.title ?? request?.text ?? t(running.has(id) ? 'screen.working' : 'world.freeTime'),
-        role: member ? [member.role, member.model, member.effort, t(member.relation === 'peer' ? 'relation.peer' : 'relation.managed')].filter(Boolean).join(' · ') : t('member.leader'),
+        role: member
+          ? [
+              member.role,
+              member.model === undefined
+                ? undefined
+                : member.provider === undefined ? member.model : `${member.provider}/${member.model}`,
+              member.effort,
+              t(member.relation === 'peer' ? 'relation.peer' : 'relation.managed'),
+            ].filter(Boolean).join(' · ')
+          : t('member.leader'),
       }
     })
     return { names, seats, roster, running, openOf, worldMembers }

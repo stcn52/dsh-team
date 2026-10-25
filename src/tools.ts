@@ -55,6 +55,7 @@ const MEMBER_PROPERTIES = {
   name: { type: 'string', required: true },
   role: { type: 'string' },
   relation: { type: 'string', required: true, enum: ['managed', 'peer'] },
+  provider: { type: 'string' },
   model: { type: 'string' },
   effort: { type: 'string' },
 } as const
@@ -70,13 +71,15 @@ const TASK_PROPERTIES = {
 
 /** Drop the undefined optional members a JSON fact must not carry. */
 function memberValue(member: TeamMemberFact): {
-  memberId: string; name: string; role?: string; relation: 'managed' | 'peer'; model?: string; effort?: string
+  memberId: string; name: string; role?: string; relation: 'managed' | 'peer'
+  provider?: string; model?: string; effort?: string
 } {
   return {
     memberId: member.memberId,
     name: member.name,
     relation: member.relation,
     ...member.role !== undefined ? { role: member.role } : {},
+    ...member.provider !== undefined ? { provider: member.provider } : {},
     ...member.model !== undefined ? { model: member.model } : {},
     ...member.effort !== undefined ? { effort: member.effort } : {},
   }
@@ -137,7 +140,18 @@ export function spawnTool(ctx: Context): ToolDefinition {
       },
       role: { type: 'string', description: 'Optional role, e.g. reviewer. Shown to the whole team.' },
       persona: { type: 'string', description: 'Optional persona replacing the deployment persona for this teammate only.' },
-      model: { type: 'string', description: 'Optional model id; default inherits your own model.' },
+      provider: {
+        type: 'string',
+        description: 'Optional LLM provider route for this teammate, e.g. a locally served "qwen-local". '
+          + 'Default inherits your own provider. Naming another provider requires model too — model ids are '
+          + 'provider-scoped. A provider this deployment never registered is refused at spawn, with the '
+          + 'registered routes listed.',
+      },
+      model: {
+        type: 'string',
+        description: 'Optional model id; default inherits your own model. Interpreted by the selected provider, '
+          + 'so a local route needs its own model id rather than your model.',
+      },
       reasoning_effort: { type: 'string', description: 'Optional provider-owned reasoning effort for this teammate, e.g. high. Rejected when the model does not offer it.' },
     },
     output: {
@@ -152,6 +166,7 @@ export function spawnTool(ctx: Context): ToolDefinition {
     presentCall: args => call(`Spawn teammate ${args.name}`, {
       relation: args.relation,
       ...args.role !== undefined ? { role: args.role } : {},
+      ...args.provider !== undefined ? { provider: args.provider } : {},
       ...args.model !== undefined ? { model: args.model } : {},
       task: args.task,
     }),
@@ -166,6 +181,7 @@ export function spawnTool(ctx: Context): ToolDefinition {
         relation: args.relation,
         ...args.role !== undefined ? { role: args.role } : {},
         ...args.persona !== undefined ? { persona: args.persona } : {},
+        ...args.provider !== undefined ? { provider: args.provider } : {},
         ...args.model !== undefined ? { model: args.model } : {},
         ...args.reasoning_effort !== undefined ? { reasoningEffort: args.reasoning_effort } : {},
       }, exec.signal)

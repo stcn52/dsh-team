@@ -29,6 +29,8 @@ export interface TeamMemberView {
   readonly name: string
   readonly role?: string
   readonly relation: TeamRelation
+  /** Provider route recorded at spawn, when it differs from the leader's own. */
+  readonly provider?: string
   /** Model route recorded at spawn, when the leader overrode its own. */
   readonly model?: string
   /** Provider-owned reasoning effort recorded at spawn, when one was requested. */

@@ -15,7 +15,20 @@ with `this.ctx.subagents.startContinuable is not a function`.
 - `src/service.ts`, `dist/index.js`: `startContinuable` → `startActivation`,
   passing `delivery: 'parent'` (matches the pre-0.2.1 continuable behaviour:
   the leader's model is notified when a teammate settles).
-- `package.json`: version `0.2.12`, `@deepseek-ai/dsh-*` peers `^0.2.1-rc.1`.
+- `package.json`: version `0.2.13`, `@deepseek-ai/dsh-*` peers `^0.2.1-rc.1`.
+- `0.2.13` — local-model routing for teammates:
+  - `team_spawn` takes an optional `provider` (`AgentOptions.provider` already
+    exists in DSH; `resolveChildAgentOptions()` overrides the parent route and
+    drops the parent's route-owned effort), so one teammate can run on a
+    locally served model while the leader stays on `deepseek-official`.
+  - the spawn refuses an unregistered provider (`UNKNOWN_PROVIDER`, listing the
+    registered routes) and a route change without a model id
+    (`MODEL_REQUIRED`, because model ids are provider-scoped).
+  - the route is recorded on the roster row (`provider`/`model`) and shown on
+    the stage as `provider/model`.
+  - new deployment knobs `teammateProvider` / `teammateModel` default every
+    teammate route (empty = inherit the leader's), which is what makes "the
+    whole team works on the local model" a two-line profile patch.
 
 `dist/` is committed, so installing straight from git needs no build step.
 

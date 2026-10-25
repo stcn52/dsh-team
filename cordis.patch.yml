@@ -30,3 +30,10 @@
         maxWorkspaceEntries: 32
         # Longest single note body.
         maxNoteChars: 4000
+        # Default LLM route for a teammate whose spawn names no provider/model.
+        # Leave both empty to inherit the leader's own route. Set the pair to run
+        # every teammate on another route — e.g. a locally served model:
+        #   teammateProvider: qwen-local
+        #   teammateModel: qwen3.8-flash-next-iq3_s
+        teammateProvider: ''
+        teammateModel: ''

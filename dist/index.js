@@ -25,7 +25,9 @@ const Config = z.object({
 	maxChainHops: z.number().step(1).min(1).max(64).default(4),
 	maxChainRoundTrips: z.number().step(1).min(1).max(64).default(2),
 	maxWorkspaceEntries: z.number().step(1).min(1).max(500).default(32),
-	maxNoteChars: z.number().step(1).min(200).max(2e5).default(4e3)
+	maxNoteChars: z.number().step(1).min(200).max(2e5).default(4e3),
+	teammateProvider: z.string().default(""),
+	teammateModel: z.string().default("")
 });
 //#endregion
 //#region src/command.ts
@@ -221,6 +223,7 @@ function readDispatchFact(view, data, time) {
 			if (name === void 0 || relation === void 0 || memberId === void 0) return void 0;
 			if (text !== `teammate ${name} joined as a ${relation} member and started on its task. Address it as "${name}" or "${memberId}".`) return void 0;
 			const role = asText$1(args["role"]);
+			const provider = asText$1(args["provider"]);
 			const model = asText$1(args["model"]);
 			const effort = asText$1(args["reasoning_effort"]);
 			return {
@@ -230,6 +233,7 @@ function readDispatchFact(view, data, time) {
 					name,
 					relation,
 					...role !== void 0 ? { role } : {},
+					...provider !== void 0 ? { provider } : {},
 					...model !== void 0 ? { model } : {},
 					...effort !== void 0 ? { effort } : {}
 				}
@@ -332,6 +336,7 @@ function readMember(value) {
 	const relation = asRelation(record["relation"]);
 	if (memberId === void 0 || name === void 0 || relation === void 0) return void 0;
 	const role = asText(record["role"]);
+	const provider = asText(record["provider"]);
 	const model = asText(record["model"]);
 	const effort = asText(record["effort"]);
 	return {
@@ -339,6 +344,7 @@ function readMember(value) {
 		name,
 		relation,
 		...role !== void 0 ? { role } : {},
+		...provider !== void 0 ? { provider } : {},
 		...model !== void 0 ? { model } : {},
 		...effort !== void 0 ? { effort } : {}
 	};
@@ -626,6 +632,7 @@ const teamViewSchema = z$1.object({
 		name: z$1.string(),
 		role: z$1.string().optional(),
 		relation: z$1.union([z$1.literal("managed"), z$1.literal("peer")]),
+		provider: z$1.string().optional(),
 		model: z$1.string().optional(),
 		effort: z$1.string().optional(),
 		joinedAt: z$1.number()
@@ -695,6 +702,8 @@ const MESSAGES = {
 	TASK_TITLE_REQUIRED: "a new task needs a title",
 	SELF_MESSAGE: "a member cannot message itself",
 	UNAUTHORIZED: "this team operation is not available to you",
+	UNKNOWN_PROVIDER: "no LLM provider with that id is registered here — spawn with the leader's own route, or name one of the registered providers",
+	MODEL_REQUIRED: "a teammate on a provider other than the leader's needs an explicit model id: model ids are provider-scoped, so the leader's model usually does not exist on the other route",
 	UNKNOWN_EFFORT: "that reasoning effort is not offered by the selected model",
 	CHAIN_EXHAUSTED: "this conversation has relayed as far as it may between teammates — settle it yourself and report to the leader, which is never refused",
 	PING_PONG: "you have already said your piece to this member in this conversation — decide with what you have, or raise it with the leader",
@@ -827,9 +836,12 @@ var TeamService = class extends Service {
 		const team = this.teamOf(leader);
 		if (team.members.size >= this.config.maxTeammates) throw new TeamError("MAX_TEAMMATES", String(this.config.maxTeammates));
 		if (findByName(team, request.name) !== void 0) throw new TeamError("DUPLICATE_NAME", request.name);
-		await this.assertEffortOffered(leader, request);
+		const route = this.resolveRoute(leader, request);
+		await this.assertProviderRegistered(leader, route.provider);
+		await this.assertEffortOffered(leader, request, route);
 		const agentOptions = {
-			...request.model !== void 0 ? { model: request.model } : {},
+			...route.provider !== void 0 ? { provider: route.provider } : {},
+			...route.model !== void 0 ? { model: route.model } : {},
 			...request.reasoningEffort !== void 0 ? { reasoningEffort: ReasoningEffortId(request.reasoningEffort) } : {}
 		};
 		const pending = {
@@ -837,7 +849,8 @@ var TeamService = class extends Service {
 				name: request.name,
 				relation: request.relation,
 				...request.role !== void 0 ? { role: request.role } : {},
-				...request.model !== void 0 ? { model: request.model } : {},
+				...route.provider !== void 0 ? { provider: route.provider } : {},
+				...route.model !== void 0 ? { model: route.model } : {},
 				...request.reasoningEffort !== void 0 ? { effort: request.reasoningEffort } : {}
 			},
 			claimed: []
@@ -1211,17 +1224,56 @@ var TeamService = class extends Service {
 		return await queueHostSubagentPrompt(this.ctx.subagents, actor.leader, SessionId(recipient.id), content, source, signal);
 	}
 	/**
+	* The route this spawn runs on. A request that names its own provider or
+	* model wins exactly as given; one that names neither falls back to the
+	* deployment's teammate route, so a single `teammateProvider` pair turns
+	* every teammate local without overriding a leader that asked for a
+	* specific route. Model ids are provider-scoped, so a route change without
+	* a model is refused instead of sending the leader's model id to a provider
+	* that never advertised it.
+	*/
+	resolveRoute(leader, request) {
+		const explicit = request.provider !== void 0 || request.model !== void 0;
+		const provider = explicit ? request.provider : this.config.teammateProvider === "" ? void 0 : this.config.teammateProvider;
+		const model = explicit ? request.model : this.config.teammateModel === "" ? void 0 : this.config.teammateModel;
+		if (provider !== void 0 && provider !== leader.options.provider && model === void 0) throw new TeamError("MODEL_REQUIRED", provider);
+		return {
+			...provider !== void 0 ? { provider } : {},
+			...model !== void 0 ? { model } : {}
+		};
+	}
+	/**
+	* Reject a spawn aimed at a provider this deployment never registered, at
+	* spawn rather than on the teammate's first request: the failure would
+	* otherwise arrive as an adapter error inside the teammate's own turn,
+	* where the leader cannot see it or correct the route.
+	*/
+	assertProviderRegistered(leader, provider) {
+		if (provider === void 0 || provider === leader.options.provider) return;
+		const llm = this.ctx.get("llm");
+		if (llm === void 0) return;
+		const registered = llm.listProviders();
+		if (registered.length === 0 || registered.some((entry) => entry.id === provider)) return;
+		throw new TeamError("UNKNOWN_PROVIDER", `${provider}; registered: ${registered.map((entry) => entry.id).join(", ")}`);
+	}
+	/**
 	* Reject a reasoning effort the selected model does not offer, at spawn
 	* rather than on the teammate's every later request. Validation needs an
 	* exact provider/model route: without one the adapter stays the authority.
 	*/
-	async assertEffortOffered(leader, request) {
+	async assertEffortOffered(leader, request, route) {
 		if (request.reasoningEffort === void 0) return;
 		const llm = this.ctx.get("llm");
-		const provider = leader.options.provider;
-		const model = request.model ?? leader.options.model;
+		const provider = route.provider ?? leader.options.provider;
+		const model = route.model ?? leader.options.model;
 		if (llm === void 0 || provider === void 0 || model === void 0) return;
-		const offered = (await llm.resolveModelInfo(provider, model)).reasoning?.efforts ?? [];
+		let info;
+		try {
+			info = await llm.resolveModelInfo(provider, model);
+		} catch {
+			return;
+		}
+		const offered = info.reasoning?.efforts ?? [];
 		if (offered.some((effort) => effort.id === request.reasoningEffort)) return;
 		throw new TeamError("UNKNOWN_EFFORT", offered.length === 0 ? `${model} exposes no reasoning efforts` : `${model} offers ${offered.map((effort) => effort.id).join(", ")}`);
 	}
@@ -1253,6 +1305,7 @@ function memberFact(member) {
 		name: member.name,
 		relation: member.relation,
 		...member.role !== void 0 ? { role: member.role } : {},
+		...member.provider !== void 0 ? { provider: member.provider } : {},
 		...member.model !== void 0 ? { model: member.model } : {},
 		...member.effort !== void 0 ? { effort: member.effort } : {}
 	};
@@ -1482,6 +1535,7 @@ const MEMBER_PROPERTIES = {
 		required: true,
 		enum: ["managed", "peer"]
 	},
+	provider: { type: "string" },
 	model: { type: "string" },
 	effort: { type: "string" }
 };
@@ -1514,6 +1568,7 @@ function memberValue(member) {
 		name: member.name,
 		relation: member.relation,
 		...member.role !== void 0 ? { role: member.role } : {},
+		...member.provider !== void 0 ? { provider: member.provider } : {},
 		...member.model !== void 0 ? { model: member.model } : {},
 		...member.effort !== void 0 ? { effort: member.effort } : {}
 	};
@@ -1579,9 +1634,13 @@ function spawnTool(ctx) {
 				type: "string",
 				description: "Optional persona replacing the deployment persona for this teammate only."
 			},
+			provider: {
+				type: "string",
+				description: "Optional LLM provider route for this teammate, e.g. a locally served \"qwen-local\". Default inherits your own provider. Naming another provider requires model too — model ids are provider-scoped. A provider this deployment never registered is refused at spawn, with the registered routes listed."
+			},
 			model: {
 				type: "string",
-				description: "Optional model id; default inherits your own model."
+				description: "Optional model id; default inherits your own model. Interpreted by the selected provider, so a local route needs its own model id rather than your model."
 			},
 			reasoning_effort: {
 				type: "string",
@@ -1606,6 +1665,7 @@ function spawnTool(ctx) {
 		presentCall: (args) => call(`Spawn teammate ${args.name}`, {
 			relation: args.relation,
 			...args.role !== void 0 ? { role: args.role } : {},
+			...args.provider !== void 0 ? { provider: args.provider } : {},
 			...args.model !== void 0 ? { model: args.model } : {},
 			task: args.task
 		}),
@@ -1618,6 +1678,7 @@ function spawnTool(ctx) {
 				relation: args.relation,
 				...args.role !== void 0 ? { role: args.role } : {},
 				...args.persona !== void 0 ? { persona: args.persona } : {},
+				...args.provider !== void 0 ? { provider: args.provider } : {},
 				...args.model !== void 0 ? { model: args.model } : {},
 				...args.reasoning_effort !== void 0 ? { reasoningEffort: args.reasoning_effort } : {}
 			}, exec.signal));

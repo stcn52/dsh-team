@@ -24,6 +24,7 @@ const teamViewSchema = z.object({
     name: z.string(),
     role: z.string().optional(),
     relation: z.union([z.literal('managed'), z.literal('peer')]),
+    provider: z.string().optional(),
     model: z.string().optional(),
     effort: z.string().optional(),
     joinedAt: z.number(),

@@ -84,8 +84,20 @@ export interface TeamSpawnRequest {
   readonly persona?: string
   readonly relation: TeamRelation
   readonly task: string
+  /**
+   * LLM provider route for this teammate. Omitted inherits the leader's route
+   * (or the deployment's `teammateProvider` default); naming another route is
+   * how one teammate runs on a locally served model.
+   */
+  readonly provider?: string
   readonly model?: string
   readonly reasoningEffort?: string
+}
+
+/** The route one spawn resolves to, after request and deployment defaults. */
+interface ResolvedRoute {
+  readonly provider?: string
+  readonly model?: string
 }
 
 /** One roster row with its live runtime state. */
@@ -207,9 +219,12 @@ export class TeamService extends Service {
       throw new TeamError('MAX_TEAMMATES', String(this.config.maxTeammates))
     }
     if (findByName(team, request.name) !== undefined) throw new TeamError('DUPLICATE_NAME', request.name)
-    await this.assertEffortOffered(leader, request)
+    const route = this.resolveRoute(leader, request)
+    await this.assertProviderRegistered(leader, route.provider)
+    await this.assertEffortOffered(leader, request, route)
     const agentOptions: AgentOptions = {
-      ...request.model !== undefined ? { model: request.model } : {},
+      ...route.provider !== undefined ? { provider: route.provider } : {},
+      ...route.model !== undefined ? { model: route.model } : {},
       ...request.reasoningEffort !== undefined
         ? { reasoningEffort: ReasoningEffortId(request.reasoningEffort) }
         : {},
@@ -219,7 +234,8 @@ export class TeamService extends Service {
         name: request.name,
         relation: request.relation,
         ...request.role !== undefined ? { role: request.role } : {},
-        ...request.model !== undefined ? { model: request.model } : {},
+        ...route.provider !== undefined ? { provider: route.provider } : {},
+        ...route.model !== undefined ? { model: route.model } : {},
         ...request.reasoningEffort !== undefined ? { effort: request.reasoningEffort } : {},
       },
       claimed: [],
@@ -616,17 +632,74 @@ export class TeamService extends Service {
   }
 
   /**
+   * The route this spawn runs on. A request that names its own provider or
+   * model wins exactly as given; one that names neither falls back to the
+   * deployment's teammate route, so a single `teammateProvider` pair turns
+   * every teammate local without overriding a leader that asked for a
+   * specific route. Model ids are provider-scoped, so a route change without
+   * a model is refused instead of sending the leader's model id to a provider
+   * that never advertised it.
+   */
+  private resolveRoute(leader: Agent, request: TeamSpawnRequest): ResolvedRoute {
+    const explicit = request.provider !== undefined || request.model !== undefined
+    const provider = explicit
+      ? request.provider
+      : this.config.teammateProvider === '' ? undefined : this.config.teammateProvider
+    const model = explicit
+      ? request.model
+      : this.config.teammateModel === '' ? undefined : this.config.teammateModel
+    if (provider !== undefined && provider !== leader.options.provider && model === undefined) {
+      throw new TeamError('MODEL_REQUIRED', provider)
+    }
+    return {
+      ...provider !== undefined ? { provider } : {},
+      ...model !== undefined ? { model } : {},
+    }
+  }
+
+  /**
+   * Reject a spawn aimed at a provider this deployment never registered, at
+   * spawn rather than on the teammate's first request: the failure would
+   * otherwise arrive as an adapter error inside the teammate's own turn,
+   * where the leader cannot see it or correct the route.
+   */
+  private assertProviderRegistered(leader: Agent, provider: string | undefined): void {
+    if (provider === undefined || provider === leader.options.provider) return
+    const llm = this.ctx.get('llm')
+    if (llm === undefined) return
+    const registered = llm.listProviders()
+    // An empty registry means no adapter has mounted yet: the spawn stays the
+    // adapter's call rather than refusing every route on a technicality.
+    if (registered.length === 0 || registered.some(entry => entry.id === provider)) return
+    throw new TeamError(
+      'UNKNOWN_PROVIDER',
+      `${provider}; registered: ${registered.map(entry => entry.id).join(', ')}`,
+    )
+  }
+
+  /**
    * Reject a reasoning effort the selected model does not offer, at spawn
    * rather than on the teammate's every later request. Validation needs an
    * exact provider/model route: without one the adapter stays the authority.
    */
-  private async assertEffortOffered(leader: Agent, request: TeamSpawnRequest): Promise<void> {
+  private async assertEffortOffered(
+    leader: Agent,
+    request: TeamSpawnRequest,
+    route: ResolvedRoute,
+  ): Promise<void> {
     if (request.reasoningEffort === undefined) return
     const llm = this.ctx.get('llm')
-    const provider = leader.options.provider
-    const model = request.model ?? leader.options.model
+    const provider = route.provider ?? leader.options.provider
+    const model = route.model ?? leader.options.model
     if (llm === undefined || provider === undefined || model === undefined) return
-    const info = await llm.resolveModelInfo(provider, model)
+    let info: Awaited<ReturnType<typeof llm.resolveModelInfo>>
+    try {
+      info = await llm.resolveModelInfo(provider, model)
+    } catch {
+      // An unresolvable route stays the adapter's authority; the provider check
+      // above already refused the mismatch the leader can act on.
+      return
+    }
     const offered = info.reasoning?.efforts ?? []
     if (offered.some(effort => effort.id === request.reasoningEffort)) return
     throw new TeamError(
@@ -667,6 +740,7 @@ function memberFact(member: TeamMemberView): TeamMemberFact {
     name: member.name,
     relation: member.relation,
     ...member.role !== undefined ? { role: member.role } : {},
+    ...member.provider !== undefined ? { provider: member.provider } : {},
     ...member.model !== undefined ? { model: member.model } : {},
     ...member.effort !== undefined ? { effort: member.effort } : {},
   }

@@ -204,11 +204,22 @@ export class FakeAgents {
   }
 }
 
-/** The `ctx.llm` double: only the model-info read the team validates against. */
+/** The `ctx.llm` double: the provider directory and the model-info read the team validates against. */
 export class FakeLlm {
-  constructor(private readonly efforts: readonly string[]) {}
+  /** Route pairs `resolveModelInfo` was asked about, in call order. */
+  readonly resolved: Array<{ provider: string; model: string }> = []
 
-  async resolveModelInfo(_provider: string, _model: string): Promise<{ reasoning?: { efforts: { id: string }[] } }> {
+  constructor(
+    private readonly efforts: readonly string[],
+    private readonly providers: readonly string[] = ['deepseek'],
+  ) {}
+
+  listProviders(): Array<{ id: string; name: string }> {
+    return this.providers.map(id => ({ id, name: id }))
+  }
+
+  async resolveModelInfo(provider: string, model: string): Promise<{ reasoning?: { efforts: { id: string }[] } }> {
+    this.resolved.push({ provider, model })
     return await Promise.resolve(
       this.efforts.length === 0 ? {} : { reasoning: { efforts: this.efforts.map(id => ({ id })) } },
     )

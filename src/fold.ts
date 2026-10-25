@@ -29,6 +29,7 @@ export interface TeamMemberFact {
   readonly name: string
   readonly role?: string
   readonly relation: TeamRelation
+  readonly provider?: string
   readonly model?: string
   readonly effort?: string
 }
@@ -87,6 +88,7 @@ function readMember(value: unknown): TeamMemberFact | undefined {
   const relation = asRelation(record['relation'])
   if (memberId === undefined || name === undefined || relation === undefined) return undefined
   const role = asText(record['role'])
+  const provider = asText(record['provider'])
   const model = asText(record['model'])
   const effort = asText(record['effort'])
   return {
@@ -94,6 +96,7 @@ function readMember(value: unknown): TeamMemberFact | undefined {
     name,
     relation,
     ...role !== undefined ? { role } : {},
+    ...provider !== undefined ? { provider } : {},
     ...model !== undefined ? { model } : {},
     ...effort !== undefined ? { effort } : {},
   }

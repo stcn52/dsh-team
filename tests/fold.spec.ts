@@ -14,7 +14,10 @@ import { codeDispatchEvent, toolResultEvent, userMessageEvent } from './harness.
 
 const BOUND = 50
 
-const alice = { memberId: 'child-1', name: 'Alice', role: 'reviewer', relation: 'peer', model: 'x', effort: 'high' }
+const alice = {
+  memberId: 'child-1', name: 'Alice', role: 'reviewer', relation: 'peer',
+  provider: 'qwen-local', model: 'x', effort: 'high',
+}
 const bob = { memberId: 'child-2', name: 'Bob', relation: 'managed' }
 
 describe('readFact', () => {

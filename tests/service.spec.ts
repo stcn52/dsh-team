@@ -16,7 +16,7 @@ import {
 
 const CONFIG: TeamConfig = {
   provider: 'spawn', maxTeammates: 2, maxRecentMessages: 20, maxChainHops: 4, maxChainRoundTrips: 2,
-  maxWorkspaceEntries: 8, maxNoteChars: 400,
+  maxWorkspaceEntries: 8, maxNoteChars: 400, teammateProvider: '', teammateModel: '',
 }
 
 /** One assembled world: the service plus the doubles it was built on. */
@@ -26,6 +26,8 @@ interface World {
   readonly agents: FakeAgents
   readonly subagents: FakeSubagents
   readonly leader: FakeAgent
+  /** The provider directory and model-info double, when the world mounted one. */
+  readonly llm?: FakeLlm
 }
 
 const signal = new AbortController().signal
@@ -53,6 +55,7 @@ function world(options: {
   readonly config?: TeamConfig
   readonly leader?: FakeAgent
   readonly efforts?: readonly string[]
+  readonly providers?: readonly string[]
 } = {}): World {
   const ctx = new Context()
   const agents = new FakeAgents(ctx)
@@ -60,6 +63,7 @@ function world(options: {
   subagents.publishChild = (childId, parentId, options) => {
     agents.add(fakeAgent(String(childId), {
       parent: String(parentId),
+      ...typeof options?.provider === 'string' ? { provider: options.provider } : {},
       ...typeof options?.model === 'string' ? { model: options.model } : {},
       ...typeof options?.reasoningEffort === 'string' ? { reasoningEffort: options.reasoningEffort } : {},
     }))
@@ -67,10 +71,13 @@ function world(options: {
   ctx.provide('agents', agents)
   ctx.provide('subagents', subagents)
   ctx.provide('sessions', {})
-  if (options.efforts !== undefined) ctx.provide('llm', new FakeLlm(options.efforts))
+  const llm = options.efforts === undefined && options.providers === undefined
+    ? undefined
+    : new FakeLlm(options.efforts ?? [], options.providers)
+  if (llm !== undefined) ctx.provide('llm', llm)
   const service = new TeamService(ctx, options.config ?? CONFIG)
   const leader = agents.add(options.leader ?? fakeAgent('leader-1', { provider: 'deepseek', model: 'chat' }))
-  return { ctx, service, agents, subagents, leader }
+  return { ctx, service, agents, subagents, leader, ...llm !== undefined ? { llm } : {} }
 }
 
 /** Spawn one teammate and register its live agent double. */
@@ -78,6 +85,7 @@ async function spawn(scene: World, name: string, options: {
   readonly relation?: 'managed' | 'peer'
   readonly childId?: string
   readonly role?: string
+  readonly provider?: string
   readonly model?: string
   readonly effort?: string
 } = {}): Promise<FakeAgent> {
@@ -87,6 +95,7 @@ async function spawn(scene: World, name: string, options: {
     task: `do ${name}'s work`,
     relation: options.relation ?? 'managed',
     ...options.role !== undefined ? { role: options.role } : {},
+    ...options.provider !== undefined ? { provider: options.provider } : {},
     ...options.model !== undefined ? { model: options.model } : {},
     ...options.effort !== undefined ? { reasoningEffort: options.effort } : {},
   }, signal)
@@ -193,6 +202,65 @@ describe('spawn', () => {
     expect(scene.service.adopt(bob.agent)).toMatchObject({ memberId: 'child-2', name: 'Bob' })
     expect(scene.service.adopt(alice.agent)).toMatchObject({ memberId: 'child-1', name: 'Alice' })
     expect(scene.service.list(scene.leader.agent).members.map(member => member.name)).toEqual(['Bob', 'Alice'])
+  })
+})
+
+describe('provider routing', () => {
+  it('runs one teammate on another provider route, and records the route', async () => {
+    const scene = world({ providers: ['deepseek', 'qwen-local'] })
+    const alice = await spawn(scene, 'Alice', { provider: 'qwen-local', model: 'qwen3.8-flash-next-iq3_s' })
+
+    expect(scene.subagents.started[0]?.agentOptions).toEqual({
+      provider: 'qwen-local',
+      model: 'qwen3.8-flash-next-iq3_s',
+    })
+    expect(alice.options).toMatchObject({ provider: 'qwen-local', model: 'qwen3.8-flash-next-iq3_s' })
+    expect(scene.service.list(scene.leader.agent).members[0]).toMatchObject({
+      provider: 'qwen-local',
+      model: 'qwen3.8-flash-next-iq3_s',
+    })
+  })
+
+  it('refuses a provider this deployment never registered, naming the ones it has', async () => {
+    const scene = world({ providers: ['deepseek', 'qwen-local'] })
+    await expect(spawn(scene, 'Alice', { provider: 'ollama', model: 'x' }))
+      .rejects.toMatchObject({ code: 'UNKNOWN_PROVIDER' })
+    await expect(spawn(scene, 'Alice', { provider: 'ollama', model: 'x' }))
+      .rejects.toThrow(/registered: deepseek, qwen-local/)
+    expect(scene.subagents.started).toHaveLength(0)
+  })
+
+  it('requires a model id when the route changes, because model ids are provider-scoped', async () => {
+    const scene = world({ providers: ['deepseek', 'qwen-local'] })
+    await expect(spawn(scene, 'Alice', { provider: 'qwen-local' }))
+      .rejects.toMatchObject({ code: 'MODEL_REQUIRED' })
+    expect(scene.subagents.started).toHaveLength(0)
+  })
+
+  it('stays on the leader route when the spawn leaves the provider alone', async () => {
+    const scene = world({ providers: ['deepseek', 'qwen-local'] })
+    await spawn(scene, 'Alice', { model: 'reasoner' })
+    expect(scene.subagents.started[0]?.agentOptions).toEqual({ model: 'reasoner' })
+    expect(scene.service.list(scene.leader.agent).members[0]?.provider).toBeUndefined()
+  })
+
+  it('routes every teammate by default when the deployment configures a teammate route', async () => {
+    const scene = world({
+      config: { ...CONFIG, teammateProvider: 'qwen-local', teammateModel: 'qwen3.8-flash-next-iq3_s' },
+      providers: ['deepseek', 'qwen-local'],
+    })
+    await spawn(scene, 'Alice')
+    await spawn(scene, 'Bob')
+    expect(scene.subagents.started.map(started => started.agentOptions)).toEqual([
+      { provider: 'qwen-local', model: 'qwen3.8-flash-next-iq3_s' },
+      { provider: 'qwen-local', model: 'qwen3.8-flash-next-iq3_s' },
+    ])
+  })
+
+  it('validates a requested effort against the requested route, not the leader route', async () => {
+    const scene = world({ efforts: ['low'], providers: ['deepseek', 'qwen-local'] })
+    await spawn(scene, 'Alice', { provider: 'qwen-local', model: 'qwen3.8', effort: 'low' })
+    expect(scene.llm?.resolved).toEqual([{ provider: 'qwen-local', model: 'qwen3.8' }])
   })
 })
 

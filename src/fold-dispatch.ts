@@ -153,6 +153,7 @@ export function readDispatchFact(view: TeamView, data: unknown, time: number): u
       if (name === undefined || relation === undefined || memberId === undefined) return undefined
       if (text !== `teammate ${name} joined as a ${relation} member and started on its task. Address it as "${name}" or "${memberId}".`) return undefined
       const role = asText(args['role'])
+      const provider = asText(args['provider'])
       const model = asText(args['model'])
       const effort = asText(args['reasoning_effort'])
       return {
@@ -162,6 +163,7 @@ export function readDispatchFact(view: TeamView, data: unknown, time: number): u
           name,
           relation,
           ...role !== undefined ? { role } : {},
+          ...provider !== undefined ? { provider } : {},
           ...model !== undefined ? { model } : {},
           ...effort !== undefined ? { effort } : {},
         },

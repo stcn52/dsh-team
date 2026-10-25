@@ -18,6 +18,8 @@ export type TeamErrorCode =
   | 'TASK_TITLE_REQUIRED'
   | 'SELF_MESSAGE'
   | 'UNAUTHORIZED'
+  | 'UNKNOWN_PROVIDER'
+  | 'MODEL_REQUIRED'
   | 'UNKNOWN_EFFORT'
   | 'CHAIN_EXHAUSTED'
   | 'PING_PONG'
@@ -42,6 +44,12 @@ const MESSAGES: Record<TeamErrorCode, string> = {
   TASK_TITLE_REQUIRED: 'a new task needs a title',
   SELF_MESSAGE: 'a member cannot message itself',
   UNAUTHORIZED: 'this team operation is not available to you',
+  UNKNOWN_PROVIDER:
+    'no LLM provider with that id is registered here — spawn with the leader\'s own route, or name one of '
+    + 'the registered providers',
+  MODEL_REQUIRED:
+    'a teammate on a provider other than the leader\'s needs an explicit model id: model ids are '
+    + 'provider-scoped, so the leader\'s model usually does not exist on the other route',
   UNKNOWN_EFFORT: 'that reasoning effort is not offered by the selected model',
   CHAIN_EXHAUSTED:
     'this conversation has relayed as far as it may between teammates — settle it yourself and report to '

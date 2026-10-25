@@ -27,6 +27,15 @@ export interface TeamConfig {
   readonly maxWorkspaceEntries: number
   /** Longest single note body. */
   readonly maxNoteChars: number
+  /**
+   * Default LLM provider route for a teammate the leader does not address
+   * explicitly. Empty inherits the leader's own route. Set it together with
+   * {@link teammateModel} to run every teammate on another route — a locally
+   * served model, for instance — without repeating the route on every spawn.
+   */
+  readonly teammateProvider: string
+  /** Default model id paired with {@link teammateProvider}; empty inherits the leader's. */
+  readonly teammateModel: string
 }
 
 /**
@@ -42,4 +51,6 @@ export const Config: z<Partial<TeamConfig>, TeamConfig> = z.object({
   maxChainRoundTrips: z.number().step(1).min(1).max(64).default(2),
   maxWorkspaceEntries: z.number().step(1).min(1).max(500).default(32),
   maxNoteChars: z.number().step(1).min(200).max(200_000).default(4000),
+  teammateProvider: z.string().default(''),
+  teammateModel: z.string().default(''),
 })

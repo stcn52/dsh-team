@@ -13,7 +13,7 @@ import { SHARED_AREA, TeamWorkspace, type WorkspaceEntry } from '../src/workspac
 
 const CONFIG: TeamConfig = {
   provider: 'spawn', maxTeammates: 8, maxRecentMessages: 20, maxChainHops: 4, maxChainRoundTrips: 2,
-  maxWorkspaceEntries: 3, maxNoteChars: 40,
+  maxWorkspaceEntries: 3, maxNoteChars: 40, teammateProvider: '', teammateModel: '',
 }
 
 const alice = { id: 'child-1', name: 'Alice' }
