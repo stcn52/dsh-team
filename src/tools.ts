@@ -683,11 +683,13 @@ export function waitTool(ctx: Context): ToolDefinition {
       + 'for every member when you name none, returns as soon as they are all done, and gives up after '
       + `timeout_ms (default ${WAIT_DEFAULT_MS / 60_000} minutes, at most ${WAIT_MAX_MS / 60_000}) with `
       + 'timedOut: true, the still-running members in busy, and the members that never showed a live session '
-      + 'in cold. An idle member counts as done, and so does a member whose session is already gone but whose '
-      + 'report has reached you — queued in your own inbox, spliced into your own session log, or already in '
-      + 'your mailbox: a short turn can run '
-      + 'and be reaped before this call takes its first look, and its settlement notice waits in your inbox '
-      + 'until your next turn starts. '
+      + 'in cold. It waits for the REPORT, not just for quiescence: a member counts as done only when its turn '
+      + 'is over AND something it said is readable — queued in your own inbox, spliced into your own session '
+      + 'log, or already in your mailbox — so the names in done are exactly the members in reports. A member '
+      + 'whose turn ended but whose words have not arrived is still being waited for; if the budget runs out '
+      + 'first it lands in busy (finished, nothing readable handed back), never in done and never in cold. A '
+      + 'short turn can run and be reaped before this call takes its first look, and its settlement notice '
+      + 'waits in your inbox until your next turn starts. '
       + 'cold means no live session was seen for that member AND nothing from it has reached you for this '
       + 'round — not your inbox, not your own log, not your mailbox — so it '
       + 'is NOT finished as far as this call can tell — it may not have started yet, or it may have finished '
@@ -717,16 +719,19 @@ export function waitTool(ctx: Context): ToolDefinition {
             required: true,
             items: { type: 'string' },
             description:
-              'Members confirmed finished: their turn ended inside the wait, or their session was already gone '
-              + 'while their report had reached you (queued in your inbox, spliced into your log, or already in '
-              + 'your mailbox). '
-              + 'Never a cold member.',
+              'Members confirmed finished WITH their report readable: their turn ended inside the wait and a '
+              + 'report from them became readable, or their session was already gone while their report had '
+              + 'reached you (queued in your inbox, spliced into your log, or already in your mailbox). '
+              + 'One reports entry per name here, same order. Never a cold member.',
           },
           busy: {
             type: 'array',
             required: true,
             items: { type: 'string' },
-            description: 'Members seen running that were still running when the timeout expired; empty otherwise.',
+            description:
+              'Members whose work is not in your hands: still running when the timeout expired, or finished '
+              + 'with no readable report by then (the completion happened, its words did not arrive in time). '
+              + 'Empty otherwise.',
           },
           cold: {
             type: 'array',
@@ -761,8 +766,9 @@ export function waitTool(ctx: Context): ToolDefinition {
             },
             description:
               'What each finished member actually handed back, in done order: the member and its closing '
-              + 'text. A member that is done but left nothing readable has no entry, so this is a subset of '
-              + 'done; busy and cold members never appear.',
+              + 'text. In exact correspondence with done — one entry per member named there, same order — '
+              + 'because a member with nothing readable is not counted done at all. busy and cold members '
+              + 'never appear.',
           },
         },
       },

@@ -177,6 +177,26 @@ function queuedReply(memberId: string, name: string, text = 'OK'): UserMessage {
   })
 }
 
+/**
+ * Commit one spliced report into the leader's log the way the runtime does, and
+ * announce it on `session/event`.
+ *
+ * The announcement is the whole point: `Session.append()` publishes
+ * `session/event` post-commit, and that feed — not a poll — is what tells a
+ * waiting `team_wait` that a report may have become readable. A row pushed into
+ * the events array without this emit is a log the runtime could never have
+ * produced in that moment: invisible to a live wait.
+ * @param scene - the world whose leader log receives the row.
+ * @param message - the report to splice.
+ * @returns the committed event.
+ */
+function spliceReport(scene: World, message: UserMessage): ReturnType<typeof inboxSplicedEvent> {
+  const event = inboxSplicedEvent([message])
+  scene.leader.session.events.push(event)
+  scene.ctx.emit('session/event', scene.leader.session as never, event as never)
+  return event
+}
+
 describe('spawn', () => {
   let scene: World
 
@@ -1097,16 +1117,29 @@ describe('wait', () => {
     return armed
   }
 
-  it('returns at once with every member done when nobody is running', async () => {
+  /**
+   * The all-clear case under the new condition: both members' turns are over AND
+   * both reports are already readable, so the answer is immediate and carries
+   * what each member said. A member with nothing readable is not done at all —
+   * the next case is that half.
+   */
+  it('returns at once with every member done and its report readable', async () => {
     const scene = world()
-    await spawn(scene, 'Alice', { childId: 'child-1' })
-    await spawn(scene, 'Bob', { childId: 'child-2' })
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    scene.leader.inbox.nextStep.push(
+      settlementNotice(alice.id, 'alice done'),
+      settlementNotice(bob.id, 'bob done'),
+    )
 
     expect(await scene.service.wait(scene.leader.agent))
-      .toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false, reports: [] })
+      .toEqual({
+        done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false,
+        reports: [{ member: 'Alice', text: 'alice done' }, { member: 'Bob', text: 'bob done' }],
+      })
   })
 
-  it('blocks while a member runs, and returns as soon as it is idle', async () => {
+  it('blocks while a member runs, and returns as soon as it is idle and reported', async () => {
     const scene = world()
     const alice = await spawn(scene, 'Alice')
     alice.status = 'running'
@@ -1118,8 +1151,14 @@ describe('wait', () => {
     await sleep(80)
     expect(resolved).toEqual([])
 
+    // The turn ends and the runtime hands its closing words over: under the new
+    // rule those two are one event as far as the caller is concerned.
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
   })
 
   /**
@@ -1145,8 +1184,12 @@ describe('wait', () => {
     await sleep(80)
     expect(resolved).toEqual([])
 
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
   })
 
   it('re-reads the roster after the settle, so a member published meanwhile is still awaited', async () => {
@@ -1164,8 +1207,12 @@ describe('wait', () => {
     await sleep(80)
     expect(resolved).toEqual([])
 
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
   })
 
   /**
@@ -1216,19 +1263,28 @@ describe('wait', () => {
     // The publication was read, and the wait moved onto the harness's own signal.
     expect(alice.idleCalls).toBe(1)
 
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
   })
 
   it('reports the members still running when the budget expires, without hanging', async () => {
     const scene = world()
     const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
-    await spawn(scene, 'Bob', { childId: 'child-2' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
     alice.status = 'running'
+    // Bob is finished already — and finished means his report is readable too.
+    scene.leader.inbox.nextStep.push(settlementNotice(bob.id, 'bob done'))
 
     const started = Date.now()
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 20 })
-    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], cold: [], timedOut: true, reports: [] })
+    expect(observed).toEqual({
+      done: ['Bob'], busy: ['Alice'], cold: [], timedOut: true,
+      reports: [{ member: 'Bob', text: 'bob done' }],
+    })
     expect(Date.now() - started).toBeLessThan(2_000)
   })
 
@@ -1248,9 +1304,15 @@ describe('wait', () => {
     const started = Date.now()
     const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
     await sleep(40)
+    // A reaped member still has to have handed something back; disposal is a
+    // finish signal, not an answer.
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     scene.agents.remove(alice.id)
 
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
     expect(Date.now() - started).toBeLessThan(500)
   })
 
@@ -1607,12 +1669,18 @@ describe('wait', () => {
     // Carol is the cold one: the roster row exists, no live session does.
     scene.agents.remove(carol.id)
     carol.status = 'running'
-    // Alice finishes inside the window; Bob never does.
-    setTimeout(() => { alice.goIdle() }, 40)
+    // Alice finishes inside the window and hands her words back with the finish;
+    // Bob never does either.
+    setTimeout(() => {
+      scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
+      alice.goIdle()
+    }, 40)
 
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 150 })
-    expect(observed)
-      .toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true, reports: [] })
+    expect(observed).toEqual({
+      done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
 
     const flat = [...observed.done, ...observed.busy, ...observed.cold]
     // Disjoint: no name twice.
@@ -1671,8 +1739,12 @@ describe('wait', () => {
     await sleep(40)
     expect(live.size).toBe(1)
 
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     scene.agents.add(alice)
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
     expect(live.size).toBe(0)
   })
 
@@ -1727,9 +1799,13 @@ describe('wait', () => {
   it('names each member once, however it was addressed', async () => {
     const scene = world()
     const alice = await spawn(scene, 'Alice')
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
 
     expect(await scene.service.wait(scene.leader.agent, { members: ['Alice', 'alice', alice.id] }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+      .toEqual({
+        done: ['Alice'], busy: [], cold: [], timedOut: false,
+        reports: [{ member: 'Alice', text: 'alice done' }],
+      })
   })
 
   /**
@@ -1752,9 +1828,15 @@ describe('wait', () => {
     const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
     // Past the settle window, so the wait is holding a live `whenIdle()`.
     await sleep(80)
+    // Its closing words were delivered before the reaping, as the runtime does
+    // while the parent is mid-turn.
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     scene.agents.remove(alice.id)
 
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
     // Seconds, not the budget: the bug returned after ~2 000 ms here.
     expect(Date.now() - started).toBeLessThan(500)
   })
@@ -1802,8 +1884,12 @@ describe('wait', () => {
     // One live observation, one live subscription.
     expect(live.size).toBe(1)
 
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice done'))
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }],
+    })
     expect(live.size).toBe(0)
   })
 
@@ -1857,10 +1943,17 @@ describe('wait', () => {
     const started = Date.now()
     const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
     await sleep(100)
+    scene.leader.inbox.nextStep.push(
+      settlementNotice(alice.id, 'alice done'),
+      settlementNotice(bob.id, 'bob done'),
+    )
     scene.agents.remove(alice.id)
     scene.agents.remove(bob.id)
 
-    expect(await waiting).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false, reports: [] })
+    expect(await waiting).toEqual({
+      done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'alice done' }, { member: 'Bob', text: 'bob done' }],
+    })
     expect(Date.now() - started).toBeLessThan(1_000)
   })
 
@@ -2090,18 +2183,22 @@ describe('wait', () => {
   })
 
   /**
-   * The other end of the same statement: a member that finishes without saying
-   * anything has no report, so `reports` is a SUBSET of `done` rather than a
-   * parallel list. An entry invented to keep the two the same length would make
-   * the leader believe a silent member answered.
+   * The other end of the same statement, restated as the new rule requires: a
+   * member that finishes without leaving anything readable is NOT done, because a
+   * `done` entry the caller cannot act on is the defect. It is also not `cold` —
+   * its turn demonstrably ended — so it lands in `busy`: finished, words never
+   * observed. Inventing a report to keep the lists the same length would be
+   * worse; leaving it in `done` is what this change removed.
    */
-  it('leaves a finished but silent member out of reports', async () => {
+  it('does not call a finished but silent member done, and leaves reports empty', async () => {
     const scene = world()
     await spawn(scene, 'Alice')
 
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
-    expect(observed.done).toEqual(['Alice'])
+    expect(observed.done).toEqual([])
     expect(observed.reports).toEqual([])
+    expect(observed.busy).toEqual(['Alice'])
+    expect(observed.timedOut).toBe(true)
   })
 
   /**
@@ -2144,5 +2241,159 @@ describe('wait', () => {
       member: 'Alice',
       text: 'screenshot attached\n[+1 non-text block omitted]',
     }])
+  })
+
+  /**
+   * The regression lock for the reported defect, and the sentence the whole
+   * change is about: **a wait waits for the REPORT, not for quiescence**.
+   *
+   * The host trace answered `all finished: a, b, c` while `reports` held only a
+   * and b. `done` was decided by the idle signal and `reports` was collected
+   * afterwards from a second, later read, so a member whose turn had ended but
+   * whose words were not readable yet was confirmed finished with nothing to
+   * hand back — a completion the caller cannot use.
+   *
+   * The harness leaves that window open by construction: in the subagent
+   * manager's teardown `agent/disposed` (which settles `whenIdle()`) runs
+   * BEFORE `notifySettlement()` queues the notice
+   * (`@deepseek-ai/dsh-subagent/lib/types/manager.js`), so the very moment a
+   * member settles there may be no report in the inbox, the log, or the mailbox.
+   *
+   * Under the new rule that state is NOT done: the member is still awaited, and
+   * a budget that runs out first lands it in `busy` — finished, report never
+   * observed — never in `done` and never in `cold` (it did finish).
+   */
+  it('does not count a settled member as done before its report is readable', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    // The turn ends inside the window; nothing readable ever follows.
+    setTimeout(() => { alice.goIdle() }, 10)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 80 })
+
+    expect(observed.done).toEqual([])
+    expect(observed.reports).toEqual([])
+    // Finished, so not cold; unreadable, so not done.
+    expect(observed.busy).toEqual(['Alice'])
+    expect(observed.cold).toEqual([])
+    expect(observed.timedOut).toBe(true)
+  })
+
+  /**
+   * The other half of the same rule: when the report does arrive, the wait
+   * returns AT THAT MOMENT — it is a wait for the content, not a fixed grace
+   * period that expires into a guess. The report lands on the leader's log
+   * through the runtime's own splice, announced on `session/event`.
+   */
+  it('returns the moment a delayed report becomes readable', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    setTimeout(() => { alice.goIdle() }, 10)
+    // Its closing words reach the leader a moment after its turn ended.
+    setTimeout(() => { spliceReport(scene, settlementNotice(alice.id, 'c is ready')) }, 60)
+
+    const started = Date.now()
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 })
+    const elapsed = Date.now() - started
+
+    expect(observed).toEqual({
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: 'c is ready' }],
+    })
+    // It did not answer at its own settle (10 ms) and did not sit out the budget:
+    // it answered when the report existed.
+    expect(elapsed).toBeGreaterThanOrEqual(50)
+    expect(elapsed).toBeLessThan(1_000)
+  })
+
+  /**
+   * The acceptance criterion in one scene: an immediately readable report, a
+   * delayed one, and a member that finished and never handed anything back. The
+   * assertion is not three separate lists but the correspondence itself —
+   * `done` and `reports` name the same members, in the same order — because the
+   * defect was exactly a `done` entry with no report behind it.
+   */
+  it('keeps done and reports one-to-one across an immediate, a delayed and a silent member', async () => {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3 } })
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    const carol = await spawn(scene, 'Carol', { childId: 'child-3' })
+    alice.status = 'running'
+    bob.status = 'running'
+    carol.status = 'running'
+    // Alice's report is already readable when the wait looks.
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id, 'alice is back'))
+    setTimeout(() => { alice.goIdle() }, 5)
+    // Bob's report arrives inside the window, after his turn ended.
+    setTimeout(() => {
+      bob.goIdle()
+      spliceReport(scene, settlementNotice(bob.id, 'bob is back'))
+    }, 40)
+    // Carol finishes and leaves no words anywhere.
+    setTimeout(() => { carol.goIdle() }, 20)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 200 })
+
+    expect(observed.done).toEqual(['Alice', 'Bob'])
+    expect(observed.busy).toEqual(['Carol'])
+    expect(observed.cold).toEqual([])
+    // The contract: one report per done member, same members, same order.
+    expect(observed.reports.map(report => report.member)).toEqual([...observed.done])
+    expect(new Set(observed.done)).toEqual(new Set(observed.reports.map(report => report.member)))
+  })
+
+  /**
+   * The performance property the new condition must not spend: a round whose
+   * reports are all readable already answers at once. The idle signal and the
+   * report are both there on the first read, so nothing new is armed and no
+   * retry window is spent — the answer is tens of milliseconds, not the budget.
+   */
+  it('answers at once when every member already has a readable report', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    scene.leader.inbox.nextStep.push(
+      settlementNotice(alice.id, 'a is back'),
+      settlementNotice(bob.id, 'b is back'),
+    )
+
+    const started = Date.now()
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 30_000 })
+    const elapsed = Date.now() - started
+
+    expect(observed.timedOut).toBe(false)
+    expect(observed.done).toEqual(['Alice', 'Bob'])
+    expect(observed.reports).toEqual([
+      { member: 'Alice', text: 'a is back' },
+      { member: 'Bob', text: 'b is back' },
+    ])
+    // Far below the 30 s budget — and below the 1 s a regression would need.
+    expect(elapsed).toBeLessThan(500)
+  })
+
+  /**
+   * The deadline half of the rule, stated as its own case: content that never
+   * becomes readable by the end of the budget is a `busy` member with
+   * `timedOut: true`, and the wait really does wait for it instead of answering
+   * as soon as the turn ends.
+   */
+  it('reports a finished-but-unreadable member as busy when the budget expires', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    setTimeout(() => { alice.goIdle() }, 5)
+
+    const started = Date.now()
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 120 })
+    const elapsed = Date.now() - started
+
+    expect(observed.done).toEqual([])
+    expect(observed.busy).toEqual(['Alice'])
+    expect(observed.reports).toEqual([])
+    expect(observed.timedOut).toBe(true)
+    // It waited the budget out rather than answering at the settle.
+    expect(elapsed).toBeGreaterThanOrEqual(120)
   })
 })

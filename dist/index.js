@@ -1283,6 +1283,26 @@ const STRUCTURED_PREFIX = "Structured result: ";
 */
 const WAKE_SETTLE_MS = 25;
 /**
+* How long a wait keeps re-reading for a member's report after that member's
+* turn has ended, before it stops retrying and parks on the leader's log feed
+* instead (see {@link TeamService.awaitReport}).
+*
+* The window is deliberately tiny, and it is a retry budget rather than a poll:
+* the runtime hands the settlement notice to the parent a few microtasks after
+* it disposes the child's agent — `notifySettlement()` runs after the disposal
+* that settles `whenIdle()` in `@deepseek-ai/dsh-subagent`'s teardown — so the
+* report can exist a hair later than the quiescence the observation raced.
+* Anything slower than that is not a delay a timer can close, it is a different
+* moment, and `session/event` is what announces it. The delays are 0, 5 and 15
+* ms, so a member whose report is already readable spends none of them and a
+* round that is all readable still answers in the tens of milliseconds.
+*/
+const REPORT_SETTLE_RETRY_MS = [
+	0,
+	5,
+	15
+];
+/**
 * How far back one wait's report scan may walk the leader's log.
 *
 * The scan is already bounded by the delivery boundary it is looking past (see
@@ -1702,14 +1722,18 @@ var TeamService = class extends Service {
 	* - Every target is watched for the whole window, recording `seen` the moment
 	*   `agents.get()` (or an `agent/created` for it) yields a live agent, however
 	*   that agent's status reads at the time.
-	* - `whenIdle()` settling → `done`. So does a cold target whose report was
+	* - `whenIdle()` settling is only the FIRST half of `done`: the member's turn
+	*   is over, and the wait then keeps watching until a report from it is
+	*   readable (see {@link awaitReport}). So does a cold target whose report was
 	*   already in the log past its own delivery when the wait began: it is
 	*   settled before any observation is armed (see {@link presettleReported}).
 	* - At the deadline: `seen` and still `running` → `busy`; `seen` but no longer
-	*   running (idle or reaped) → `done`; never `seen` → `done` when the leader
-	*   holds a report from it — queued in its inbox for this round, spliced into
-	*   its log after this round's delivery, or in its durable mailbox with
-	*   nothing addressed to it since — and `cold` otherwise.
+	*   running (idle or reaped) → `done` when a report from it is readable and
+	*   `busy` when it is not (the turn ended, its words never arrived); never
+	*   `seen` → `done` when the leader holds a report from it — queued in its
+	*   inbox for this round, spliced into its log after this round's delivery, or
+	*   in its durable mailbox with nothing addressed to it since — and `cold`
+	*   otherwise.
 	*
 	* "No agent in the registry" is three histories, not one: never started, a
 	* delivery accepted but not yet published, or a turn that ran and was reaped
@@ -1723,7 +1747,7 @@ var TeamService = class extends Service {
 	* so a wait issued in the same turn saw "no live session, no report" for a
 	* member that had already answered while the report sat in the inbox queue.
 	* The queue is therefore read first (see {@link reportedIntoInbox}), with the
-	* log as the durable half of the same question (see {@link reportedInLog}) —
+	* log as the durable half of the same question (see {@link logReportMap}) —
 	* the queue is a moment, and the splice row outlives it even when the boundary
 	* consumes the notice without ever delivering it — and the mailbox as the part
 	* that did reach the surface. One delivery boundary keeps an older round's
@@ -1745,16 +1769,41 @@ var TeamService = class extends Service {
 	* gets the full window — nothing on its record says otherwise, and no report of
 	* an earlier round can stand in for this one.
 	*
-	* The boundary this answer still carries: it reports **quiescence**, not
-	* receipt. A member that is idle right now may already be holding a prompt
-	* `team_send` accepted a moment ago, and `whenIdle()` cannot see that — so one
-	* settle window runs before the first read, and a delivery that lands later
-	* than that window on an already-resident, already-idle member is
-	* indistinguishable from a member that was already idle.
+	* **What this call waits for is the report, not the quiescence.** The reported
+	* defect was the gap between them: a host trace answered `all finished: a, b,
+	* c` while `reports` held only a and b. `done` was decided by the idle signal
+	* and the report was collected afterwards, from a second read taken later, so
+	* a member whose turn had ended before its words became readable was confirmed
+	* finished with nothing a caller could use. The runtime makes that gap real,
+	* not theoretical: in the subagent manager's teardown `agent/disposed` (which
+	* settles `whenIdle()`) runs BEFORE `notifySettlement()` hands the notice to
+	* the parent. So the two decisions are now one:
+	*
+	* - an observation resolves only when the member has settled AND a report from
+	*   it is readable (see {@link awaitReport});
+	* - `done` is written by the same read that produces the report text, so a
+	*   member without readable text cannot enter it (see {@link bucketOf});
+	* - a budget that expires first puts such a member in `busy`, not `done` and
+	*   not `cold`: it finished, and what it said never arrived in time.
+	*
+	* The "report became readable" signal is the runtime's own: a settled child's
+	* words reach the leader as an `agent/inbox/spliced` row committed to the
+	* leader's log, and `Session.append()` publishes `session/event` post-commit.
+	* A wait therefore parks on that feed (filtered to the leader's own session) —
+	* no polling, no fixed grace period — after a bounded retry window
+	* ({@link REPORT_SETTLE_RETRY_MS}) that covers the microtask-scale gap between
+	* disposal and notice delivery. A round whose reports are all readable already
+	* spends none of it and still answers in tens of milliseconds.
+	*
+	* The boundary this answer still carries: a member that is idle right now may
+	* already be holding a prompt `team_send` accepted a moment ago, and
+	* `whenIdle()` cannot see that — one settle window runs before the first read,
+	* and a delivery that lands later than that window on an already-resident,
+	* already-idle member is indistinguishable from a member that was already idle.
 	* @param actorAgent - the acting leader or teammate.
 	* @param request - who to wait for, for how long, and the caller's signal.
-	* @returns who is done, who is still running, who had no live session and no
-	*   report, and whether time ran out.
+	* @returns who is done with its report, who is still running or came back
+	*   unreadable, who had no live session and no report, and whether time ran out.
 	* @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place
 	*   (the leader itself included — it is the one waiting), `ABORTED` when the
 	*   caller's signal fires, `NO_TEAM`/`LEADER_AWAY` when there is no team.
@@ -1778,13 +1827,14 @@ var TeamService = class extends Service {
 			settled: false
 		}));
 		const watch = /* @__PURE__ */ new Set();
+		const evidence = this.waitEvidence(actor, watch);
 		let outcome;
 		try {
 			this.presettleReported(actor, targets, observations);
 			const observing = targets.map((target, index) => ({
 				target,
 				observation: observations[index]
-			})).filter(({ observation }) => !observation.settled).map(({ target, observation }) => this.observeIdle(target, observation, watch));
+			})).filter(({ observation }) => !observation.settled).map(({ target, observation }) => this.observeIdle(target, observation, watch, evidence));
 			outcome = await this.raceWait(observing, clampWait(request.timeoutMs), request.signal);
 		} finally {
 			for (const stop of watch) stop();
@@ -1807,9 +1857,10 @@ var TeamService = class extends Service {
 	*
 	* So the durable judgement is taken here as well, BEFORE the observation, and
 	* a hit becomes a `settled` observation with nothing armed behind it. The
-	* judgement itself is not new: it is {@link reportedInLog}, the very read
+	* judgement itself is not new: it is {@link logReportMap}, the very read
 	* {@link bucketOf} does at the deadline, reused so both moments can never
-	* disagree.
+	* disagree — and, now that a report's TEXT is part of finishing, reused with
+	* the same requirement that the text exists.
 	*
 	* Why this cannot over-claim, and how it differs from the "no live agent means
 	* done" shortcut that was wrong:
@@ -1845,8 +1896,11 @@ var TeamService = class extends Service {
 			cold.push(index);
 		});
 		if (cold.length === 0) return;
-		const reported = this.reportedInLog(actor, cold.map((index) => targets[index]));
-		for (const index of cold) if (reported.has(targets[index].memberId)) observations[index].settled = true;
+		const reported = this.logReportMap(actor, cold.map((index) => targets[index]));
+		for (const index of cold) {
+			const message = reported.get(targets[index].memberId);
+			if (message !== void 0 && reportTextOf(message) !== void 0) observations[index].settled = true;
+		}
 	}
 	/**
 	* Split the observed targets into the three disjoint buckets, from what the
@@ -1860,7 +1914,7 @@ var TeamService = class extends Service {
 	* 2. never `seen`, but the leader's inbox queue holds a report FROM it that
 	*    arrived after its latest delivery, or its own log holds a spliced report
 	*    from it past that same delivery, or its durable mailbox holds one and
-	*    nothing has been addressed to it since — `done`: it finished a turn and
+	*    nothing has been addressed to it since — finished: it finished a turn and
 	*    reported back, and the runtime has already reaped its session. "No live
 	*    agent" is three different states, and this is the one that used to be
 	*    misread as "never started" (a member whose whole turn fits between the
@@ -1869,15 +1923,19 @@ var TeamService = class extends Service {
 	*    whole window AND neither queue, log, nor mailbox has a word from it, so
 	*    nothing observed says it ever finished. It must not fall through to the
 	*    quiescence rule.
-	* 4. `seen`, and no longer `running` at the end — `done`: resident and
+	* 4. `seen`, and no longer `running` at the end — finished: resident and
 	*    quiescent now (or reaped, which occupies no turn either).
 	* 5. `seen` and still `running` — `busy`.
 	*
-	* Every member that lands in `done` also gets {@link reportOf} asked what it
-	* said, and the answer goes into `reports` when there is one. That read is
-	* taken from the same evidence the bucket itself rests on — one inbox walk,
-	* one log walk, and the mailbox — so the report a leader receives can never
-	* belong to a different round than the completion it is attached to.
+	* "Finished" is not yet a bucket: rules 1, 2 and 4 hand the member to
+	* {@link reportOf}, and the SAME read decides both halves — readable text puts
+	* it in `done` with that text in `reports`, and no readable text puts it in
+	* `busy` instead. That is the fix for the reported defect, made structural
+	* rather than procedural: `done` and `reports` cannot disagree, because one
+	* read writes both. A member can therefore reach the deadline with its turn
+	* over and no words yet (the runtime disposes the child before it delivers the
+	* settlement notice), and it is reported as unfinished-in-hand rather than as
+	* an answer nobody can read.
 	* @param actor - the team, and the leader whose inbox queue is read.
 	* @param targets - the members this wait was asked about, in order.
 	* @param observations - the live observation recorded per target, same order.
@@ -1894,10 +1952,26 @@ var TeamService = class extends Service {
 		let logged;
 		const loggedReports = () => logged ??= this.logReportMap(actor, targets);
 		const reported = observations.some((observation) => !observation.seen && !observation.settled) ? loggedReports() : void 0;
+		/**
+		* One finished member: `done` and `reports` written from ONE read, or neither.
+		*
+		* The single read is the whole point. Reading the bucket from quiescence and
+		* collecting the text afterwards was the reported defect — the two reads
+		* describe two moments, and a member whose report had not landed between them
+		* was confirmed finished with nothing to hand back. Here the text decides:
+		* no readable text means no `done` entry, and the member stays unfinished in
+		* the caller's hands (`busy`, since its turn is over and it did come back to
+		* the wait's own record).
+		* @param target - the member whose turn ended.
+		*/
 		const finished = (target) => {
-			done.push(target.name);
 			const text = this.reportOf(actor, target, mailbox, loggedReports);
-			if (text !== void 0) reports.push({
+			if (text === void 0) {
+				busy.push(target.name);
+				return;
+			}
+			done.push(target.name);
+			reports.push({
 				member: target.name,
 				text
 			});
@@ -1943,14 +2017,18 @@ var TeamService = class extends Service {
 	* message's `source.summary` carried — the one-line account a settlement
 	* notice keeps when the member's closing text was empty.
 	*
-	* A member that is `done` because `whenIdle()` settled has no guaranteed report
-	* at all: it may have answered, and it may have said nothing. Both are answered
-	* here without a claim — nothing found means no entry in `reports`.
+	* This is now the decision, not a labelling step: the same call that answers
+	* "what did it say" answers "is this member done", because a completion whose
+	* words cannot be read is not an answer the caller can use. So a member whose
+	* turn is over but whose report has not landed yet answers `undefined` here —
+	* which keeps it out of `done` and out of `reports` together, and makes the
+	* wait keep watching it (see {@link awaitReport}) instead of handing back a
+	* name with no content.
 	* @param actor - the team, and the leader whose inbox and log are read.
 	* @param target - the finished member.
 	* @param mailbox - the leader's durable mailbox feed, newest last.
 	* @param logged - the log reports, resolved lazily and only when reached.
-	* @returns the report text, or undefined when the member left nothing to read.
+	* @returns the report text, or undefined when nothing readable exists YET.
 	*/
 	reportOf(actor, target, mailbox, logged) {
 		const queued = this.freshQueuedReports(actor, target.memberId, mailbox);
@@ -2014,6 +2092,33 @@ var TeamService = class extends Service {
 		return targets;
 	}
 	/**
+	* Watch one member until its turn quiesces AND its report is readable.
+	*
+	* Two halves that must not be separated, because the caller asked for the work
+	* back, not for a quiescent process:
+	*
+	* 1. **The turn ends** ({@link settleOf}) — quiescence, which is where `done`
+	*    used to stop.
+	* 2. **The report becomes readable** ({@link awaitReport}) — the words the
+	*    caller is waiting for, which the runtime may deliver a moment after the
+	*    turn ends (it disposes the child before it hands the settlement notice to
+	*    the parent).
+	*
+	* Only both together resolve this observation. A member whose turn ended and
+	* whose report never arrives therefore keeps the wait running until the budget
+	* ends it — the same rule that already governed a member that never woke.
+	* @param target - the roster member to watch.
+	* @param observation - this target's live record, updated in place.
+	* @param watch - the wait's subscription set, so an ending wait can drop it.
+	* @param evidence - how to read a report, and when to look again.
+	* @returns the observation promise, which never rejects and, on the cold path,
+	*   may never resolve at all — the deadline, not this promise, ends that wait.
+	*/
+	async observeIdle(target, observation, watch, evidence) {
+		await this.settleOf(target, observation, watch);
+		await this.awaitReport(target, watch, evidence);
+	}
+	/**
 	* Watch one member until its turn quiesces, recording what was seen of it.
 	*
 	* Two paths, because a member can be in one of two very different states:
@@ -2039,10 +2144,10 @@ var TeamService = class extends Service {
 	* @param target - the roster member to watch.
 	* @param observation - this target's live record, updated in place.
 	* @param watch - the wait's subscription set, so an ending wait can drop it.
-	* @returns the observation promise, which never rejects and, on the cold path,
+	* @returns the quiescence promise, which never rejects and, on the cold path,
 	*   may never resolve at all — the deadline, not this promise, ends that wait.
 	*/
-	observeIdle(target, observation, watch) {
+	settleOf(target, observation, watch) {
 		const release = () => {
 			observation.settled = true;
 		};
@@ -2120,6 +2225,118 @@ var TeamService = class extends Service {
 			} catch {
 				settle();
 			}
+		});
+	}
+	/**
+	* The report reader one wait shares across its targets: where the text comes
+	* from, and when to look again.
+	*
+	* Both halves are needed because a report is not guaranteed to exist at the
+	* moment its author's turn ends — the harness disposes the child's agent and
+	* only then hands the settlement notice to the parent — so "is it readable"
+	* has to be asked more than once, and asking on a timer would be exactly the
+	* long poll this call must not become. The signal is the runtime's own: a
+	* report arrives as an `agent/inbox/spliced` row committed to the LEADER's log,
+	* and `Session.append()` publishes `session/event` post-commit
+	* (`@deepseek-ai/dsh-session`). A listener is armed once per wait, for the
+	* leader's own session only, and dropped with the rest of `watch` when the wait
+	* ends on any of its three exits.
+	*
+	* The durable mailbox is folded once and reused: it is the leader's own log
+	* read through `team`, it cannot change while the leader is suspended inside
+	* this call, and folding it per retry would make the wait read the whole log on
+	* every look.
+	* @param actor - the team, and the leader whose inbox, log, and mailbox are read.
+	* @param watch - the wait's subscription set, so an ending wait can drop the
+	*   log listener and any pending retry timer.
+	* @returns the reader.
+	*/
+	waitEvidence(actor, watch) {
+		let mailbox;
+		const mailboxRows = () => mailbox ??= this.durableView(actor.leader).messages;
+		return {
+			textOf: (target) => this.reportOf(actor, target, mailboxRows(), () => this.logReportMap(actor, [target])),
+			growing: () => new Promise((resolve) => {
+				let unsubscribe;
+				const stop = () => {
+					watch.delete(stop);
+					const drop = unsubscribe;
+					unsubscribe = void 0;
+					drop?.();
+				};
+				watch.add(stop);
+				unsubscribe = this.ctx.on("session/event", (session) => {
+					if (session !== actor.leader.session) return;
+					stop();
+					resolve();
+				});
+			})
+		};
+	}
+	/**
+	* Wait until this member's report is readable — a wait for the CONTENT, not a
+	* grace period that expires into a guess.
+	*
+	* The reported defect is the reason this exists: a member was declared done
+	* when its turn ended, its report was collected afterwards from a second read,
+	* and any member whose words landed between those two reads was returned as a
+	* name with no content — `all finished: a, b, c` with reports for a and b only.
+	* The runtime makes that window real: the subagent manager disposes the child
+	* (`agent/disposed`, which settles `whenIdle()`) before `notifySettlement()`
+	* gives the notice to the parent.
+	*
+	* Two bounded stages, neither of which is a poll:
+	*
+	* 1. A short re-read budget ({@link REPORT_SETTLE_RETRY_MS}, ≤ 20 ms total) for
+	*    the microtask-scale gap between the two, which timers can actually close.
+	*    A member whose report is already readable spends none of it.
+	* 2. Then park on the leader's log feed ({@link waitEvidence}) and re-read on
+	*    each new row, which is what catches a report that really is late. No timer
+	*    runs here, and the listener dies with the wait.
+	*
+	* Returning early is therefore impossible: this promise resolves only when the
+	* text exists. If it never does, the budget ends the wait and
+	* {@link bucketOf} reports the member as `busy` — finished, never readable —
+	* instead of claiming a completion the caller cannot use.
+	* @param target - the member whose turn has ended.
+	* @param watch - the wait's subscription set, so no timer or listener outlives it.
+	* @param evidence - how to read a report, and when to look again.
+	* @returns a promise that resolves when the report is readable, and never
+	*   rejects.
+	*/
+	async awaitReport(target, watch, evidence) {
+		for (const delay of REPORT_SETTLE_RETRY_MS) {
+			if (delay > 0) await this.pause(delay, watch);
+			if (evidence.textOf(target) !== void 0) return;
+		}
+		for (;;) {
+			await evidence.growing();
+			if (evidence.textOf(target) !== void 0) return;
+		}
+	}
+	/**
+	* Sleep for one bounded retry interval, with the timer tracked by `watch`.
+	*
+	* The tracker is what keeps the retry window from outliving the wait: the
+	* deadline or the caller's cancellation ends the wait while a retry may still
+	* be pending, and `watch` is stopped on every exit. A timer left running would
+	* only wake a dead closure — small, but one per timed-out wait.
+	* @param ms - how long to sleep.
+	* @param watch - the wait's subscription set, so the timer is cleared with it.
+	* @returns a promise that resolves on the timer or never, if the wait ended first.
+	*/
+	pause(ms, watch) {
+		return new Promise((resolve) => {
+			let timer;
+			const stop = () => {
+				watch.delete(stop);
+				if (timer !== void 0) clearTimeout(timer);
+			};
+			watch.add(stop);
+			timer = setTimeout(() => {
+				stop();
+				resolve();
+			}, ms);
 		});
 	}
 	/**
@@ -2443,7 +2660,7 @@ var TeamService = class extends Service {
 		actor.team.deliveredAt.set(memberId, logPositionOf(actor.leader));
 	}
 	/**
-	* Which of these members left a report in the leader's own log.
+	* The reports these members left in the leader's own log, newest row each.
 	*
 	* This is the durable half of {@link reportedIntoInbox}, and it exists
 	* because the queue is a moment, not a record. A member's completion reaches
@@ -2464,24 +2681,13 @@ var TeamService = class extends Service {
 	*
 	* One reverse walk serves every target: it starts at the end of the log, stops
 	* at the oldest boundary among them, reads each member's own boundary before
-	* crediting it, and stops early once every target has been found.
-	* @param actor - the team, and the leader whose log is read.
-	* @param targets - the members this wait was asked about.
-	* @returns the member ids with a report after their own boundary.
-	*/
-	reportedInLog(actor, targets) {
-		return new Set(this.logReportMap(actor, targets).keys());
-	}
-	/**
-	* The same reverse walk as {@link reportedInLog}, keeping each member's NEWEST
-	* report instead of only the fact that one exists.
-	*
-	* The wait asks this walk two things at once — "did it report" (the bucket)
-	* and "what did it say" (the report text) — and they must be answered from one
-	* scan: two scans would stamp two different sets of freshness evidence onto
-	* one answer. Walking backwards makes the newest row the first hit for its
-	* sender, so the message kept per member is the one the leader would read next
-	* anyway.
+	* crediting it, and stops early once every target has been found. Keeping the
+	* MESSAGE rather than only the fact is what lets the bucket and the report text
+	* come from one scan: two scans would stamp two different sets of freshness
+	* evidence onto one answer, and that disagreement is precisely the reported
+	* "done but no report" defect. Walking backwards makes the newest row the first
+	* hit for its sender, so the message kept per member is the one the leader
+	* would read next anyway.
 	* @param actor - the team, and the leader whose log is read.
 	* @param targets - the members this wait was asked about.
 	* @returns the newest spliced report per member id, past its own boundary.
@@ -3691,7 +3897,7 @@ function listTool(ctx, audience = "leader") {
 function waitTool(ctx) {
 	return defineTool({
 		name: "team_wait",
-		description: `Block until teammates finish their current turn, then report who is done, who is still running, who had no live session, and whether the timeout ran out. It does not stop at names: the closing report of every finished member comes back with the answer — in reports for a caller reading the fields, and in the rendered text as one "name: what it said" line each — so a single wait returns what the members concluded, not only that they stopped. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all done, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true, the still-running members in busy, and the members that never showed a live session in cold. An idle member counts as done, and so does a member whose session is already gone but whose report has reached you — queued in your own inbox, spliced into your own session log, or already in your mailbox: a short turn can run and be reaped before this call takes its first look, and its settlement notice waits in your inbox until your next turn starts. cold means no live session was seen for that member AND nothing from it has reached you for this round — not your inbox, not your own log, not your mailbox — so it is NOT finished as far as this call can tell — it may not have started yet, or it may have finished without writing back — and a leader that summarises it as returned work is claiming more than the wait observed. A member that never wakes therefore costs the whole budget instead of being waved through. It only observes: it never spawns, wakes, messages or cancels anyone.`,
+		description: `Block until teammates finish their current turn, then report who is done, who is still running, who had no live session, and whether the timeout ran out. It does not stop at names: the closing report of every finished member comes back with the answer — in reports for a caller reading the fields, and in the rendered text as one "name: what it said" line each — so a single wait returns what the members concluded, not only that they stopped. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all done, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true, the still-running members in busy, and the members that never showed a live session in cold. It waits for the REPORT, not just for quiescence: a member counts as done only when its turn is over AND something it said is readable — queued in your own inbox, spliced into your own session log, or already in your mailbox — so the names in done are exactly the members in reports. A member whose turn ended but whose words have not arrived is still being waited for; if the budget runs out first it lands in busy (finished, nothing readable handed back), never in done and never in cold. A short turn can run and be reaped before this call takes its first look, and its settlement notice waits in your inbox until your next turn starts. cold means no live session was seen for that member AND nothing from it has reached you for this round — not your inbox, not your own log, not your mailbox — so it is NOT finished as far as this call can tell — it may not have started yet, or it may have finished without writing back — and a leader that summarises it as returned work is claiming more than the wait observed. A member that never wakes therefore costs the whole budget instead of being waved through. It only observes: it never spawns, wakes, messages or cancels anyone.`,
 		parameters: {
 			members: {
 				type: "array",
@@ -3712,13 +3918,13 @@ function waitTool(ctx) {
 						type: "array",
 						required: true,
 						items: { type: "string" },
-						description: "Members confirmed finished: their turn ended inside the wait, or their session was already gone while their report had reached you (queued in your inbox, spliced into your log, or already in your mailbox). Never a cold member."
+						description: "Members confirmed finished WITH their report readable: their turn ended inside the wait and a report from them became readable, or their session was already gone while their report had reached you (queued in your inbox, spliced into your log, or already in your mailbox). One reports entry per name here, same order. Never a cold member."
 					},
 					busy: {
 						type: "array",
 						required: true,
 						items: { type: "string" },
-						description: "Members seen running that were still running when the timeout expired; empty otherwise."
+						description: "Members whose work is not in your hands: still running when the timeout expired, or finished with no readable report by then (the completion happened, its words did not arrive in time). Empty otherwise."
 					},
 					cold: {
 						type: "array",
@@ -3749,7 +3955,7 @@ function waitTool(ctx) {
 								}
 							}
 						},
-						description: "What each finished member actually handed back, in done order: the member and its closing text. A member that is done but left nothing readable has no entry, so this is a subset of done; busy and cold members never appear."
+						description: "What each finished member actually handed back, in done order: the member and its closing text. In exact correspondence with done — one entry per member named there, same order — because a member with nothing readable is not counted done at all. busy and cold members never appear."
 					}
 				}
 			},
