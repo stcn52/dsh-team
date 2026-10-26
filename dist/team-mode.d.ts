@@ -1,4 +1,4 @@
-import { t as TeamService } from "./service-Bvn8hWhe.js";
+import { t as TeamService } from "./service-D_virsfo.js";
 import { ToolExecution } from "@deepseek-ai/dsh-tools";
 import { Context } from "@deepseek-ai/cordis";
 //#region src/team-mode.d.ts

@@ -309,12 +309,18 @@ export function sendTool(ctx: Context, audience: 'leader' | 'member'): ToolDefin
           ? `message queued as the next turn of ${value.deliveries.map(entry => entry.name).join(', ')}`
           : `message queued as the next turn of ${value.name}`,
       }],
+      // A projection is single-valued, so several deliveries are reported as a
+      // LIST of facts — one `message` row per mailbox. Returning one merged fact
+      // would record a broadcast as a single message (or, if it were not a fact
+      // shape `readFact` knows, as none at all); see `readFacts` in ./fold.ts.
       presentationMeta: (args, value) => 'deliveries' in value
-        ? {
-            team: 'broadcast',
+        ? value.deliveries.map(entry => ({
+            team: 'message',
+            messageId: entry.messageId,
+            to: entry.to,
             text: args.message,
-            deliveries: value.deliveries.map(entry => ({ messageId: entry.messageId, to: entry.to, hop: entry.hop })),
-          }
+            hop: entry.hop,
+          }))
         : {
             team: 'message',
             messageId: value.messageId,

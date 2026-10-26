@@ -88,15 +88,20 @@ function presentation(tool: TeamTool, block: ToolCallBlock, state: TeamPanelStat
       break
     }
     case 'team_send': {
-      // A broadcast reports one row per mailbox, so the card names them all
-      // rather than falling back to the generic "teammate" label.
+      // A broadcast addresses a LIST, and the projection expands it into one
+      // `message` fact per mailbox — so no single fact carries the whole
+      // address list. Read the names off the arguments instead of falling back
+      // to the generic "teammate" label.
+      const address = args['to']
       const reference = fact?.team === 'message'
         ? fact.to
-        : fact?.team === 'broadcast'
-          ? fact.deliveries.map(delivery => delivery.to).join(', ')
-          : argument(args, 'to')
+        : typeof address === 'string'
+          ? address
+          : Array.isArray(address)
+            ? address.filter(name => typeof name === 'string').join(', ')
+            : undefined
       people = [who(sessionId, t('tool.sender')), who(reference, argument(args, 'to') ?? t('tool.teammate'))]
-      summary = fact?.team === 'message' || fact?.team === 'broadcast' ? fact.text : argument(args, 'message') ?? ''
+      summary = fact?.team === 'message' ? fact.text : argument(args, 'message') ?? ''
       caption = t('tool.recipient', { name: people[1]!.name })
       break
     }

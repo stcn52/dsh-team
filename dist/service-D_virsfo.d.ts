@@ -251,22 +251,6 @@ type TeamFact = {
   readonly text: string;
   /** Depth of the delivery in its conversation chain. */
   readonly hop?: number;
-} |
-/**
- * One broadcast: the same text to several mailboxes. Carried as one fact with
- * the text at the top so a broadcast to ten teammates logs the message once,
- * while the fold still records one row per mailbox.
- */
-{
-  readonly team: 'broadcast';
-  /** The text every recipient of this broadcast received. */
-  readonly text: string;
-  /** One row per recipient, each with its own message id and chain depth. */
-  readonly deliveries: readonly {
-    readonly messageId: string;
-    readonly to: string;
-    readonly hop?: number;
-  }[];
 } | {
   readonly team: 'task';
   readonly task: TeamTaskView;

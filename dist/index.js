@@ -886,29 +886,6 @@ function readFact(meta) {
 				...hop !== void 0 ? { hop } : {}
 			};
 		}
-		case "broadcast": {
-			const rows = record["deliveries"];
-			if (!Array.isArray(rows) || rows.length === 0) return void 0;
-			const deliveries = [];
-			for (const row of rows) {
-				const entry = asRecord(row);
-				if (entry === void 0) return void 0;
-				const messageId = asText(entry["messageId"]);
-				const to = asText(entry["to"]);
-				if (messageId === void 0 || to === void 0) return void 0;
-				const hop = asCount(entry["hop"]);
-				deliveries.push({
-					messageId,
-					to,
-					...hop !== void 0 ? { hop } : {}
-				});
-			}
-			return {
-				team: "broadcast",
-				text: asText(record["text"]) ?? "",
-				deliveries
-			};
-		}
 		case "task": {
 			const task = readTask(record["task"]);
 			return task === void 0 ? void 0 : {
@@ -928,6 +905,31 @@ function readFact(meta) {
 		}
 		default: return;
 	}
+}
+/**
+* Narrow every logged team fact off one `meta` slot.
+*
+* A projection is single-valued by signature — `presentationMeta(args, value)`
+* returns one `JsonValue` — so a call that changes several things at once can
+* only report them by returning a LIST of facts. This reader is what makes that
+* list one event carrying several facts instead of one unreadable blob:
+* a plain object stays the single fact it always was, an array is read entry by
+* entry, and one unreadable entry is skipped rather than voiding the rest — the
+* same tolerance {@link readFact} gives an unknown fact kind.
+* @param meta - the `meta` of one `tool/result`, or a parsed PTC dispatch fact.
+* @returns every fact the slot carries, in order; empty when it carries none.
+*/
+function readFacts(meta) {
+	if (!Array.isArray(meta)) {
+		const single = readFact(meta);
+		return single === void 0 ? [] : [single];
+	}
+	const facts = [];
+	for (const entry of meta) {
+		const fact = readFact(entry);
+		if (fact !== void 0) facts.push(fact);
+	}
+	return facts;
 }
 /**
 * Narrow one delivered message's source into a mailbox row, or reject it.
@@ -972,6 +974,22 @@ function upsertTask(tasks, task) {
 	if (index < 0) return [...tasks, task];
 	const next = [...tasks];
 	next[index] = task;
+	return next;
+}
+/**
+* Apply every fact one event carried, in order. An event with no readable fact
+* returns `view` itself, which is what keeps the projection registry's
+* reference-equality shortcut working for the single-fact case it has always
+* seen.
+* @param view - the state before this event.
+* @param facts - the facts the event carried, in log order.
+* @param time - the event's stamp.
+* @param bound - mailbox feed length ceiling.
+* @returns the folded view.
+*/
+function applyFacts(view, facts, time, bound) {
+	let next = view;
+	for (const fact of facts) next = applyFact(next, fact, time, bound);
 	return next;
 }
 /** Apply one settled team fact to the view. */
@@ -1029,21 +1047,6 @@ function applyFact(view, fact, time, bound) {
 				...fact.hop !== void 0 ? { hop: fact.hop } : {}
 			}, bound)
 		};
-		case "broadcast": {
-			let messages = view.messages;
-			for (const delivery of fact.deliveries) messages = appended(messages, {
-				messageId: delivery.messageId,
-				to: delivery.to,
-				kind: "message",
-				text: fact.text,
-				time,
-				...delivery.hop !== void 0 ? { hop: delivery.hop } : {}
-			}, bound);
-			return {
-				...view,
-				messages
-			};
-		}
 		case "task": return {
 			...view,
 			tasks: upsertTask(view.tasks, fact.task)
@@ -1105,8 +1108,7 @@ function applyTeamEvent(view, event, bound) {
 	}
 	if (event.type === "tool/result") {
 		if (event.data.error !== void 0) return view;
-		const fact = readFact(event.data.meta);
-		return fact === void 0 ? view : applyFact(view, fact, event.time, bound);
+		return applyFacts(view, readFacts(event.data.meta), event.time, bound);
 	}
 	if (event.type === "user/message") {
 		const incoming = readIncoming(event.data.source);
@@ -1114,10 +1116,7 @@ function applyTeamEvent(view, event, bound) {
 		const text = incoming.kind === "settled" ? noticeText(event.data.source) ?? textOf$1(event.data.content) : textOf$1(event.data.content);
 		return applyIncoming(view, incoming, event.data.id, text, event.time, bound);
 	}
-	if (event.type === "tool/ptc-dispatch") {
-		const fact = readFact(readDispatchFact(view, event.data, event.time));
-		return fact === void 0 ? view : applyFact(view, fact, event.time, bound);
-	}
+	if (event.type === "tool/ptc-dispatch") return applyFacts(view, readFacts(readDispatchFact(view, event.data, event.time)), event.time, bound);
 	return view;
 }
 /**
@@ -1674,15 +1673,13 @@ function sendTool(ctx, audience) {
 				type: "text",
 				text: "deliveries" in value ? `message queued as the next turn of ${value.deliveries.map((entry) => entry.name).join(", ")}` : `message queued as the next turn of ${value.name}`
 			}],
-			presentationMeta: (args, value) => "deliveries" in value ? {
-				team: "broadcast",
+			presentationMeta: (args, value) => "deliveries" in value ? value.deliveries.map((entry) => ({
+				team: "message",
+				messageId: entry.messageId,
+				to: entry.to,
 				text: args.message,
-				deliveries: value.deliveries.map((entry) => ({
-					messageId: entry.messageId,
-					to: entry.to,
-					hop: entry.hop
-				}))
-			} : {
+				hop: entry.hop
+			})) : {
 				team: "message",
 				messageId: value.messageId,
 				to: value.to,
