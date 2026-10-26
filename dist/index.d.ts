@@ -1,4 +1,4 @@
-import { _ as Config, a as EMPTY_TEAM_VIEW, c as TeamChain, d as TeamMessageSource, f as TeamMessageView, g as TeamView, h as TeamTaskView, i as foldTeam, l as TeamMemberView, m as TeamTaskStatus, n as TeamFact, o as TEAM_PROJECTION_KEY, p as TeamRelation, r as TeamMemberFact, s as TeamBoardEntryView, t as TeamService, u as TeamMessageKind, v as TeamConfig } from "./service-D_virsfo.js";
+import { _ as Config, a as EMPTY_TEAM_VIEW, c as TeamChain, d as TeamMessageSource, f as TeamMessageView, g as TeamView, h as TeamTaskView, i as foldTeam, l as TeamMemberView, m as TeamTaskStatus, n as TeamFact, o as TEAM_PROJECTION_KEY, p as TeamRelation, r as TeamMemberFact, s as TeamBoardEntryView, t as TeamService, u as TeamMessageKind, v as TeamConfig } from "./service-BNnkCR96.js";
 import { z } from "zod";
 import { Context } from "@deepseek-ai/cordis";
 import { ProjectionDefinition } from "@deepseek-ai/dsh-session-projection";
@@ -11,7 +11,7 @@ import { ProjectionDefinition } from "@deepseek-ai/dsh-session-projection";
  * @module dsh-team/errors
  */
 /** Every way a team operation refuses. */
-type TeamErrorCode = 'NO_TEAM' | 'LEADER_AWAY' | 'NESTED_TEAM' | 'MAX_TEAMMATES' | 'DUPLICATE_NAME' | 'UNKNOWN_MEMBER' | 'UNKNOWN_TASK' | 'TASK_TITLE_REQUIRED' | 'SELF_MESSAGE' | 'UNAUTHORIZED' | 'UNKNOWN_PROVIDER' | 'MODEL_REQUIRED' | 'UNKNOWN_EFFORT' | 'CHAIN_EXHAUSTED' | 'PING_PONG' | 'REPEATED_MESSAGE' | 'INVALID_NOTE_KEY' | 'NOTE_TOO_LONG' | 'WORKSPACE_FULL' | 'UNKNOWN_NOTE' | 'EMPTY_LEARNING' | 'UNKNOWN_DOSSIER' | 'UNKNOWN_ENTRY';
+type TeamErrorCode = 'NO_TEAM' | 'LEADER_AWAY' | 'NESTED_TEAM' | 'MAX_TEAMMATES' | 'DUPLICATE_NAME' | 'UNKNOWN_MEMBER' | 'UNKNOWN_TASK' | 'TASK_TITLE_REQUIRED' | 'SELF_MESSAGE' | 'UNAUTHORIZED' | 'UNKNOWN_PROVIDER' | 'MODEL_REQUIRED' | 'UNKNOWN_EFFORT' | 'CHAIN_EXHAUSTED' | 'PING_PONG' | 'REPEATED_MESSAGE' | 'INVALID_NOTE_KEY' | 'NOTE_TOO_LONG' | 'WORKSPACE_FULL' | 'UNKNOWN_NOTE' | 'EMPTY_LEARNING' | 'UNKNOWN_DOSSIER' | 'UNKNOWN_ENTRY' | 'ABORTED';
 /** One refused team operation. */
 declare class TeamError extends Error {
   readonly code: TeamErrorCode;

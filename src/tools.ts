@@ -22,7 +22,7 @@ import type { TeamMemberFact } from './fold.ts'
 import { DISPATCH_FACT_PREFIX } from './fold-dispatch.ts'
 import { TeamError } from './errors.ts'
 import type { DossierEntry, MemberDossiers } from './dossier.ts'
-import type { TeamSeat, TeamService } from './service.ts'
+import { WAIT_DEFAULT_MS, WAIT_MAX_MS, type TeamSeat, type TeamService } from './service.ts'
 import { SHARED_AREA, type TeamWorkspace } from './workspace.ts'
 
 /** The acting agent; a team tool without one is a composition mistake. */
@@ -577,6 +577,95 @@ export function listTool(ctx: Context, audience: 'leader' | 'member' = 'leader')
           ...message.hop !== undefined ? { hop: message.hop } : {},
         })),
       })
+    },
+  })
+}
+
+/**
+ * `team_wait` — block until the named teammates stop working.
+ *
+ * The missing half of asynchronous delivery: `team_send` only accepts a message
+ * and `team_list` only samples a state, so neither can answer "have the three
+ * reviews come back yet". This is observation only — it never spawns, wakes or
+ * cancels a member — which is why it belongs to the leader alone: a teammate
+ * waiting on its peers would deadlock two turns against each other.
+ * @param ctx - context carrying the team service.
+ * @returns the tool definition.
+ */
+export function waitTool(ctx: Context): ToolDefinition {
+  return defineTool({
+    name: 'team_wait',
+    description:
+      'Block until teammates finish their current turn, then report who is done, who is still running, and '
+      + 'whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone '
+      + '"back" before you summarise: team_send only accepts a message and never answers, so this is the only '
+      + 'call that waits for the work itself. Read the answer for what it is: it reports that nobody is '
+      + 'running, not that your broadcast has been answered — a member that is idle right now counts as done '
+      + 'even if it has not started yet, and a teammate\'s reply reaches you only when it calls team_send, '
+      + 'arriving as your own next turn (team_list shows who has actually written back). It gives a '
+      + 'just-accepted delivery a brief moment to wake its recipient, waits for every member when you name '
+      + `none, returns as soon as they are all idle, and gives up after timeout_ms (default `
+      + `${WAIT_DEFAULT_MS / 60_000} minutes, at most ${WAIT_MAX_MS / 60_000}) with timedOut: true and the `
+      + 'still-running members in busy. A member that is idle, or no longer resident, counts as done. It only '
+      + 'observes: it never spawns, wakes, messages or cancels anyone.',
+    parameters: {
+      members: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Teammate names or member ids; omit to wait for every member of the team.',
+      },
+      timeout_ms: {
+        type: 'integer',
+        description:
+          `How long to block before reporting the rest as busy (default ${WAIT_DEFAULT_MS}, at most `
+          + `${WAIT_MAX_MS}); an expired wait is a report, not a failure, so you may ask again.`,
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          done: {
+            type: 'array',
+            required: true,
+            items: { type: 'string' },
+            description: 'Members that had stopped running when the wait ended.',
+          },
+          busy: {
+            type: 'array',
+            required: true,
+            items: { type: 'string' },
+            description: 'Members still running when the timeout expired; empty otherwise.',
+          },
+          timedOut: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.timedOut
+          ? `timed out — still running: ${value.busy.join(', ')}`
+            + (value.done.length === 0 ? '' : `; settled: ${value.done.join(', ')}`)
+          : value.done.length === 0
+            ? 'nothing to wait for'
+            : `all settled: ${value.done.join(', ')}`,
+      }],
+    },
+    presentCall: args => ({
+      card: 'generic',
+      kind: 'read',
+      title: args.members === undefined ? 'Wait for the team' : `Wait for ${args.members.join(', ')}`,
+    }),
+    presentResult: (args, result) => result.isError
+      ? done('Wait for teammates', `failed: ${failureText(result)}`)
+      : done(args.members === undefined ? 'Waited for the team' : `Waited for ${args.members.join(', ')}`),
+    async execute(args, exec) {
+      const observed = await ctx.team.wait(actor(exec.agent), {
+        ...args.members !== undefined ? { members: args.members } : {},
+        ...args.timeout_ms !== undefined ? { timeoutMs: args.timeout_ms } : {},
+        signal: exec.signal,
+      })
+      return { done: [...observed.done], busy: [...observed.busy], timedOut: observed.timedOut }
     },
   })
 }

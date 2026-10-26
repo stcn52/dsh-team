@@ -29,7 +29,7 @@ import { TeamService } from './service.ts'
 import { installTeammateDossier, installTeammateWorkspace, installTeammateWorld } from './teammate.ts'
 import {
   boardTool, dismissTool, dossierNameOf, forgetTool, listTool, noteTool, profileTool, relationTool,
-  reviewTool, sendTool, spawnTool, taskTool,
+  reviewTool, sendTool, spawnTool, taskTool, waitTool,
 } from './tools.ts'
 import { installLeaderRouting } from './routing.ts'
 import { TeamWorkspace } from './workspace.ts'
@@ -78,6 +78,10 @@ function installLeaderTools(ctx: Context, config: TeamConfig, agent: Agent): () 
     agent.ctx.tools.register(relationTool(ctx)),
     agent.ctx.tools.register(dismissTool(ctx)),
     agent.ctx.tools.register(listTool(ctx)),
+    // Waiting is the leader's alone: a teammate blocking on its peers would
+    // deadlock two turns against each other, and its own briefing already tells
+    // it not to wait for a peer in place.
+    agent.ctx.tools.register(waitTool(ctx)),
   ]
   return () => {
     for (const dispose of disposers.reverse()) dispose()

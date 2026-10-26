@@ -327,6 +327,28 @@ interface TeamListResult {
   readonly tasks: readonly TeamTaskView[];
   readonly messages: readonly TeamMessageView[];
 }
+/** What one `team_wait` observed when it returned. */
+interface TeamWaitResult {
+  /**
+   * Members that were not running when the wait ended, named in the order they
+   * were asked about. A member whose agent was reaped counts here: it occupies
+   * no turn, so waiting on it further would wait on a ghost.
+   */
+  readonly done: readonly string[];
+  /** Members still running when the budget expired; empty unless `timedOut`. */
+  readonly busy: readonly string[];
+  /** Whether the budget expired before every target settled. */
+  readonly timedOut: boolean;
+}
+/** What one caller asks `team_wait` to observe. */
+interface TeamWaitRequest {
+  /** Member names or ids; omitted means every member of this team. */
+  readonly members?: readonly string[];
+  /** Wall-clock budget in milliseconds, clamped to `[1, WAIT_MAX_MS]`. */
+  readonly timeoutMs?: number;
+  /** Caller cancellation: the wait refuses with `ABORTED` instead of a partial read. */
+  readonly signal?: AbortSignal;
+}
 /** Where one member sits: whose workspace it reaches, and how a note is signed. */
 interface TeamSeat {
   readonly leaderId: string;
@@ -498,6 +520,85 @@ declare class TeamService extends Service {
    * @returns the live team read; an inactive team reports empty lists.
    */
   list(actorAgent: Agent): TeamListResult;
+  /**
+   * Block until the named teammates stop running, or until the budget expires.
+   *
+   * Observation only: nothing here spawns, wakes, cancels, or messages a member.
+   * A member the registry no longer holds counts as done, because a reaped agent
+   * occupies no turn and reporting it busy would leave the leader waiting on a
+   * ghost. Readiness is `Agent.whenIdle()` — the harness's own quiescence signal
+   * — rather than a poll of `Agent.status`: a status sample can miss a turn that
+   * begins between two samples, while `whenIdle()` follows the activity it was
+   * observed against.
+   *
+   * The boundary this answer carries: it reports **quiescence**, not receipt. A
+   * member that is idle right now may still be holding a prompt `team_send`
+   * accepted a moment ago, and `whenIdle()` cannot see that — so one settle
+   * window runs before the first read, and a delivery that lands later than that
+   * window is indistinguishable from a member that was already idle.
+   * @param actorAgent - the acting leader or teammate.
+   * @param request - who to wait for, for how long, and the caller's signal.
+   * @returns who is done, who is still running, and whether time ran out.
+   * @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place
+   *   (the leader itself included — it is the one waiting), `ABORTED` when the
+   *   caller's signal fires, `NO_TEAM`/`LEADER_AWAY` when there is no team.
+   */
+  wait(actorAgent: Agent, request?: TeamWaitRequest): Promise<TeamWaitResult>;
+  /**
+   * The one settle `wait` gives a delivery `team_send` accepted just before it.
+   *
+   * One fixed delay, never a poll: `team_send` is asynchronous by contract — the
+   * prompt is accepted into the recipient's inbox, which may also resume and
+   * publish a cold recipient — while `whenIdle()` only answers "is the current
+   * activity quiescent". Reading the roster in the same tick as the send would
+   * therefore see an idle member whose driver has not started yet. The settle
+   * runs before the budget starts, so it never shortens the wait the caller
+   * asked for.
+   * @returns a promise that resolves after one settle window.
+   */
+  private settle;
+  /**
+   * Resolve the wait's addresses against this team's roster, in the order given
+   * and without duplicates: one member is one target however it was spelled.
+   * @param actor - whose roster answers.
+   * @param requested - names or ids, or undefined for every member.
+   * @returns the targets to observe.
+   * @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place,
+   *   including `leader`: the leader is the one waiting.
+   */
+  private waitTargets;
+  /**
+   * Watch one member's idle signal, recording it in `settled`.
+   *
+   * A member whose agent is already gone records as settled without asking the
+   * harness anything, and a rejected — or synchronously throwing — idle signal
+   * records as settled too: an unobservable member must not hang the leader's
+   * turn, and the next wait observes it afresh.
+   * @param memberId - the roster member to watch.
+   * @param settled - the shared set of members already accounted for.
+   * @returns the observation promise, which never rejects.
+   */
+  private observeIdle;
+  /**
+   * Race every idle signal against one deadline and the caller's signal.
+   *
+   * One aggregate race, not one timer per member: who is still running at the
+   * deadline is re-read from the registry afterwards, so per-member timers would
+   * only duplicate that read. The timer is always cleared and the abort listener
+   * always removed, so a wait that ends early leaves nothing armed on the
+   * caller's signal.
+   *
+   * A `whenIdle()` promise abandoned at the deadline or on abort cannot be
+   * cancelled — the seam takes no signal — and is a harmless remnant: its `then`
+   * only records a name in a set nobody reads again. Never await it a second
+   * time; a fresh wait starts a fresh observation instead.
+   * @param observing - one observation promise per member being watched.
+   * @param budget - the deadline in milliseconds, already clamped.
+   * @param signal - the caller's cancellation, when it supplied one.
+   * @returns `done` when every member settled, `timeout` when the deadline fired.
+   * @throws {TeamError} `ABORTED` when the caller's signal fires first.
+   */
+  private raceWait;
   /**
    * Where one acting agent sits in its team: whose workspace it reaches, and
    * how a note it writes is attributed. The leader's own seat carries its

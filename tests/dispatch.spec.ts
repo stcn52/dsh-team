@@ -61,6 +61,25 @@ describe('PTC-mode result fidelity', () => {
     expect(view.messages[0]).toMatchObject({ messageId: 'm1', to: 'child-1', hop: 0 })
   })
 
+  it('keeps every broadcast row identical on both channels', () => {
+    // The list-of-facts return must survive the PTC envelope (one JSON array)
+    // exactly as it survives the native meta slot: three rows either way.
+    const value = {
+      count: 3,
+      deliveries: [
+        { messageId: 'm1', to: 'child-1', name: 'Alice', hop: 0 },
+        { messageId: 'm2', to: 'child-2', name: 'Bob', hop: 0 },
+        { messageId: 'm3', to: 'child-3', name: 'Carol', hop: 1 },
+      ],
+    }
+    const view = roundTrip(sendTool(ctx, 'leader'), { to: '*', message: 'all hands' }, value, roster)
+    expect(view.messages.map(message => [message.messageId, message.to, message.hop])).toEqual([
+      ['m1', 'child-1', 0],
+      ['m2', 'child-2', 0],
+      ['m3', 'child-3', 1],
+    ])
+  })
+
   it('applies relation changes addressed with different casing and spaces', () => {
     roundTrip(relationTool(ctx), { member: ' ALICE ', relation: 'managed' }, { ...alice, relation: 'managed' }, roster)
   })

@@ -394,6 +394,168 @@ describe('mailbox', () => {
   })
 })
 
+describe('broadcast delivery', () => {
+  /** Two peers and one managed member, so every wildcard expansion is visible. */
+  async function trio(): Promise<{
+    readonly scene: World
+    readonly alice: FakeAgent
+    readonly bob: FakeAgent
+    readonly carol: FakeAgent
+  }> {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3 } })
+    const alice = await spawn(scene, 'Alice', { relation: 'peer', childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { relation: 'peer', childId: 'child-2' })
+    const carol = await spawn(scene, 'Carol', { relation: 'managed', childId: 'child-3' })
+    return { scene, alice, bob, carol }
+  }
+
+  /**
+   * Run one asynchronous operation expected to refuse, keeping the refusal.
+   * @param run - the operation.
+   * @returns the refusal, or undefined when it was accepted.
+   */
+  async function caught(run: () => Promise<unknown>): Promise<TeamError | undefined> {
+    try {
+      await run()
+      return undefined
+    } catch (error: unknown) {
+      return error instanceof TeamError ? error : undefined
+    }
+  }
+
+  it('keeps the single-address result shape every existing caller reads', async () => {
+    const { scene } = await trio()
+    const sent = await scene.service.send(scene.leader.agent, 'Alice', 'please review', signal)
+    expect(Object.keys(sent).sort()).toEqual(['chain', 'messageId', 'recipient'])
+    expect(sent.recipient).toMatchObject({ kind: 'member', id: 'child-1', name: 'Alice' })
+    expect(sent.chain).toEqual({ chainId: 'c1', hop: 0 })
+    expect(typeof sent.messageId).toBe('string')
+    expect(scene.subagents.followups).toHaveLength(1)
+  })
+
+  it('delivers to every address in the list, one message id each', async () => {
+    const { scene } = await trio()
+    const broadcast = await scene.service.send(scene.leader.agent, ['Alice', 'Bob'], 'sync up', signal)
+    expect(broadcast.deliveries.map(entry => entry.recipient.id)).toEqual(['child-1', 'child-2'])
+    expect(new Set(broadcast.deliveries.map(entry => entry.messageId)).size).toBe(2)
+    expect(scene.subagents.followups.map(entry => entry.childId)).toEqual(['child-1', 'child-2'])
+  })
+
+  it('expands the wildcard for the leader to the whole roster', async () => {
+    const { scene } = await trio()
+    const broadcast = await scene.service.send(scene.leader.agent, '*', 'all hands', signal)
+    expect(broadcast.deliveries.map(entry => entry.recipient.id)).toEqual(['child-1', 'child-2', 'child-3'])
+    expect(broadcast.deliveries.map(entry => entry.chain.hop)).toEqual([0, 0, 0])
+    expect(scene.subagents.followups).toHaveLength(3)
+    // The wildcard works inside a list as well, and the member it repeats is
+    // still one mailbox: a mixed list is one call, not two.
+    const mixed = await scene.service.send(scene.leader.agent, ['Alice', '*'], 'again', signal)
+    expect(mixed.deliveries.map(entry => entry.recipient.id)).toEqual(['child-1', 'child-2', 'child-3'])
+  })
+
+  it('expands the wildcard for a peer to the leader plus the other members', async () => {
+    const { scene, alice } = await trio()
+    const broadcast = await scene.service.send(alice.agent, '*', 'status check', signal)
+    expect(broadcast.deliveries.map(entry => entry.recipient.id)).toEqual(['leader-1', 'child-2', 'child-3'])
+    expect(scene.leader.received).toHaveLength(1)
+    expect(scene.subagents.followups.map(entry => entry.childId)).toEqual(['child-2', 'child-3'])
+  })
+
+  it('expands the wildcard for a managed member to the leader alone', async () => {
+    const { scene, carol } = await trio()
+    const broadcast = await scene.service.send(carol.agent, '*', 'only you', signal)
+    expect(broadcast.deliveries.map(entry => entry.recipient.id)).toEqual(['leader-1'])
+    expect(scene.leader.received).toHaveLength(1)
+    expect(scene.subagents.followups).toHaveLength(0)
+  })
+
+  it('never includes the sender in its own wildcard, and refuses a spelled-out self', async () => {
+    const { scene, alice } = await trio()
+    const broadcast = await scene.service.send(alice.agent, '*', 'hello all', signal)
+    expect(broadcast.deliveries.map(entry => entry.recipient.id)).not.toContain('child-1')
+    expect((await caught(() => scene.service.send(alice.agent, ['Alice'], 'me?', signal)))?.code)
+      .toBe('SELF_MESSAGE')
+  })
+
+  it('refuses a wildcard with nobody left to address, and an empty list', async () => {
+    const scene = world()
+    expect((await caught(() => scene.service.send(scene.leader.agent, '*', 'anyone?', signal)))?.code)
+      .toBe('UNKNOWN_MEMBER')
+    expect((await caught(() => scene.service.send(scene.leader.agent, [], 'hi', signal)))?.code)
+      .toBe('UNKNOWN_MEMBER')
+  })
+
+  it('delivers nothing at all when one address is unknown, and names that address', async () => {
+    const { scene } = await trio()
+    const error = await caught(() => scene.service.send(scene.leader.agent, ['Alice', 'Nobody'], 'hi', signal))
+    expect(error).toMatchObject({ code: 'UNKNOWN_MEMBER', detail: 'Nobody' })
+    expect(scene.subagents.followups).toHaveLength(0)
+    expect(scene.leader.received).toHaveLength(0)
+  })
+
+  it('delivers nothing when a later recipient cannot afford the message', async () => {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3, maxChainRoundTrips: 1 } })
+    const alice = await spawn(scene, 'Alice', { relation: 'peer', childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { relation: 'peer', childId: 'child-2' })
+    await scene.service.send(scene.leader.agent, 'Alice', 'look into it', signal)
+    await scene.service.send(alice.agent, 'Bob', 'first', signal)
+    const delivered = scene.subagents.followups.length
+    // The leader is the cheap address and comes first in the list; Bob's pair is
+    // spent, so checking every recipient first is what keeps this all-or-nothing.
+    const error = await caught(() => scene.service.send(alice.agent, ['leader', 'Bob'], 'again', signal))
+    expect(error?.code).toBe('PING_PONG')
+    expect(scene.leader.received).toHaveLength(0)
+    expect(scene.subagents.followups).toHaveLength(delivered)
+  })
+
+  it('delivers once when the same member is addressed twice', async () => {
+    const { scene } = await trio()
+    const broadcast = await scene.service.send(scene.leader.agent, ['Alice', 'Alice', 'child-1'], 'once', signal)
+    expect(broadcast.deliveries.map(entry => entry.recipient.id)).toEqual(['child-1'])
+    expect(scene.subagents.followups).toHaveLength(1)
+  })
+
+  it('refuses a managed member a list that reaches a teammate, delivering none of it', async () => {
+    const { scene, carol } = await trio()
+    const error = await caught(() => scene.service.send(carol.agent, ['leader', 'Alice'], 'hi', signal))
+    expect(error?.code).toBe('UNAUTHORIZED')
+    expect(scene.leader.received).toHaveLength(0)
+    expect(scene.subagents.followups).toHaveLength(0)
+  })
+
+  it('opens one conversation for the whole broadcast, each recipient deepening its own leg', async () => {
+    const { scene, alice } = await trio()
+    const broadcast = await scene.service.send(scene.leader.agent, ['Alice', 'Bob'], 'sync up', signal)
+    expect(broadcast.deliveries.map(entry => entry.chain)).toEqual([
+      { chainId: 'c1', hop: 0 },
+      { chainId: 'c1', hop: 0 },
+    ])
+    // The broadcast did not stack hops on Alice: her first relay is one deeper
+    // than the message she is working from, exactly as a single send would be.
+    expect((await scene.service.send(alice.agent, 'Bob', 'what do you know?', signal)).chain)
+      .toEqual({ chainId: 'c1', hop: 1 })
+    // One conversation for the whole broadcast: the chain counter advanced once,
+    // not once per recipient.
+    expect((await scene.service.send(scene.leader.agent, 'Carol', 'second round', signal)).chain)
+      .toEqual({ chainId: 'c2', hop: 0 })
+  })
+
+  it('spends one hop on a broadcast, not one per recipient', async () => {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3, maxChainHops: 1 } })
+    const alice = await spawn(scene, 'Alice', { relation: 'peer', childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { relation: 'peer', childId: 'child-2' })
+    await spawn(scene, 'Carol', { relation: 'peer', childId: 'child-3' })
+    // Three recipients against a budget of one relay: only the leader's own
+    // message may have cost a hop, so the first relay still fits.
+    await scene.service.send(scene.leader.agent, '*', 'kickoff', signal)
+    expect((await scene.service.send(alice.agent, 'Bob', 'on it', signal)).chain)
+      .toEqual({ chainId: 'c1', hop: 1 })
+    // And the broadcast did not reset the depth: the next relay is refused.
+    expect((await caught(() => scene.service.send(bob.agent, 'Alice', 'me too', signal)))?.code)
+      .toBe('CHAIN_EXHAUSTED')
+  })
+})
+
 describe('task list', () => {
   let scene: World
   let alice: FakeAgent
@@ -663,5 +825,187 @@ describe('a leader that is not loaded', () => {
     const scene = world()
     expect(await codeOf(() => scene.service.send(scene.leader.agent, 'Alice', 'hello', signal)))
       .toBe('UNKNOWN_MEMBER')
+  })
+})
+
+/**
+ * Waiting for the roster to settle. The seam under test is
+ * `Agent.whenIdle()` — the double models it as "resolves now while idle,
+ * resolves on release while running" — so these cases fix the primitive's
+ * contract rather than a polling loop's timing.
+ */
+describe('wait', () => {
+  /**
+   * Run one async operation expected to refuse.
+   * @param run - the operation.
+   * @returns the refusal code, or `no-throw` when it was accepted.
+   */
+  async function codeOf(run: () => Promise<unknown>): Promise<string> {
+    try {
+      await run()
+      return 'no-throw'
+    } catch (error: unknown) {
+      return error instanceof TeamError ? error.code : `other: ${String(error)}`
+    }
+  }
+
+  /**
+   * Let wall-clock time pass. Used only to step past the wait's own settle
+   * window; every assertion about state stays promise-driven.
+   * @param ms - how long to wait.
+   * @returns a promise that resolves afterwards.
+   */
+  async function sleep(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => { setTimeout(resolve, ms) })
+  }
+
+  it('returns at once with every member done when nobody is running', async () => {
+    const scene = world()
+    await spawn(scene, 'Alice', { childId: 'child-1' })
+    await spawn(scene, 'Bob', { childId: 'child-2' })
+
+    expect(await scene.service.wait(scene.leader.agent))
+      .toEqual({ done: ['Alice', 'Bob'], busy: [], timedOut: false })
+  })
+
+  it('blocks while a member runs, and returns as soon as it is idle', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+
+    const resolved: boolean[] = []
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 })
+      .then((value) => { resolved.push(true); return value })
+    // Past the settle window, so the wait is now holding a live `whenIdle()`.
+    await sleep(80)
+    expect(resolved).toEqual([])
+
+    alice.goIdle()
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], timedOut: false })
+  })
+
+  /**
+   * The race the settle window exists for: `team_send` accepts a prompt into the
+   * recipient's inbox, and the recipient's driver starts a moment later. Read in
+   * the same tick, the member still looks idle and `whenIdle()` answers
+   * immediately — so a wait issued straight from the sending turn would report
+   * "done" before anyone had begun.
+   *
+   * The wake is modelled as a queued microtask, which is what makes this a
+   * negative control: drop the settle and the read happens before the wake, so
+   * `resolved` fills up while the member is still about to start.
+   */
+  it('does not call a just-delivered member done before its wake lands', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // The delivery was accepted a moment ago; the driver wake is still queued.
+    queueMicrotask(() => { alice.status = 'running' })
+
+    const resolved: boolean[] = []
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 })
+      .then((value) => { resolved.push(true); return value })
+    await sleep(80)
+    expect(resolved).toEqual([])
+
+    alice.goIdle()
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], timedOut: false })
+  })
+
+  it('re-reads the roster after the settle, so a member published meanwhile is still awaited', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // A cold recipient: the roster row exists, no live agent yet. The accepted
+    // delivery resumes and publishes it just after the wait begins.
+    scene.agents.remove(alice.id)
+    alice.status = 'running'
+    setTimeout(() => { scene.agents.add(alice) }, 0)
+
+    const resolved: boolean[] = []
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 })
+      .then((value) => { resolved.push(true); return value })
+    await sleep(80)
+    expect(resolved).toEqual([])
+
+    alice.goIdle()
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], timedOut: false })
+  })
+
+  it('reports the members still running when the budget expires, without hanging', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    await spawn(scene, 'Bob', { childId: 'child-2' })
+    alice.status = 'running'
+
+    const started = Date.now()
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 20 })
+    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], timedOut: true })
+    expect(Date.now() - started).toBeLessThan(2_000)
+  })
+
+  it('counts a member the registry no longer holds as done, without observing it', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    scene.agents.remove(alice.id)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 }))
+      .toEqual({ done: ['Alice'], busy: [], timedOut: false })
+    expect(alice.idleCalls).toBe(0)
+  })
+
+  it('refuses with ABORTED instead of reporting half a roster', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    const controller = new AbortController()
+
+    const waiting = scene.service.wait(scene.leader.agent, { signal: controller.signal, timeoutMs: 5_000 })
+    controller.abort()
+
+    expect(await codeOf(() => waiting)).toBe('ABORTED')
+    // A refused wait is an observation abandoned, not a member disturbed.
+    expect(alice.status).toBe('running')
+  })
+
+  it('refuses an already-aborted call before it observes anyone', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    const controller = new AbortController()
+    controller.abort()
+
+    expect(await codeOf(() => scene.service.wait(scene.leader.agent, { signal: controller.signal })))
+      .toBe('ABORTED')
+    expect(alice.idleCalls).toBe(0)
+  })
+
+  it('refuses an address the roster cannot place, the leader itself included', async () => {
+    const scene = world()
+    await spawn(scene, 'Alice')
+
+    expect(await codeOf(() => scene.service.wait(scene.leader.agent, { members: ['Nobody'] })))
+      .toBe('UNKNOWN_MEMBER')
+    expect(await codeOf(() => scene.service.wait(scene.leader.agent, { members: ['leader'] })))
+      .toBe('UNKNOWN_MEMBER')
+  })
+
+  it('answers an empty team, and an empty selection, without arming a wait', async () => {
+    const scene = world()
+    expect(await scene.service.wait(scene.leader.agent))
+      .toEqual({ done: [], busy: [], timedOut: false })
+
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    expect(await scene.service.wait(scene.leader.agent, { members: [], timeoutMs: 60_000 }))
+      .toEqual({ done: [], busy: [], timedOut: false })
+    expect(alice.idleCalls).toBe(0)
+  })
+
+  it('names each member once, however it was addressed', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+
+    expect(await scene.service.wait(scene.leader.agent, { members: ['Alice', 'alice', alice.id] }))
+      .toEqual({ done: ['Alice'], busy: [], timedOut: false })
   })
 })

@@ -38,8 +38,16 @@ export interface FakeAgent {
   readonly received: AcceptedMessage[]
   /** Messages accepted through `steer` (the command plane's submission path). */
   readonly steered: UserMessage[]
+  /** Resolvers of `whenIdle()` calls still pending, oldest first. */
+  readonly idleWaiters: Array<() => void>
+  /** How many times `whenIdle()` was called, so a test can prove nobody observed this agent. */
+  idleCalls: number
   send(message: UserMessage, target: string, wakeup: boolean): void
   steer(message: UserMessage): void
+  /** The harness's own quiescence seam: resolves now while idle, on release while running. */
+  whenIdle(): Promise<void>
+  /** End the current activity: status becomes idle and every pending `whenIdle()` resolves. */
+  goIdle(): void
   /** The same double under the seam's own type, for service and tool calls. */
   readonly agent: Agent
 }
@@ -80,11 +88,22 @@ export function fakeAgent(id: string, options: {
     prompt: new FakeSystemPrompt(),
     received: [],
     steered: [],
+    idleWaiters: [],
+    idleCalls: 0,
     send(message, target, wakeup) {
       this.received.push({ message, target, wakeup })
     },
     steer(message) {
       this.steered.push(message)
+    },
+    whenIdle() {
+      this.idleCalls += 1
+      if (this.status === 'idle') return Promise.resolve()
+      return new Promise<void>(resolve => { this.idleWaiters.push(resolve) })
+    },
+    goIdle() {
+      this.status = 'idle'
+      for (const resolve of this.idleWaiters.splice(0)) resolve()
     },
     get agent(): Agent {
       return self as unknown as Agent

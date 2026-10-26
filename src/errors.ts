@@ -31,6 +31,7 @@ export type TeamErrorCode =
   | 'EMPTY_LEARNING'
   | 'UNKNOWN_DOSSIER'
   | 'UNKNOWN_ENTRY'
+  | 'ABORTED'
 
 /** Stable sentence per code; `detail` appends the caller-specific part. */
 const MESSAGES: Record<TeamErrorCode, string> = {
@@ -70,6 +71,9 @@ const MESSAGES: Record<TeamErrorCode, string> = {
     + 'this worth keeping',
   UNKNOWN_DOSSIER: 'nobody under that name has a dossier yet — there is nothing recorded to read or forget',
   UNKNOWN_ENTRY: 'no entry with that id is in this dossier — team_profile lists the ids it holds',
+  ABORTED:
+    'this call was cancelled before it finished, so it has no answer to report. Nothing was changed; '
+    + 'ask again if you still need it',
 }
 
 /** One refused team operation. */

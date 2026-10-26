@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { EMPTY_TEAM_VIEW } from '../src/contract.ts'
-import { applyTeamEvent, foldTeam, readFact } from '../src/fold.ts'
+import { applyTeamEvent, foldTeam, readFact, readFacts } from '../src/fold.ts'
 import { codeDispatchEvent, toolResultEvent, userMessageEvent } from './harness.ts'
 
 const BOUND = 50
@@ -47,6 +47,32 @@ describe('readFact', () => {
     expect(readFact({ team: 'member-promoted-to-leader', member: alice })).toBeUndefined()
     expect(readFact('member-added')).toBeUndefined()
     expect(readFact(undefined)).toBeUndefined()
+  })
+})
+
+describe('readFacts', () => {
+  const one = { team: 'message', messageId: 'm1', to: 'child-1', text: 'hi' }
+
+  it('reads one object as the single fact it always was', () => {
+    expect(readFacts(one)).toEqual([{ team: 'message', messageId: 'm1', to: 'child-1', text: 'hi' }])
+  })
+
+  it('reads a list of facts in order, which is how one call reports several changes', () => {
+    const facts = readFacts([one, { team: 'message', messageId: 'm2', to: 'child-2', text: 'hi' }])
+    expect(facts.map(fact => fact.team === 'message' ? fact.messageId : 'other')).toEqual(['m1', 'm2'])
+  })
+
+  it('skips one unreadable entry instead of voiding the rest of the list', () => {
+    const facts = readFacts([one, { team: 'member-promoted-to-leader' }, 'nonsense', { team: 'message' }])
+    expect(facts).toHaveLength(1)
+    expect(facts[0]).toEqual({ team: 'message', messageId: 'm1', to: 'child-1', text: 'hi' })
+  })
+
+  it('carries nothing for a slot that is not a fact at all', () => {
+    expect(readFacts(undefined)).toEqual([])
+    expect(readFacts('member-added')).toEqual([])
+    expect(readFacts([])).toEqual([])
+    expect(readFacts([[], null])).toEqual([])
   })
 })
 
@@ -122,6 +148,35 @@ describe('foldTeam', () => {
     expect(view.messages).toEqual([
       { messageId: 'm1', to: 'child-1', kind: 'message', text: 'please review', time: 77 },
     ])
+  })
+
+  it('records one row per fact when one send reports several mailboxes', () => {
+    // A broadcast to three teammates arrives as one event carrying three facts,
+    // and the stream must show three rows — not one, and not none.
+    const view = foldTeam([
+      toolResultEvent([
+        { team: 'message', messageId: 'm1', to: 'child-1', text: 'all hands', hop: 0 },
+        { team: 'message', messageId: 'm2', to: 'child-2', text: 'all hands', hop: 0 },
+        { team: 'message', messageId: 'm3', to: 'child-3', text: 'all hands', hop: 0 },
+      ], { time: 77 }),
+    ], BOUND)
+    expect(view.messages).toEqual([
+      { messageId: 'm1', to: 'child-1', kind: 'message', text: 'all hands', time: 77, hop: 0 },
+      { messageId: 'm2', to: 'child-2', kind: 'message', text: 'all hands', time: 77, hop: 0 },
+      { messageId: 'm3', to: 'child-3', kind: 'message', text: 'all hands', time: 77, hop: 0 },
+    ])
+  })
+
+  it('keeps the rows a mixed list can read and drops only the unreadable entry', () => {
+    const view = foldTeam([
+      toolResultEvent([
+        { team: 'message', messageId: 'm1', to: 'child-1', text: 'kept', hop: 0 },
+        { team: 'message' },
+        'nonsense',
+        { team: 'message', messageId: 'm2', to: 'child-2', text: 'kept', hop: 0 },
+      ], { time: 5 }),
+    ], BOUND)
+    expect(view.messages.map(message => message.messageId)).toEqual(['m1', 'm2'])
   })
 
   it('records an inbound delivery only when its sender is on the roster', () => {

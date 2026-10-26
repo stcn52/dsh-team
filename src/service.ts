@@ -47,6 +47,30 @@ export type MemberStatus = 'running' | 'idle' | 'ready'
 const CHAIN_MEMORY = 64
 
 /**
+ * The default `team_wait` budget: long enough for one teammate's turn, short
+ * enough that a stalled member is reported instead of holding the leader's turn
+ * for the rest of the session.
+ */
+export const WAIT_DEFAULT_MS = 120_000
+
+/**
+ * The ceiling `team_wait` accepts. A leader that genuinely needs longer asks
+ * again with the members still running; holding one tool call for longer than
+ * this only makes a stuck roster invisible for longer.
+ */
+export const WAIT_MAX_MS = 600_000
+
+/**
+ * How long `team_wait` lets a just-accepted delivery settle before it reads the
+ * roster. `team_send` is asynchronous by contract: its prompt is accepted into
+ * the recipient's inbox — behind which a cold recipient may also be resumed and
+ * published — while `whenIdle()` only answers "is the current activity
+ * quiescent". Without one settle, a wait issued straight from the sending turn
+ * would read an idle member whose driver has not started yet.
+ */
+const WAKE_SETTLE_MS = 25
+
+/**
  * The address that means "everyone else on this team". It expands per the
  * sender's relation, because a managed member may only reach the leader and
  * its wildcard therefore resolves to that one address.
@@ -127,6 +151,30 @@ export interface TeamListResult {
   readonly messages: readonly TeamMessageView[]
 }
 
+/** What one `team_wait` observed when it returned. */
+export interface TeamWaitResult {
+  /**
+   * Members that were not running when the wait ended, named in the order they
+   * were asked about. A member whose agent was reaped counts here: it occupies
+   * no turn, so waiting on it further would wait on a ghost.
+   */
+  readonly done: readonly string[]
+  /** Members still running when the budget expired; empty unless `timedOut`. */
+  readonly busy: readonly string[]
+  /** Whether the budget expired before every target settled. */
+  readonly timedOut: boolean
+}
+
+/** What one caller asks `team_wait` to observe. */
+export interface TeamWaitRequest {
+  /** Member names or ids; omitted means every member of this team. */
+  readonly members?: readonly string[]
+  /** Wall-clock budget in milliseconds, clamped to `[1, WAIT_MAX_MS]`. */
+  readonly timeoutMs?: number
+  /** Caller cancellation: the wait refuses with `ABORTED` instead of a partial read. */
+  readonly signal?: AbortSignal
+}
+
 /** Where one member sits: whose workspace it reaches, and how a note is signed. */
 export interface TeamSeat {
   readonly leaderId: string
@@ -147,6 +195,12 @@ interface Actor {
 export type Recipient =
   | { readonly kind: 'leader'; readonly id: string; readonly name: string }
   | { readonly kind: 'member'; readonly id: string; readonly name: string; readonly member: TeamMemberFact }
+
+/** One member a wait observes, resolved against the roster before any clock starts. */
+interface WaitTarget {
+  readonly memberId: string
+  readonly name: string
+}
 
 /** One accepted mailbox delivery: the message an inbox took, and its chain. */
 export interface TeamDelivery {
@@ -537,6 +591,187 @@ export class TeamService extends Service {
       })),
       tasks: [...actor.team.tasks.values()],
       messages: [...view.messages],
+    }
+  }
+
+  /**
+   * Block until the named teammates stop running, or until the budget expires.
+   *
+   * Observation only: nothing here spawns, wakes, cancels, or messages a member.
+   * A member the registry no longer holds counts as done, because a reaped agent
+   * occupies no turn and reporting it busy would leave the leader waiting on a
+   * ghost. Readiness is `Agent.whenIdle()` — the harness's own quiescence signal
+   * — rather than a poll of `Agent.status`: a status sample can miss a turn that
+   * begins between two samples, while `whenIdle()` follows the activity it was
+   * observed against.
+   *
+   * The boundary this answer carries: it reports **quiescence**, not receipt. A
+   * member that is idle right now may still be holding a prompt `team_send`
+   * accepted a moment ago, and `whenIdle()` cannot see that — so one settle
+   * window runs before the first read, and a delivery that lands later than that
+   * window is indistinguishable from a member that was already idle.
+   * @param actorAgent - the acting leader or teammate.
+   * @param request - who to wait for, for how long, and the caller's signal.
+   * @returns who is done, who is still running, and whether time ran out.
+   * @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place
+   *   (the leader itself included — it is the one waiting), `ABORTED` when the
+   *   caller's signal fires, `NO_TEAM`/`LEADER_AWAY` when there is no team.
+   */
+  async wait(actorAgent: Agent, request: TeamWaitRequest = {}): Promise<TeamWaitResult> {
+    const actor = this.resolveActor(actorAgent)
+    const targets = this.waitTargets(actor, request.members)
+    // Read through a call, not the property directly: `AbortSignal.aborted` is
+    // readonly, so a second direct comparison would be narrowed away by the
+    // first — but the settle below is exactly where it can change.
+    const cancelled = (): boolean => request.signal?.aborted === true
+    // Checked before the first await, so an already-cancelled call never reports
+    // a cheerful "everyone is done".
+    if (cancelled()) {
+      throw new TeamError('ABORTED', 'team_wait was cancelled before it started')
+    }
+    // Nothing to observe is a complete answer, not a refusal: an empty roster and
+    // an explicit empty selection have both already happened.
+    if (targets.length === 0) return { done: [], busy: [], timedOut: false }
+    await this.settle()
+    // The settle is an await of its own, so a cancellation that lands during it
+    // must still refuse rather than report a roster it stopped believing in.
+    if (cancelled()) {
+      throw new TeamError('ABORTED', 'team_wait was cancelled before it observed anyone')
+    }
+    const settled = new Set<string>()
+    const observing = targets.map(target => this.observeIdle(target.memberId, settled))
+    const outcome = await this.raceWait(observing, clampWait(request.timeoutMs), request.signal)
+    const done: string[] = []
+    const busy: string[] = []
+    for (const target of targets) {
+      const agent = this.ctx.agents.get(SessionId(target.memberId))
+      // Settled, reaped, or — at the deadline — resident but no longer running:
+      // every one of those has stopped occupying a turn. Re-reading the registry
+      // here is what keeps a settle that lost the race by one microtask out of
+      // `busy`.
+      if (settled.has(target.memberId) || agent === undefined || agent.status !== 'running') {
+        done.push(target.name)
+      } else {
+        busy.push(target.name)
+      }
+    }
+    return { done, busy, timedOut: outcome === 'timeout' }
+  }
+
+  /**
+   * The one settle `wait` gives a delivery `team_send` accepted just before it.
+   *
+   * One fixed delay, never a poll: `team_send` is asynchronous by contract — the
+   * prompt is accepted into the recipient's inbox, which may also resume and
+   * publish a cold recipient — while `whenIdle()` only answers "is the current
+   * activity quiescent". Reading the roster in the same tick as the send would
+   * therefore see an idle member whose driver has not started yet. The settle
+   * runs before the budget starts, so it never shortens the wait the caller
+   * asked for.
+   * @returns a promise that resolves after one settle window.
+   */
+  private settle(): Promise<void> {
+    return new Promise<void>((resolve) => { setTimeout(resolve, WAKE_SETTLE_MS) })
+  }
+
+  /**
+   * Resolve the wait's addresses against this team's roster, in the order given
+   * and without duplicates: one member is one target however it was spelled.
+   * @param actor - whose roster answers.
+   * @param requested - names or ids, or undefined for every member.
+   * @returns the targets to observe.
+   * @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place,
+   *   including `leader`: the leader is the one waiting.
+   */
+  private waitTargets(actor: Actor, requested: readonly string[] | undefined): readonly WaitTarget[] {
+    const addresses = requested ?? [...actor.team.members.values()].map(member => member.memberId)
+    const targets: WaitTarget[] = []
+    const seen = new Set<string>()
+    for (const address of addresses) {
+      const recipient = this.resolveRecipient(actor, address)
+      if (recipient.kind !== 'member') {
+        throw new TeamError('UNKNOWN_MEMBER', `${recipient.name} is the leader, which is the one waiting`)
+      }
+      if (seen.has(recipient.id)) continue
+      seen.add(recipient.id)
+      targets.push({ memberId: recipient.id, name: recipient.name })
+    }
+    return targets
+  }
+
+  /**
+   * Watch one member's idle signal, recording it in `settled`.
+   *
+   * A member whose agent is already gone records as settled without asking the
+   * harness anything, and a rejected — or synchronously throwing — idle signal
+   * records as settled too: an unobservable member must not hang the leader's
+   * turn, and the next wait observes it afresh.
+   * @param memberId - the roster member to watch.
+   * @param settled - the shared set of members already accounted for.
+   * @returns the observation promise, which never rejects.
+   */
+  private observeIdle(memberId: string, settled: Set<string>): Promise<void> {
+    const release = (): void => { settled.add(memberId) }
+    const agent = this.ctx.agents.get(SessionId(memberId))
+    if (agent === undefined) {
+      release()
+      return Promise.resolve()
+    }
+    try {
+      return agent.whenIdle().then(release, release)
+    } catch {
+      release()
+      return Promise.resolve()
+    }
+  }
+
+  /**
+   * Race every idle signal against one deadline and the caller's signal.
+   *
+   * One aggregate race, not one timer per member: who is still running at the
+   * deadline is re-read from the registry afterwards, so per-member timers would
+   * only duplicate that read. The timer is always cleared and the abort listener
+   * always removed, so a wait that ends early leaves nothing armed on the
+   * caller's signal.
+   *
+   * A `whenIdle()` promise abandoned at the deadline or on abort cannot be
+   * cancelled — the seam takes no signal — and is a harmless remnant: its `then`
+   * only records a name in a set nobody reads again. Never await it a second
+   * time; a fresh wait starts a fresh observation instead.
+   * @param observing - one observation promise per member being watched.
+   * @param budget - the deadline in milliseconds, already clamped.
+   * @param signal - the caller's cancellation, when it supplied one.
+   * @returns `done` when every member settled, `timeout` when the deadline fired.
+   * @throws {TeamError} `ABORTED` when the caller's signal fires first.
+   */
+  private async raceWait(
+    observing: readonly Promise<void>[],
+    budget: number,
+    signal: AbortSignal | undefined,
+  ): Promise<'done' | 'timeout'> {
+    if (observing.length === 0) return 'done'
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    const deadline = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => { resolve('timeout') }, budget)
+    })
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      if (signal === undefined) return
+      // An abort that landed between the caller's own check and this line would
+      // never emit again, so arm nothing and refuse now instead of waiting out
+      // the full budget.
+      if (signal.aborted) {
+        reject(new TeamError('ABORTED', 'team_wait was cancelled before it started waiting'))
+        return
+      }
+      onAbort = () => { reject(new TeamError('ABORTED', 'team_wait was cancelled while it was waiting')) }
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      return await Promise.race([Promise.all(observing).then(() => 'done' as const), deadline, cancelled])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (signal !== undefined && onAbort !== undefined) signal.removeEventListener('abort', onAbort)
     }
   }
 
@@ -937,6 +1172,19 @@ function findByName(team: TeamState, name: string): TeamMemberFact | undefined {
     if (member.name.toLowerCase() === wanted) return member
   }
   return undefined
+}
+
+/**
+ * Clamp one requested wait budget into the window `team_wait` honours: an
+ * absent or non-finite value takes the default, and everything else is bounded
+ * so that neither a zero (a snapshot wearing a wait's name) nor an hour-long
+ * block can surprise the caller.
+ * @param requested - the caller's milliseconds, when it gave any.
+ * @returns the budget to arm.
+ */
+function clampWait(requested: number | undefined): number {
+  if (requested === undefined || !Number.isFinite(requested)) return WAIT_DEFAULT_MS
+  return Math.min(Math.max(Math.trunc(requested), 1), WAIT_MAX_MS)
 }
 
 /** Short stable task id, unique within one team's live list. */

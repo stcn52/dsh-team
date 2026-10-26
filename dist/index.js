@@ -112,7 +112,8 @@ const MESSAGES = {
 	UNKNOWN_NOTE: "no note with that name is in this workspace area",
 	EMPTY_LEARNING: "a dossier entry needs both the point and the evidence — say what you observed or verified that makes this worth keeping",
 	UNKNOWN_DOSSIER: "nobody under that name has a dossier yet — there is nothing recorded to read or forget",
-	UNKNOWN_ENTRY: "no entry with that id is in this dossier — team_profile lists the ids it holds"
+	UNKNOWN_ENTRY: "no entry with that id is in this dossier — team_profile lists the ids it holds",
+	ABORTED: "this call was cancelled before it finished, so it has no answer to report. Nothing was changed; ask again if you still need it"
 };
 /** One refused team operation. */
 var TeamError = class extends Error {
@@ -1211,6 +1212,919 @@ function teamProjection(maxRecentMessages) {
 	};
 }
 //#endregion
+//#region src/service.ts
+/**
+* The agent-team service: roster, mailbox routing with its relation-based
+* authorization, the shared task list, and the team lifecycle.
+*
+* Teammates are NOT a private runtime. Each one is a continuable subagent of
+* the leader (`ctx.subagents.startActivation`), so the harness owns identity,
+* residency, cold resume after a restart, interrupt, and the `origin:
+* 'subagent'` session header that keeps a teammate out of the session tree and
+* out of generic Host routing. What this service adds is what the subagent
+* seam deliberately leaves out: named members, member-to-member delivery, and
+* one shared task list.
+*
+* Delivery authority is always the leader's. `ctx.subagents` authorizes a
+* follow-up against the durable direct-parent lineage only ("teams remain
+* rejected until an explicit authority protocol has a production consumer"),
+* and the leader IS every teammate's durable direct parent. A peer-to-peer
+* message is therefore a leader-authorized delivery whose durable source names
+* the real sender; `relation` decides who may ASK for it, never who may
+* perform it.
+*
+* @module dsh-team/service
+*/
+/** How many recent conversation chains one team keeps enforcement state for. */
+const CHAIN_MEMORY = 64;
+/**
+* The default `team_wait` budget: long enough for one teammate's turn, short
+* enough that a stalled member is reported instead of holding the leader's turn
+* for the rest of the session.
+*/
+const WAIT_DEFAULT_MS = 12e4;
+/**
+* The ceiling `team_wait` accepts. A leader that genuinely needs longer asks
+* again with the members still running; holding one tool call for longer than
+* this only makes a stuck roster invisible for longer.
+*/
+const WAIT_MAX_MS = 6e5;
+/**
+* How long `team_wait` lets a just-accepted delivery settle before it reads the
+* roster. `team_send` is asynchronous by contract: its prompt is accepted into
+* the recipient's inbox — behind which a cold recipient may also be resumed and
+* published — while `whenIdle()` only answers "is the current activity
+* quiescent". Without one settle, a wait issued straight from the sending turn
+* would read an idle member whose driver has not started yet.
+*/
+const WAKE_SETTLE_MS = 25;
+/**
+* The address that means "everyone else on this team". It expands per the
+* sender's relation, because a managed member may only reach the leader and
+* its wildcard therefore resolves to that one address.
+*/
+const WILDCARD_ADDRESS = "*";
+/** `Context.team`: roster, mailbox routing, tasks, and team lifecycle. */
+var TeamService = class extends Service {
+	config;
+	static inject = [
+		"agents",
+		"sessions",
+		"subagents",
+		"sessionProjections"
+	];
+	/** Live team per leader session id; rebuilt lazily from that session's log. */
+	teams = /* @__PURE__ */ new Map();
+	/** Spawns in flight, keyed by leader session id (team tools never overlap). */
+	pending = /* @__PURE__ */ new Map();
+	constructor(ctx, config) {
+		super(ctx, "team");
+		this.config = config;
+		ctx.on("agent/disposed", (payload) => {
+			this.teams.delete(payload.agent.id);
+			this.pending.delete(payload.agent.id);
+		});
+	}
+	/**
+	* The live team of one leader, rebuilt from its log on first touch. Nothing
+	* is resumed here: a teammate materializes only when a message reaches it.
+	* @param leader - the leader session's live agent.
+	* @returns the mutable live team state.
+	*/
+	teamOf(leader) {
+		const existing = this.teams.get(leader.id);
+		if (existing !== void 0) return existing;
+		const view = this.durableView(leader);
+		const state = {
+			active: view.active,
+			members: new Map(view.members.map((member) => [member.memberId, memberFact(member)])),
+			tasks: new Map(view.tasks.map((task) => [task.taskId, task])),
+			inbox: /* @__PURE__ */ new Map(),
+			chains: /* @__PURE__ */ new Map(),
+			started: 0
+		};
+		this.teams.set(leader.id, state);
+		return state;
+	}
+	/**
+	* Commit one roster change to the LEADER's session log.
+	*
+	* `ctx.emit('team/changed')` is a same-process edge only — it tells observers
+	* to look again, and it dies with the process. The roster the panel renders is
+	* rebuilt from this log ({@link durableView}), so a lifecycle change that only
+	* emitted would be gone after a refresh, and a spawn made through the admin
+	* route has no tool result to carry it. This record is that durable half.
+	*
+	* The event is a plugin record, not a released type: it is committed
+	* `ignorable`, never enters the model-visible surface, and a reader that does
+	* not know the type skips it instead of refusing the log.
+	* @param leader - the leader whose session log carries the team.
+	* @param record - the WHOLE post-change roster fact.
+	*/
+	publish(leader, record) {
+		try {
+			appendPluginRecord(leader.session, TEAM_MEMBER_RECORD, record);
+		} catch (error) {
+			this.ctx.logger.warn("dsh-team: publishing %s to the session log failed: %s", record.op, String(error));
+			return;
+		}
+		this.ctx.sessions.flush(leader.session);
+	}
+	/**
+	* Adopt one continuable child into the team world while its scope is being
+	* composed. Called from the teammate setup contribution after the child is
+	* published — on cold resume the child is already on the leader's roster,
+	* and only a child the roster has never seen can be the spawn currently in
+	* flight.
+	* @param child - the unpublished child agent.
+	* @returns the membership facts, or undefined for a child outside any team.
+	*/
+	adopt(child) {
+		const leaderId = child.session.header.parentSession;
+		if (leaderId === void 0) return void 0;
+		const leader = this.ctx.agents.get(leaderId);
+		if (leader === void 0) return void 0;
+		const team = this.teamOf(leader);
+		const known = team.members.get(child.id);
+		if (known !== void 0) return known;
+		const pending = this.pending.get(leaderId);
+		if (pending === void 0) return void 0;
+		const fact = {
+			...pending.fact,
+			memberId: child.id
+		};
+		pending.claimed.push(child.id);
+		team.members.set(child.id, fact);
+		return fact;
+	}
+	/**
+	* Spawn one teammate: a continuable subagent of the leader plus a roster row.
+	* @param leader - the acting leader agent.
+	* @param request - name, relation, initial task, and optional overrides.
+	* @param signal - cancellation owning the operation until the teammate accepts its brief.
+	* @returns the new member's durable facts.
+	* @throws {TeamError} when the actor cannot lead, or the roster is full.
+	*/
+	async spawn(leader, request, signal) {
+		if (leader.session.header.origin === "subagent") throw new TeamError("NESTED_TEAM");
+		const team = this.teamOf(leader);
+		if (team.members.size >= this.config.maxTeammates) throw new TeamError("MAX_TEAMMATES", String(this.config.maxTeammates));
+		if (findByName(team, request.name) !== void 0) throw new TeamError("DUPLICATE_NAME", request.name);
+		const route = this.resolveRoute(leader, request);
+		await this.assertProviderRegistered(leader, route.provider);
+		await this.assertEffortOffered(leader, request, route);
+		const agentOptions = {
+			...route.provider !== void 0 ? { provider: route.provider } : {},
+			...route.model !== void 0 ? { model: route.model } : {},
+			...request.reasoningEffort !== void 0 ? { reasoningEffort: ReasoningEffortId(request.reasoningEffort) } : {}
+		};
+		const pending = {
+			fact: {
+				name: request.name,
+				relation: request.relation,
+				...request.role !== void 0 ? { role: request.role } : {},
+				...route.provider !== void 0 ? { provider: route.provider } : {},
+				...route.model !== void 0 ? { model: route.model } : {},
+				...request.reasoningEffort !== void 0 ? { effort: request.reasoningEffort } : {},
+				...request.skills !== void 0 && request.skills.length > 0 ? { skills: [...request.skills] } : {}
+			},
+			claimed: []
+		};
+		this.pending.set(leader.id, pending);
+		let childId;
+		try {
+			childId = (await this.ctx.subagents.startActivation({
+				provider: this.config.provider,
+				label: request.role === void 0 ? request.name : `${request.name} (${request.role})`,
+				request: {
+					parent: leader,
+					prompt: [{
+						type: "text",
+						text: brief(request)
+					}],
+					...request.persona !== void 0 ? { persona: request.persona } : {},
+					...Object.keys(agentOptions).length > 0 ? { agentOptions } : {}
+				},
+				signal,
+				delivery: "parent"
+			})).childId;
+		} catch (error) {
+			for (const claimed of pending.claimed) team.members.delete(claimed);
+			throw error;
+		} finally {
+			this.pending.delete(leader.id);
+		}
+		const fact = {
+			...pending.fact,
+			memberId: childId
+		};
+		team.members.set(childId, fact);
+		team.active = true;
+		this.publish(leader, {
+			version: 1,
+			op: "upsert",
+			member: fact
+		});
+		this.ctx.emit("team/changed", { leaderId: leader.id });
+		return fact;
+	}
+	async send(from, to, text, signal) {
+		const actor = this.resolveActor(from);
+		const recipients = this.resolveRecipients(actor, to);
+		for (const recipient of recipients) this.assertDeliverable(actor, from, recipient);
+		const chain = this.chainFor(actor, from);
+		for (const recipient of recipients) if (recipient.kind === "member") this.assertBudget(actor.team, chain, from.id, recipient, text);
+		const deliveries = [];
+		for (const recipient of recipients) {
+			const messageId = await this.deliver(actor, recipient, [{
+				type: "text",
+				text
+			}], signal, chain);
+			this.recordDelivery(actor.team, chain, from.id, recipient, text);
+			deliveries.push({
+				messageId,
+				recipient,
+				chain
+			});
+		}
+		if (typeof to === "string" && to.trim() !== WILDCARD_ADDRESS) return deliveries[0];
+		return { deliveries };
+	}
+	/**
+	* Create or update one shared task. Writes are the leader's: a teammate's
+	* own tool calls land in its own log, which the leader's durable team state
+	* never reads — teammates report, and the leader records the outcome.
+	* @param leader - the acting leader agent.
+	* @param spec - a new task (title) or an update to an existing one (taskId).
+	* @returns the whole post-change task.
+	* @throws {TeamError} when the actor is not the leader, the task is unknown,
+	*   or the assignee is not on the roster.
+	*/
+	upsertTask(leader, spec) {
+		const actor = this.resolveActor(leader);
+		if (actor.member !== void 0) throw new TeamError("UNAUTHORIZED", "only the leader writes the task list");
+		const assigneeId = spec.assigneeId === void 0 ? void 0 : this.resolveRecipient(actor, spec.assigneeId).id;
+		if (spec.taskId === void 0) {
+			if (spec.title === void 0) throw new TeamError("TASK_TITLE_REQUIRED");
+			const task = {
+				taskId: taskIdOf(actor.team),
+				title: spec.title,
+				status: spec.status ?? "pending",
+				...assigneeId !== void 0 ? { assigneeId } : {},
+				...spec.note !== void 0 ? { note: spec.note } : {}
+			};
+			actor.team.tasks.set(task.taskId, task);
+			this.ctx.emit("team/changed", { leaderId: actor.leader.id });
+			return task;
+		}
+		const previous = actor.team.tasks.get(spec.taskId);
+		if (previous === void 0) throw new TeamError("UNKNOWN_TASK", spec.taskId);
+		const task = {
+			...previous,
+			...spec.title !== void 0 ? { title: spec.title } : {},
+			...spec.status !== void 0 ? { status: spec.status } : {},
+			...assigneeId !== void 0 ? { assigneeId } : {},
+			...spec.note !== void 0 ? { note: spec.note } : {}
+		};
+		actor.team.tasks.set(task.taskId, task);
+		this.ctx.emit("team/changed", { leaderId: actor.leader.id });
+		return task;
+	}
+	/**
+	* Change one teammate's relationship level.
+	* @param leader - the acting leader agent.
+	* @param target - the teammate's member id or name.
+	* @param relation - the new relation.
+	* @returns the whole post-change member record.
+	* @throws {TeamError} when the actor is not the leader or the member is unknown.
+	*/
+	setRelation(leader, target, relation) {
+		const actor = this.resolveActor(leader);
+		if (actor.member !== void 0) throw new TeamError("UNAUTHORIZED", "only the leader changes relations");
+		const recipient = this.resolveRecipient(actor, target);
+		if (recipient.kind !== "member") throw new TeamError("UNKNOWN_MEMBER", target);
+		const fact = {
+			...recipient.member,
+			relation
+		};
+		actor.team.members.set(fact.memberId, fact);
+		this.publish(actor.leader, {
+			version: 1,
+			op: "upsert",
+			member: fact
+		});
+		this.ctx.emit("team/changed", { leaderId: actor.leader.id });
+		return fact;
+	}
+	/**
+	* Dismiss one teammate, or end the whole team when no target is given. A
+	* dismissed teammate stops its current turn and stops receiving mail; its
+	* durable session stays readable through the subagent catalog.
+	* @param leader - the acting leader agent.
+	* @param target - the teammate's member id or name; absent ends the team.
+	* @returns whether the team ended, plus the dismissed member id when targeted.
+	* @throws {TeamError} when the actor is not the leader or the member is unknown.
+	*/
+	dismiss(leader, target) {
+		const actor = this.resolveActor(leader);
+		if (actor.member !== void 0) throw new TeamError("UNAUTHORIZED", "only the leader dismisses teammates");
+		if (target === void 0) {
+			for (const memberId of [...actor.team.members.keys()]) this.stopMember(actor.leader, memberId);
+			actor.team.members.clear();
+			actor.team.tasks.clear();
+			actor.team.inbox.clear();
+			actor.team.chains.clear();
+			actor.team.active = false;
+			this.publish(actor.leader, {
+				version: 1,
+				op: "ended"
+			});
+			this.ctx.emit("team/changed", {
+				leaderId: actor.leader.id,
+				ended: true
+			});
+			return { ended: true };
+		}
+		const recipient = this.resolveRecipient(actor, target);
+		if (recipient.kind !== "member") throw new TeamError("UNKNOWN_MEMBER", target);
+		this.stopMember(actor.leader, recipient.id);
+		actor.team.members.delete(recipient.id);
+		actor.team.inbox.delete(recipient.id);
+		this.publish(actor.leader, {
+			version: 1,
+			op: "remove",
+			memberId: recipient.id
+		});
+		this.ctx.emit("team/changed", {
+			leaderId: actor.leader.id,
+			removedMember: recipient.id
+		});
+		return {
+			ended: false,
+			memberId: recipient.id
+		};
+	}
+	/**
+	* The roster, task list, and recent leader-visible mailbox traffic, from the
+	* point of view of any member of the team.
+	* @param actorAgent - the acting leader or teammate.
+	* @returns the live team read; an inactive team reports empty lists.
+	*/
+	list(actorAgent) {
+		const actor = this.tryResolveActor(actorAgent);
+		if (actor === void 0) return {
+			active: false,
+			members: [],
+			tasks: [],
+			messages: []
+		};
+		const view = this.durableView(actor.leader);
+		return {
+			active: actor.team.active,
+			members: [...actor.team.members.values()].map((member) => ({
+				...member,
+				joinedAt: view.members.find((row) => row.memberId === member.memberId)?.joinedAt ?? 0,
+				status: this.statusOf(member.memberId)
+			})),
+			tasks: [...actor.team.tasks.values()],
+			messages: [...view.messages]
+		};
+	}
+	/**
+	* Block until the named teammates stop running, or until the budget expires.
+	*
+	* Observation only: nothing here spawns, wakes, cancels, or messages a member.
+	* A member the registry no longer holds counts as done, because a reaped agent
+	* occupies no turn and reporting it busy would leave the leader waiting on a
+	* ghost. Readiness is `Agent.whenIdle()` — the harness's own quiescence signal
+	* — rather than a poll of `Agent.status`: a status sample can miss a turn that
+	* begins between two samples, while `whenIdle()` follows the activity it was
+	* observed against.
+	*
+	* The boundary this answer carries: it reports **quiescence**, not receipt. A
+	* member that is idle right now may still be holding a prompt `team_send`
+	* accepted a moment ago, and `whenIdle()` cannot see that — so one settle
+	* window runs before the first read, and a delivery that lands later than that
+	* window is indistinguishable from a member that was already idle.
+	* @param actorAgent - the acting leader or teammate.
+	* @param request - who to wait for, for how long, and the caller's signal.
+	* @returns who is done, who is still running, and whether time ran out.
+	* @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place
+	*   (the leader itself included — it is the one waiting), `ABORTED` when the
+	*   caller's signal fires, `NO_TEAM`/`LEADER_AWAY` when there is no team.
+	*/
+	async wait(actorAgent, request = {}) {
+		const actor = this.resolveActor(actorAgent);
+		const targets = this.waitTargets(actor, request.members);
+		const cancelled = () => request.signal?.aborted === true;
+		if (cancelled()) throw new TeamError("ABORTED", "team_wait was cancelled before it started");
+		if (targets.length === 0) return {
+			done: [],
+			busy: [],
+			timedOut: false
+		};
+		await this.settle();
+		if (cancelled()) throw new TeamError("ABORTED", "team_wait was cancelled before it observed anyone");
+		const settled = /* @__PURE__ */ new Set();
+		const observing = targets.map((target) => this.observeIdle(target.memberId, settled));
+		const outcome = await this.raceWait(observing, clampWait(request.timeoutMs), request.signal);
+		const done = [];
+		const busy = [];
+		for (const target of targets) {
+			const agent = this.ctx.agents.get(SessionId(target.memberId));
+			if (settled.has(target.memberId) || agent === void 0 || agent.status !== "running") done.push(target.name);
+			else busy.push(target.name);
+		}
+		return {
+			done,
+			busy,
+			timedOut: outcome === "timeout"
+		};
+	}
+	/**
+	* The one settle `wait` gives a delivery `team_send` accepted just before it.
+	*
+	* One fixed delay, never a poll: `team_send` is asynchronous by contract — the
+	* prompt is accepted into the recipient's inbox, which may also resume and
+	* publish a cold recipient — while `whenIdle()` only answers "is the current
+	* activity quiescent". Reading the roster in the same tick as the send would
+	* therefore see an idle member whose driver has not started yet. The settle
+	* runs before the budget starts, so it never shortens the wait the caller
+	* asked for.
+	* @returns a promise that resolves after one settle window.
+	*/
+	settle() {
+		return new Promise((resolve) => {
+			setTimeout(resolve, WAKE_SETTLE_MS);
+		});
+	}
+	/**
+	* Resolve the wait's addresses against this team's roster, in the order given
+	* and without duplicates: one member is one target however it was spelled.
+	* @param actor - whose roster answers.
+	* @param requested - names or ids, or undefined for every member.
+	* @returns the targets to observe.
+	* @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place,
+	*   including `leader`: the leader is the one waiting.
+	*/
+	waitTargets(actor, requested) {
+		const addresses = requested ?? [...actor.team.members.values()].map((member) => member.memberId);
+		const targets = [];
+		const seen = /* @__PURE__ */ new Set();
+		for (const address of addresses) {
+			const recipient = this.resolveRecipient(actor, address);
+			if (recipient.kind !== "member") throw new TeamError("UNKNOWN_MEMBER", `${recipient.name} is the leader, which is the one waiting`);
+			if (seen.has(recipient.id)) continue;
+			seen.add(recipient.id);
+			targets.push({
+				memberId: recipient.id,
+				name: recipient.name
+			});
+		}
+		return targets;
+	}
+	/**
+	* Watch one member's idle signal, recording it in `settled`.
+	*
+	* A member whose agent is already gone records as settled without asking the
+	* harness anything, and a rejected — or synchronously throwing — idle signal
+	* records as settled too: an unobservable member must not hang the leader's
+	* turn, and the next wait observes it afresh.
+	* @param memberId - the roster member to watch.
+	* @param settled - the shared set of members already accounted for.
+	* @returns the observation promise, which never rejects.
+	*/
+	observeIdle(memberId, settled) {
+		const release = () => {
+			settled.add(memberId);
+		};
+		const agent = this.ctx.agents.get(SessionId(memberId));
+		if (agent === void 0) {
+			release();
+			return Promise.resolve();
+		}
+		try {
+			return agent.whenIdle().then(release, release);
+		} catch {
+			release();
+			return Promise.resolve();
+		}
+	}
+	/**
+	* Race every idle signal against one deadline and the caller's signal.
+	*
+	* One aggregate race, not one timer per member: who is still running at the
+	* deadline is re-read from the registry afterwards, so per-member timers would
+	* only duplicate that read. The timer is always cleared and the abort listener
+	* always removed, so a wait that ends early leaves nothing armed on the
+	* caller's signal.
+	*
+	* A `whenIdle()` promise abandoned at the deadline or on abort cannot be
+	* cancelled — the seam takes no signal — and is a harmless remnant: its `then`
+	* only records a name in a set nobody reads again. Never await it a second
+	* time; a fresh wait starts a fresh observation instead.
+	* @param observing - one observation promise per member being watched.
+	* @param budget - the deadline in milliseconds, already clamped.
+	* @param signal - the caller's cancellation, when it supplied one.
+	* @returns `done` when every member settled, `timeout` when the deadline fired.
+	* @throws {TeamError} `ABORTED` when the caller's signal fires first.
+	*/
+	async raceWait(observing, budget, signal) {
+		if (observing.length === 0) return "done";
+		let timer;
+		let onAbort;
+		const deadline = new Promise((resolve) => {
+			timer = setTimeout(() => {
+				resolve("timeout");
+			}, budget);
+		});
+		const cancelled = new Promise((_resolve, reject) => {
+			if (signal === void 0) return;
+			if (signal.aborted) {
+				reject(new TeamError("ABORTED", "team_wait was cancelled before it started waiting"));
+				return;
+			}
+			onAbort = () => {
+				reject(new TeamError("ABORTED", "team_wait was cancelled while it was waiting"));
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
+		try {
+			return await Promise.race([
+				Promise.all(observing).then(() => "done"),
+				deadline,
+				cancelled
+			]);
+		} finally {
+			if (timer !== void 0) clearTimeout(timer);
+			if (signal !== void 0 && onAbort !== void 0) signal.removeEventListener("abort", onAbort);
+		}
+	}
+	/**
+	* Where one acting agent sits in its team: whose workspace it reaches, and
+	* how a note it writes is attributed. The leader's own seat carries its
+	* session id, so its private pad is addressed exactly like a teammate's.
+	* @param agent - the acting leader or teammate.
+	* @returns the team's leader id, the actor's own id, and its display name.
+	* @throws {TeamError} when the actor is not in a team.
+	*/
+	seatOf(agent) {
+		const actor = this.resolveActor(agent);
+		return {
+			leaderId: actor.leader.id,
+			memberId: actor.member?.memberId ?? actor.leader.id,
+			name: actor.member?.name ?? "leader"
+		};
+	}
+	/**
+	* The teammate roster as one teammate should see it, for its prompt section.
+	* @param member - the teammate agent.
+	* @returns the leader-relative roster, or undefined outside a team.
+	*/
+	rosterFor(member) {
+		const actor = this.tryResolveActor(member);
+		if (actor?.member === void 0) return void 0;
+		return {
+			self: actor.member,
+			others: [...actor.team.members.values()].filter((row) => row.memberId !== member.id)
+		};
+	}
+	/** The durable view the leader's log folds to (the projection registry's cached cut). */
+	durableView(leader) {
+		const registry = this.ctx.get("sessionProjections");
+		if (registry === void 0) return foldTeam(leader.session.snapshotEvents(), this.config.maxRecentMessages);
+		return registry.snapshot(leader.session).values.team ?? EMPTY_TEAM_VIEW;
+	}
+	/** Live runtime state of one teammate; `ready` means no live agent remains. */
+	statusOf(memberId) {
+		const agent = this.ctx.agents.get(SessionId(memberId));
+		if (agent === void 0) return "ready";
+		return agent.status === "running" ? "running" : "idle";
+	}
+	/**
+	* Resolve the acting agent's team, or fail loud — and say WHICH failure it
+	* is. A teammate whose leader session is simply not loaded is not a teammate
+	* without a team: every delivery runs on the leader's parent authority, so
+	* the mailbox is shut until the leader is back, while the workspace (which
+	* needs nobody) stays open. Telling it "no team here yet" would send it to
+	* spawn one, which it cannot do.
+	*/
+	resolveActor(agent) {
+		const actor = this.tryResolveActor(agent);
+		if (actor !== void 0) return actor;
+		const leaderId = agent.session.header.parentSession;
+		if (agent.session.header.origin === "subagent" && leaderId !== void 0 && this.ctx.agents.get(leaderId) === void 0) throw new TeamError("LEADER_AWAY");
+		throw new TeamError("NO_TEAM");
+	}
+	/** Resolve the acting agent's team, or report absence. */
+	tryResolveActor(agent) {
+		if (agent.session.header.origin !== "subagent") return {
+			leader: agent,
+			team: this.teamOf(agent)
+		};
+		const leaderId = agent.session.header.parentSession;
+		if (leaderId === void 0) return void 0;
+		const leader = this.ctx.agents.get(leaderId);
+		if (leader === void 0) return void 0;
+		const team = this.teamOf(leader);
+		const member = team.members.get(agent.id);
+		return member === void 0 ? void 0 : {
+			leader,
+			team,
+			member
+		};
+	}
+	/** Resolve one address (member id, member name, or `leader`) to a recipient. */
+	resolveRecipient(actor, address) {
+		const normalized = address.trim();
+		if (normalized.length === 0) throw new TeamError("UNKNOWN_MEMBER", address);
+		if (normalized === actor.leader.id || normalized.toLowerCase() === "leader") return {
+			kind: "leader",
+			id: actor.leader.id,
+			name: "leader"
+		};
+		const byId = actor.team.members.get(normalized);
+		if (byId !== void 0) return {
+			kind: "member",
+			id: byId.memberId,
+			name: byId.name,
+			member: byId
+		};
+		const byName = findByName(actor.team, normalized);
+		if (byName !== void 0) return {
+			kind: "member",
+			id: byName.memberId,
+			name: byName.name,
+			member: byName
+		};
+		throw new TeamError("UNKNOWN_MEMBER", address);
+	}
+	/**
+	* Resolve one address, a list of them, or the wildcard to the distinct
+	* recipients one send must reach, in the order given.
+	*
+	* The wildcard means "everyone else on this team", which the sender's
+	* relation decides: every member for the leader, the leader plus the other
+	* members for a peer, and only the leader for a managed member — the one
+	* address that relation may reach. The sender is never a recipient of its own
+	* wildcard, while an address the sender spelled out for itself is refused
+	* later by {@link assertDeliverable} rather than silently dropped: a member
+	* that named itself made a mistake worth reporting.
+	* @param actor - who is sending, which fixes both the wildcard and self.
+	* @param address - one address, the wildcard, or a list mixing the two.
+	* @returns the distinct recipients, never empty and never the sender.
+	* @throws {TeamError} when an address is unknown (the refusal names that one
+	*   address), or when nothing is left to address.
+	*/
+	resolveRecipients(actor, address) {
+		const addresses = typeof address === "string" ? [address] : address;
+		const resolved = [];
+		const seen = /* @__PURE__ */ new Set();
+		for (const entry of addresses) {
+			const candidates = entry.trim() === WILDCARD_ADDRESS ? this.everyoneElse(actor) : [this.resolveRecipient(actor, entry)];
+			for (const candidate of candidates) {
+				if (seen.has(candidate.id)) continue;
+				seen.add(candidate.id);
+				resolved.push(candidate);
+			}
+		}
+		if (resolved.length === 0) throw new TeamError("UNKNOWN_MEMBER", typeof address === "string" ? "there is nobody else on this team to address" : "the list of recipients is empty");
+		return resolved;
+	}
+	/**
+	* Everyone the wildcard reaches from this sender: the whole roster for the
+	* leader, the leader and the other members for a peer, and the leader alone
+	* for a managed member.
+	* @param actor - who is sending, and therefore who is left out.
+	* @returns the expansion, empty only for a leader with no teammates.
+	*/
+	everyoneElse(actor) {
+		const leader = {
+			kind: "leader",
+			id: actor.leader.id,
+			name: "leader"
+		};
+		const others = [];
+		for (const member of actor.team.members.values()) {
+			if (member.memberId === actor.member?.memberId) continue;
+			others.push({
+				kind: "member",
+				id: member.memberId,
+				name: member.name,
+				member
+			});
+		}
+		if (actor.member === void 0) return others;
+		if (actor.member.relation === "managed") return [leader];
+		return [leader, ...others];
+	}
+	/**
+	* Refuse one delivery the actor's relation or its own identity forbids. The
+	* relation check runs first so a managed member writing to itself is told
+	* what it may not do as a managed member, exactly as before.
+	*/
+	assertDeliverable(actor, from, recipient) {
+		if (actor.member !== void 0 && actor.member.relation === "managed" && recipient.kind !== "leader") throw new TeamError("UNAUTHORIZED", `${actor.member.name} is a managed teammate and may only message the leader`);
+		if (recipient.id === from.id) throw new TeamError("SELF_MESSAGE");
+	}
+	/**
+	* The chain one send belongs to. A teammate continues the conversation it is
+	* working from — that is what turns a peer exchange into one bounded
+	* conversation instead of an unbounded sequence of unrelated messages. The
+	* leader always opens a fresh chain: its own turns are the user-visible,
+	* interruptible convergence point, so a conversation that reached the leader
+	* has already converged and the next instruction starts over.
+	*/
+	chainFor(actor, from) {
+		const inherited = actor.member === void 0 ? void 0 : actor.team.inbox.get(from.id);
+		if (inherited !== void 0) return {
+			chainId: inherited.chainId,
+			hop: inherited.hop + 1
+		};
+		actor.team.started += 1;
+		return {
+			chainId: `c${actor.team.started}`,
+			hop: 0
+		};
+	}
+	/**
+	* Refuse a peer delivery this conversation can no longer afford: too many
+	* relays deep, one ordered pair talked out, or a verbatim repeat. Nothing
+	* here applies to a message addressed to the leader.
+	*/
+	assertBudget(team, chain, fromId, recipient, text) {
+		if (chain.hop > this.config.maxChainHops) throw new TeamError("CHAIN_EXHAUSTED", `relay ${chain.hop} of at most ${this.config.maxChainHops}`);
+		const record = team.chains.get(chain.chainId);
+		if (record === void 0) return;
+		const edge = edgeKey(fromId, recipient.id);
+		if ((record.edges.get(edge) ?? 0) >= this.config.maxChainRoundTrips) throw new TeamError("PING_PONG", `${this.config.maxChainRoundTrips} message(s) already went to ${recipient.name} in this conversation`);
+		if (record.said.get(edge) === text) throw new TeamError("REPEATED_MESSAGE", recipient.name);
+	}
+	/** Charge one accepted peer delivery to its chain, and hand the chain on. */
+	recordDelivery(team, chain, fromId, recipient, text) {
+		if (recipient.kind !== "member") return;
+		team.inbox.set(recipient.id, chain);
+		let record = team.chains.get(chain.chainId);
+		if (record === void 0) {
+			record = {
+				edges: /* @__PURE__ */ new Map(),
+				said: /* @__PURE__ */ new Map()
+			};
+			team.chains.set(chain.chainId, record);
+			for (const stale of team.chains.keys()) {
+				if (team.chains.size <= CHAIN_MEMORY) break;
+				team.chains.delete(stale);
+			}
+		}
+		const edge = edgeKey(fromId, recipient.id);
+		record.edges.set(edge, (record.edges.get(edge) ?? 0) + 1);
+		record.said.set(edge, text);
+	}
+	/** Deliver one message, choosing the transport the recipient's runtime requires. */
+	async deliver(actor, recipient, content, signal, chain) {
+		const source = {
+			kind: "team-message",
+			form: "relay",
+			senderSessionId: actor.member?.memberId ?? actor.leader.id,
+			senderName: actor.member?.name ?? "leader",
+			chainId: chain.chainId,
+			hop: chain.hop
+		};
+		if (recipient.kind === "leader") {
+			const message = createUserMessage({
+				content,
+				source
+			});
+			actor.leader.send(message, "next-turn", true);
+			return message.id;
+		}
+		return await queueHostSubagentPrompt(this.ctx.subagents, actor.leader, SessionId(recipient.id), content, source, signal);
+	}
+	/**
+	* The route this spawn runs on. A request that names its own provider or
+	* model wins exactly as given; one that names neither falls back to the
+	* deployment's teammate route, so a single `teammateProvider` pair turns
+	* every teammate local without overriding a leader that asked for a
+	* specific route. Model ids are provider-scoped, so a route change without
+	* a model is refused instead of sending the leader's model id to a provider
+	* that never advertised it.
+	*/
+	resolveRoute(leader, request) {
+		const explicit = request.provider !== void 0 || request.model !== void 0;
+		const provider = explicit ? request.provider : this.config.teammateProvider === "" ? void 0 : this.config.teammateProvider;
+		const model = explicit ? request.model : this.config.teammateModel === "" ? void 0 : this.config.teammateModel;
+		if (provider !== void 0 && provider !== leader.options.provider && model === void 0) throw new TeamError("MODEL_REQUIRED", provider);
+		return {
+			...provider !== void 0 ? { provider } : {},
+			...model !== void 0 ? { model } : {}
+		};
+	}
+	/**
+	* Reject a spawn aimed at a provider this deployment never registered, at
+	* spawn rather than on the teammate's first request: the failure would
+	* otherwise arrive as an adapter error inside the teammate's own turn,
+	* where the leader cannot see it or correct the route.
+	*/
+	assertProviderRegistered(leader, provider) {
+		if (provider === void 0 || provider === leader.options.provider) return;
+		const llm = this.ctx.get("llm");
+		if (llm === void 0) return;
+		const registered = llm.listProviders();
+		if (registered.length === 0 || registered.some((entry) => entry.id === provider)) return;
+		throw new TeamError("UNKNOWN_PROVIDER", `${provider}; registered: ${registered.map((entry) => entry.id).join(", ")}`);
+	}
+	/**
+	* Reject a reasoning effort the selected model does not offer, at spawn
+	* rather than on the teammate's every later request. Validation needs an
+	* exact provider/model route: without one the adapter stays the authority.
+	*/
+	async assertEffortOffered(leader, request, route) {
+		if (request.reasoningEffort === void 0) return;
+		const llm = this.ctx.get("llm");
+		const provider = route.provider ?? leader.options.provider;
+		const model = route.model ?? leader.options.model;
+		if (llm === void 0 || provider === void 0 || model === void 0) return;
+		let info;
+		try {
+			info = await llm.resolveModelInfo(provider, model);
+		} catch {
+			return;
+		}
+		const offered = info.reasoning?.efforts ?? [];
+		if (offered.some((effort) => effort.id === request.reasoningEffort)) return;
+		throw new TeamError("UNKNOWN_EFFORT", offered.length === 0 ? `${model} exposes no reasoning efforts` : `${model} offers ${offered.map((effort) => effort.id).join(", ")}`);
+	}
+	/**
+	* Stop one teammate's current work. Residency belongs to the continuation
+	* manager, so dismissal interrupts rather than disposes: an interrupted
+	* teammate settles on its own and its session stays readable.
+	*/
+	stopMember(leader, memberId) {
+		try {
+			this.ctx.subagents.interrupt(SessionId(memberId), {
+				kind: "ancestor",
+				agent: leader
+			});
+		} catch (error) {
+			this.ctx.logger.warn("dsh-team: interrupt of teammate %s failed: %s", memberId, String(error));
+		}
+	}
+	/** Service teardown: live teams are rebuilt from their logs on next touch. */
+	stop() {
+		this.teams.clear();
+		this.pending.clear();
+	}
+};
+/** Strip the live-view fields a roster fact does not carry. */
+function memberFact(member) {
+	return {
+		memberId: member.memberId,
+		name: member.name,
+		relation: member.relation,
+		...member.role !== void 0 ? { role: member.role } : {},
+		...member.provider !== void 0 ? { provider: member.provider } : {},
+		...member.model !== void 0 ? { model: member.model } : {},
+		...member.effort !== void 0 ? { effort: member.effort } : {},
+		...member.skills !== void 0 ? { skills: [...member.skills] } : {}
+	};
+}
+/** One ordered pair, as the chain ledger keys it. */
+function edgeKey(fromId, toId) {
+	return `${fromId} ${toId}`;
+}
+/** Case-insensitive roster lookup by display name. */
+function findByName(team, name) {
+	const wanted = name.trim().toLowerCase();
+	for (const member of team.members.values()) if (member.name.toLowerCase() === wanted) return member;
+}
+/**
+* Clamp one requested wait budget into the window `team_wait` honours: an
+* absent or non-finite value takes the default, and everything else is bounded
+* so that neither a zero (a snapshot wearing a wait's name) nor an hour-long
+* block can surprise the caller.
+* @param requested - the caller's milliseconds, when it gave any.
+* @returns the budget to arm.
+*/
+function clampWait(requested) {
+	if (requested === void 0 || !Number.isFinite(requested)) return WAIT_DEFAULT_MS;
+	return Math.min(Math.max(Math.trunc(requested), 1), WAIT_MAX_MS);
+}
+/** Short stable task id, unique within one team's live list. */
+function taskIdOf(team) {
+	let next = team.tasks.size + 1;
+	while (team.tasks.has(`t${next}`)) next += 1;
+	return `t${next}`;
+}
+/** The teammate's first turn: who it is, and what the leader asked for. */
+function brief(request) {
+	return [
+		request.role === void 0 ? `You are ${request.name}, a teammate in this agent team.` : `You are ${request.name} (${request.role}), a teammate in this agent team.`,
+		"",
+		"The leader assigned you this task:",
+		request.task
+	].join("\n");
+}
+//#endregion
 //#region src/workspace.ts
 /** Keys a member may name: readable, bounded, and free of the record separator. */
 const KEY_PATTERN = /^[\w .\-一-鿿]{1,64}$/u;
@@ -1979,6 +2893,80 @@ function listTool(ctx, audience = "leader") {
 					...message.hop !== void 0 ? { hop: message.hop } : {}
 				}))
 			});
+		}
+	});
+}
+/**
+* `team_wait` — block until the named teammates stop working.
+*
+* The missing half of asynchronous delivery: `team_send` only accepts a message
+* and `team_list` only samples a state, so neither can answer "have the three
+* reviews come back yet". This is observation only — it never spawns, wakes or
+* cancels a member — which is why it belongs to the leader alone: a teammate
+* waiting on its peers would deadlock two turns against each other.
+* @param ctx - context carrying the team service.
+* @returns the tool definition.
+*/
+function waitTool(ctx) {
+	return defineTool({
+		name: "team_wait",
+		description: `Block until teammates finish their current turn, then report who is done, who is still running, and whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered — a member that is idle right now counts as done even if it has not started yet, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all idle, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true and the still-running members in busy. A member that is idle, or no longer resident, counts as done. It only observes: it never spawns, wakes, messages or cancels anyone.`,
+		parameters: {
+			members: {
+				type: "array",
+				items: { type: "string" },
+				description: "Teammate names or member ids; omit to wait for every member of the team."
+			},
+			timeout_ms: {
+				type: "integer",
+				description: `How long to block before reporting the rest as busy (default ${WAIT_DEFAULT_MS}, at most ${WAIT_MAX_MS}); an expired wait is a report, not a failure, so you may ask again.`
+			}
+		},
+		output: {
+			schema: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					done: {
+						type: "array",
+						required: true,
+						items: { type: "string" },
+						description: "Members that had stopped running when the wait ended."
+					},
+					busy: {
+						type: "array",
+						required: true,
+						items: { type: "string" },
+						description: "Members still running when the timeout expired; empty otherwise."
+					},
+					timedOut: {
+						type: "boolean",
+						required: true
+					}
+				}
+			},
+			render: (_args, value) => [{
+				type: "text",
+				text: value.timedOut ? `timed out — still running: ${value.busy.join(", ")}` + (value.done.length === 0 ? "" : `; settled: ${value.done.join(", ")}`) : value.done.length === 0 ? "nothing to wait for" : `all settled: ${value.done.join(", ")}`
+			}]
+		},
+		presentCall: (args) => ({
+			card: "generic",
+			kind: "read",
+			title: args.members === void 0 ? "Wait for the team" : `Wait for ${args.members.join(", ")}`
+		}),
+		presentResult: (args, result) => result.isError ? done("Wait for teammates", `failed: ${failureText(result)}`) : done(args.members === void 0 ? "Waited for the team" : `Waited for ${args.members.join(", ")}`),
+		async execute(args, exec) {
+			const observed = await ctx.team.wait(actor(exec.agent), {
+				...args.members !== void 0 ? { members: args.members } : {},
+				...args.timeout_ms !== void 0 ? { timeoutMs: args.timeout_ms } : {},
+				signal: exec.signal
+			});
+			return {
+				done: [...observed.done],
+				busy: [...observed.busy],
+				timedOut: observed.timedOut
+			};
 		}
 	});
 }
@@ -2850,716 +3838,6 @@ const SPAWN_TEXT_FIELDS = [
 	"reasoningEffort"
 ];
 //#endregion
-//#region src/service.ts
-/**
-* The agent-team service: roster, mailbox routing with its relation-based
-* authorization, the shared task list, and the team lifecycle.
-*
-* Teammates are NOT a private runtime. Each one is a continuable subagent of
-* the leader (`ctx.subagents.startActivation`), so the harness owns identity,
-* residency, cold resume after a restart, interrupt, and the `origin:
-* 'subagent'` session header that keeps a teammate out of the session tree and
-* out of generic Host routing. What this service adds is what the subagent
-* seam deliberately leaves out: named members, member-to-member delivery, and
-* one shared task list.
-*
-* Delivery authority is always the leader's. `ctx.subagents` authorizes a
-* follow-up against the durable direct-parent lineage only ("teams remain
-* rejected until an explicit authority protocol has a production consumer"),
-* and the leader IS every teammate's durable direct parent. A peer-to-peer
-* message is therefore a leader-authorized delivery whose durable source names
-* the real sender; `relation` decides who may ASK for it, never who may
-* perform it.
-*
-* @module dsh-team/service
-*/
-/** How many recent conversation chains one team keeps enforcement state for. */
-const CHAIN_MEMORY = 64;
-/**
-* The address that means "everyone else on this team". It expands per the
-* sender's relation, because a managed member may only reach the leader and
-* its wildcard therefore resolves to that one address.
-*/
-const WILDCARD_ADDRESS = "*";
-/** `Context.team`: roster, mailbox routing, tasks, and team lifecycle. */
-var TeamService = class extends Service {
-	config;
-	static inject = [
-		"agents",
-		"sessions",
-		"subagents",
-		"sessionProjections"
-	];
-	/** Live team per leader session id; rebuilt lazily from that session's log. */
-	teams = /* @__PURE__ */ new Map();
-	/** Spawns in flight, keyed by leader session id (team tools never overlap). */
-	pending = /* @__PURE__ */ new Map();
-	constructor(ctx, config) {
-		super(ctx, "team");
-		this.config = config;
-		ctx.on("agent/disposed", (payload) => {
-			this.teams.delete(payload.agent.id);
-			this.pending.delete(payload.agent.id);
-		});
-	}
-	/**
-	* The live team of one leader, rebuilt from its log on first touch. Nothing
-	* is resumed here: a teammate materializes only when a message reaches it.
-	* @param leader - the leader session's live agent.
-	* @returns the mutable live team state.
-	*/
-	teamOf(leader) {
-		const existing = this.teams.get(leader.id);
-		if (existing !== void 0) return existing;
-		const view = this.durableView(leader);
-		const state = {
-			active: view.active,
-			members: new Map(view.members.map((member) => [member.memberId, memberFact(member)])),
-			tasks: new Map(view.tasks.map((task) => [task.taskId, task])),
-			inbox: /* @__PURE__ */ new Map(),
-			chains: /* @__PURE__ */ new Map(),
-			started: 0
-		};
-		this.teams.set(leader.id, state);
-		return state;
-	}
-	/**
-	* Commit one roster change to the LEADER's session log.
-	*
-	* `ctx.emit('team/changed')` is a same-process edge only — it tells observers
-	* to look again, and it dies with the process. The roster the panel renders is
-	* rebuilt from this log ({@link durableView}), so a lifecycle change that only
-	* emitted would be gone after a refresh, and a spawn made through the admin
-	* route has no tool result to carry it. This record is that durable half.
-	*
-	* The event is a plugin record, not a released type: it is committed
-	* `ignorable`, never enters the model-visible surface, and a reader that does
-	* not know the type skips it instead of refusing the log.
-	* @param leader - the leader whose session log carries the team.
-	* @param record - the WHOLE post-change roster fact.
-	*/
-	publish(leader, record) {
-		try {
-			appendPluginRecord(leader.session, TEAM_MEMBER_RECORD, record);
-		} catch (error) {
-			this.ctx.logger.warn("dsh-team: publishing %s to the session log failed: %s", record.op, String(error));
-			return;
-		}
-		this.ctx.sessions.flush(leader.session);
-	}
-	/**
-	* Adopt one continuable child into the team world while its scope is being
-	* composed. Called from the teammate setup contribution after the child is
-	* published — on cold resume the child is already on the leader's roster,
-	* and only a child the roster has never seen can be the spawn currently in
-	* flight.
-	* @param child - the unpublished child agent.
-	* @returns the membership facts, or undefined for a child outside any team.
-	*/
-	adopt(child) {
-		const leaderId = child.session.header.parentSession;
-		if (leaderId === void 0) return void 0;
-		const leader = this.ctx.agents.get(leaderId);
-		if (leader === void 0) return void 0;
-		const team = this.teamOf(leader);
-		const known = team.members.get(child.id);
-		if (known !== void 0) return known;
-		const pending = this.pending.get(leaderId);
-		if (pending === void 0) return void 0;
-		const fact = {
-			...pending.fact,
-			memberId: child.id
-		};
-		pending.claimed.push(child.id);
-		team.members.set(child.id, fact);
-		return fact;
-	}
-	/**
-	* Spawn one teammate: a continuable subagent of the leader plus a roster row.
-	* @param leader - the acting leader agent.
-	* @param request - name, relation, initial task, and optional overrides.
-	* @param signal - cancellation owning the operation until the teammate accepts its brief.
-	* @returns the new member's durable facts.
-	* @throws {TeamError} when the actor cannot lead, or the roster is full.
-	*/
-	async spawn(leader, request, signal) {
-		if (leader.session.header.origin === "subagent") throw new TeamError("NESTED_TEAM");
-		const team = this.teamOf(leader);
-		if (team.members.size >= this.config.maxTeammates) throw new TeamError("MAX_TEAMMATES", String(this.config.maxTeammates));
-		if (findByName(team, request.name) !== void 0) throw new TeamError("DUPLICATE_NAME", request.name);
-		const route = this.resolveRoute(leader, request);
-		await this.assertProviderRegistered(leader, route.provider);
-		await this.assertEffortOffered(leader, request, route);
-		const agentOptions = {
-			...route.provider !== void 0 ? { provider: route.provider } : {},
-			...route.model !== void 0 ? { model: route.model } : {},
-			...request.reasoningEffort !== void 0 ? { reasoningEffort: ReasoningEffortId(request.reasoningEffort) } : {}
-		};
-		const pending = {
-			fact: {
-				name: request.name,
-				relation: request.relation,
-				...request.role !== void 0 ? { role: request.role } : {},
-				...route.provider !== void 0 ? { provider: route.provider } : {},
-				...route.model !== void 0 ? { model: route.model } : {},
-				...request.reasoningEffort !== void 0 ? { effort: request.reasoningEffort } : {},
-				...request.skills !== void 0 && request.skills.length > 0 ? { skills: [...request.skills] } : {}
-			},
-			claimed: []
-		};
-		this.pending.set(leader.id, pending);
-		let childId;
-		try {
-			childId = (await this.ctx.subagents.startActivation({
-				provider: this.config.provider,
-				label: request.role === void 0 ? request.name : `${request.name} (${request.role})`,
-				request: {
-					parent: leader,
-					prompt: [{
-						type: "text",
-						text: brief(request)
-					}],
-					...request.persona !== void 0 ? { persona: request.persona } : {},
-					...Object.keys(agentOptions).length > 0 ? { agentOptions } : {}
-				},
-				signal,
-				delivery: "parent"
-			})).childId;
-		} catch (error) {
-			for (const claimed of pending.claimed) team.members.delete(claimed);
-			throw error;
-		} finally {
-			this.pending.delete(leader.id);
-		}
-		const fact = {
-			...pending.fact,
-			memberId: childId
-		};
-		team.members.set(childId, fact);
-		team.active = true;
-		this.publish(leader, {
-			version: 1,
-			op: "upsert",
-			member: fact
-		});
-		this.ctx.emit("team/changed", { leaderId: leader.id });
-		return fact;
-	}
-	async send(from, to, text, signal) {
-		const actor = this.resolveActor(from);
-		const recipients = this.resolveRecipients(actor, to);
-		for (const recipient of recipients) this.assertDeliverable(actor, from, recipient);
-		const chain = this.chainFor(actor, from);
-		for (const recipient of recipients) if (recipient.kind === "member") this.assertBudget(actor.team, chain, from.id, recipient, text);
-		const deliveries = [];
-		for (const recipient of recipients) {
-			const messageId = await this.deliver(actor, recipient, [{
-				type: "text",
-				text
-			}], signal, chain);
-			this.recordDelivery(actor.team, chain, from.id, recipient, text);
-			deliveries.push({
-				messageId,
-				recipient,
-				chain
-			});
-		}
-		if (typeof to === "string" && to.trim() !== WILDCARD_ADDRESS) return deliveries[0];
-		return { deliveries };
-	}
-	/**
-	* Create or update one shared task. Writes are the leader's: a teammate's
-	* own tool calls land in its own log, which the leader's durable team state
-	* never reads — teammates report, and the leader records the outcome.
-	* @param leader - the acting leader agent.
-	* @param spec - a new task (title) or an update to an existing one (taskId).
-	* @returns the whole post-change task.
-	* @throws {TeamError} when the actor is not the leader, the task is unknown,
-	*   or the assignee is not on the roster.
-	*/
-	upsertTask(leader, spec) {
-		const actor = this.resolveActor(leader);
-		if (actor.member !== void 0) throw new TeamError("UNAUTHORIZED", "only the leader writes the task list");
-		const assigneeId = spec.assigneeId === void 0 ? void 0 : this.resolveRecipient(actor, spec.assigneeId).id;
-		if (spec.taskId === void 0) {
-			if (spec.title === void 0) throw new TeamError("TASK_TITLE_REQUIRED");
-			const task = {
-				taskId: taskIdOf(actor.team),
-				title: spec.title,
-				status: spec.status ?? "pending",
-				...assigneeId !== void 0 ? { assigneeId } : {},
-				...spec.note !== void 0 ? { note: spec.note } : {}
-			};
-			actor.team.tasks.set(task.taskId, task);
-			this.ctx.emit("team/changed", { leaderId: actor.leader.id });
-			return task;
-		}
-		const previous = actor.team.tasks.get(spec.taskId);
-		if (previous === void 0) throw new TeamError("UNKNOWN_TASK", spec.taskId);
-		const task = {
-			...previous,
-			...spec.title !== void 0 ? { title: spec.title } : {},
-			...spec.status !== void 0 ? { status: spec.status } : {},
-			...assigneeId !== void 0 ? { assigneeId } : {},
-			...spec.note !== void 0 ? { note: spec.note } : {}
-		};
-		actor.team.tasks.set(task.taskId, task);
-		this.ctx.emit("team/changed", { leaderId: actor.leader.id });
-		return task;
-	}
-	/**
-	* Change one teammate's relationship level.
-	* @param leader - the acting leader agent.
-	* @param target - the teammate's member id or name.
-	* @param relation - the new relation.
-	* @returns the whole post-change member record.
-	* @throws {TeamError} when the actor is not the leader or the member is unknown.
-	*/
-	setRelation(leader, target, relation) {
-		const actor = this.resolveActor(leader);
-		if (actor.member !== void 0) throw new TeamError("UNAUTHORIZED", "only the leader changes relations");
-		const recipient = this.resolveRecipient(actor, target);
-		if (recipient.kind !== "member") throw new TeamError("UNKNOWN_MEMBER", target);
-		const fact = {
-			...recipient.member,
-			relation
-		};
-		actor.team.members.set(fact.memberId, fact);
-		this.publish(actor.leader, {
-			version: 1,
-			op: "upsert",
-			member: fact
-		});
-		this.ctx.emit("team/changed", { leaderId: actor.leader.id });
-		return fact;
-	}
-	/**
-	* Dismiss one teammate, or end the whole team when no target is given. A
-	* dismissed teammate stops its current turn and stops receiving mail; its
-	* durable session stays readable through the subagent catalog.
-	* @param leader - the acting leader agent.
-	* @param target - the teammate's member id or name; absent ends the team.
-	* @returns whether the team ended, plus the dismissed member id when targeted.
-	* @throws {TeamError} when the actor is not the leader or the member is unknown.
-	*/
-	dismiss(leader, target) {
-		const actor = this.resolveActor(leader);
-		if (actor.member !== void 0) throw new TeamError("UNAUTHORIZED", "only the leader dismisses teammates");
-		if (target === void 0) {
-			for (const memberId of [...actor.team.members.keys()]) this.stopMember(actor.leader, memberId);
-			actor.team.members.clear();
-			actor.team.tasks.clear();
-			actor.team.inbox.clear();
-			actor.team.chains.clear();
-			actor.team.active = false;
-			this.publish(actor.leader, {
-				version: 1,
-				op: "ended"
-			});
-			this.ctx.emit("team/changed", {
-				leaderId: actor.leader.id,
-				ended: true
-			});
-			return { ended: true };
-		}
-		const recipient = this.resolveRecipient(actor, target);
-		if (recipient.kind !== "member") throw new TeamError("UNKNOWN_MEMBER", target);
-		this.stopMember(actor.leader, recipient.id);
-		actor.team.members.delete(recipient.id);
-		actor.team.inbox.delete(recipient.id);
-		this.publish(actor.leader, {
-			version: 1,
-			op: "remove",
-			memberId: recipient.id
-		});
-		this.ctx.emit("team/changed", {
-			leaderId: actor.leader.id,
-			removedMember: recipient.id
-		});
-		return {
-			ended: false,
-			memberId: recipient.id
-		};
-	}
-	/**
-	* The roster, task list, and recent leader-visible mailbox traffic, from the
-	* point of view of any member of the team.
-	* @param actorAgent - the acting leader or teammate.
-	* @returns the live team read; an inactive team reports empty lists.
-	*/
-	list(actorAgent) {
-		const actor = this.tryResolveActor(actorAgent);
-		if (actor === void 0) return {
-			active: false,
-			members: [],
-			tasks: [],
-			messages: []
-		};
-		const view = this.durableView(actor.leader);
-		return {
-			active: actor.team.active,
-			members: [...actor.team.members.values()].map((member) => ({
-				...member,
-				joinedAt: view.members.find((row) => row.memberId === member.memberId)?.joinedAt ?? 0,
-				status: this.statusOf(member.memberId)
-			})),
-			tasks: [...actor.team.tasks.values()],
-			messages: [...view.messages]
-		};
-	}
-	/**
-	* Where one acting agent sits in its team: whose workspace it reaches, and
-	* how a note it writes is attributed. The leader's own seat carries its
-	* session id, so its private pad is addressed exactly like a teammate's.
-	* @param agent - the acting leader or teammate.
-	* @returns the team's leader id, the actor's own id, and its display name.
-	* @throws {TeamError} when the actor is not in a team.
-	*/
-	seatOf(agent) {
-		const actor = this.resolveActor(agent);
-		return {
-			leaderId: actor.leader.id,
-			memberId: actor.member?.memberId ?? actor.leader.id,
-			name: actor.member?.name ?? "leader"
-		};
-	}
-	/**
-	* The teammate roster as one teammate should see it, for its prompt section.
-	* @param member - the teammate agent.
-	* @returns the leader-relative roster, or undefined outside a team.
-	*/
-	rosterFor(member) {
-		const actor = this.tryResolveActor(member);
-		if (actor?.member === void 0) return void 0;
-		return {
-			self: actor.member,
-			others: [...actor.team.members.values()].filter((row) => row.memberId !== member.id)
-		};
-	}
-	/** The durable view the leader's log folds to (the projection registry's cached cut). */
-	durableView(leader) {
-		const registry = this.ctx.get("sessionProjections");
-		if (registry === void 0) return foldTeam(leader.session.snapshotEvents(), this.config.maxRecentMessages);
-		return registry.snapshot(leader.session).values.team ?? EMPTY_TEAM_VIEW;
-	}
-	/** Live runtime state of one teammate; `ready` means no live agent remains. */
-	statusOf(memberId) {
-		const agent = this.ctx.agents.get(SessionId(memberId));
-		if (agent === void 0) return "ready";
-		return agent.status === "running" ? "running" : "idle";
-	}
-	/**
-	* Resolve the acting agent's team, or fail loud — and say WHICH failure it
-	* is. A teammate whose leader session is simply not loaded is not a teammate
-	* without a team: every delivery runs on the leader's parent authority, so
-	* the mailbox is shut until the leader is back, while the workspace (which
-	* needs nobody) stays open. Telling it "no team here yet" would send it to
-	* spawn one, which it cannot do.
-	*/
-	resolveActor(agent) {
-		const actor = this.tryResolveActor(agent);
-		if (actor !== void 0) return actor;
-		const leaderId = agent.session.header.parentSession;
-		if (agent.session.header.origin === "subagent" && leaderId !== void 0 && this.ctx.agents.get(leaderId) === void 0) throw new TeamError("LEADER_AWAY");
-		throw new TeamError("NO_TEAM");
-	}
-	/** Resolve the acting agent's team, or report absence. */
-	tryResolveActor(agent) {
-		if (agent.session.header.origin !== "subagent") return {
-			leader: agent,
-			team: this.teamOf(agent)
-		};
-		const leaderId = agent.session.header.parentSession;
-		if (leaderId === void 0) return void 0;
-		const leader = this.ctx.agents.get(leaderId);
-		if (leader === void 0) return void 0;
-		const team = this.teamOf(leader);
-		const member = team.members.get(agent.id);
-		return member === void 0 ? void 0 : {
-			leader,
-			team,
-			member
-		};
-	}
-	/** Resolve one address (member id, member name, or `leader`) to a recipient. */
-	resolveRecipient(actor, address) {
-		const normalized = address.trim();
-		if (normalized.length === 0) throw new TeamError("UNKNOWN_MEMBER", address);
-		if (normalized === actor.leader.id || normalized.toLowerCase() === "leader") return {
-			kind: "leader",
-			id: actor.leader.id,
-			name: "leader"
-		};
-		const byId = actor.team.members.get(normalized);
-		if (byId !== void 0) return {
-			kind: "member",
-			id: byId.memberId,
-			name: byId.name,
-			member: byId
-		};
-		const byName = findByName(actor.team, normalized);
-		if (byName !== void 0) return {
-			kind: "member",
-			id: byName.memberId,
-			name: byName.name,
-			member: byName
-		};
-		throw new TeamError("UNKNOWN_MEMBER", address);
-	}
-	/**
-	* Resolve one address, a list of them, or the wildcard to the distinct
-	* recipients one send must reach, in the order given.
-	*
-	* The wildcard means "everyone else on this team", which the sender's
-	* relation decides: every member for the leader, the leader plus the other
-	* members for a peer, and only the leader for a managed member — the one
-	* address that relation may reach. The sender is never a recipient of its own
-	* wildcard, while an address the sender spelled out for itself is refused
-	* later by {@link assertDeliverable} rather than silently dropped: a member
-	* that named itself made a mistake worth reporting.
-	* @param actor - who is sending, which fixes both the wildcard and self.
-	* @param address - one address, the wildcard, or a list mixing the two.
-	* @returns the distinct recipients, never empty and never the sender.
-	* @throws {TeamError} when an address is unknown (the refusal names that one
-	*   address), or when nothing is left to address.
-	*/
-	resolveRecipients(actor, address) {
-		const addresses = typeof address === "string" ? [address] : address;
-		const resolved = [];
-		const seen = /* @__PURE__ */ new Set();
-		for (const entry of addresses) {
-			const candidates = entry.trim() === WILDCARD_ADDRESS ? this.everyoneElse(actor) : [this.resolveRecipient(actor, entry)];
-			for (const candidate of candidates) {
-				if (seen.has(candidate.id)) continue;
-				seen.add(candidate.id);
-				resolved.push(candidate);
-			}
-		}
-		if (resolved.length === 0) throw new TeamError("UNKNOWN_MEMBER", typeof address === "string" ? "there is nobody else on this team to address" : "the list of recipients is empty");
-		return resolved;
-	}
-	/**
-	* Everyone the wildcard reaches from this sender: the whole roster for the
-	* leader, the leader and the other members for a peer, and the leader alone
-	* for a managed member.
-	* @param actor - who is sending, and therefore who is left out.
-	* @returns the expansion, empty only for a leader with no teammates.
-	*/
-	everyoneElse(actor) {
-		const leader = {
-			kind: "leader",
-			id: actor.leader.id,
-			name: "leader"
-		};
-		const others = [];
-		for (const member of actor.team.members.values()) {
-			if (member.memberId === actor.member?.memberId) continue;
-			others.push({
-				kind: "member",
-				id: member.memberId,
-				name: member.name,
-				member
-			});
-		}
-		if (actor.member === void 0) return others;
-		if (actor.member.relation === "managed") return [leader];
-		return [leader, ...others];
-	}
-	/**
-	* Refuse one delivery the actor's relation or its own identity forbids. The
-	* relation check runs first so a managed member writing to itself is told
-	* what it may not do as a managed member, exactly as before.
-	*/
-	assertDeliverable(actor, from, recipient) {
-		if (actor.member !== void 0 && actor.member.relation === "managed" && recipient.kind !== "leader") throw new TeamError("UNAUTHORIZED", `${actor.member.name} is a managed teammate and may only message the leader`);
-		if (recipient.id === from.id) throw new TeamError("SELF_MESSAGE");
-	}
-	/**
-	* The chain one send belongs to. A teammate continues the conversation it is
-	* working from — that is what turns a peer exchange into one bounded
-	* conversation instead of an unbounded sequence of unrelated messages. The
-	* leader always opens a fresh chain: its own turns are the user-visible,
-	* interruptible convergence point, so a conversation that reached the leader
-	* has already converged and the next instruction starts over.
-	*/
-	chainFor(actor, from) {
-		const inherited = actor.member === void 0 ? void 0 : actor.team.inbox.get(from.id);
-		if (inherited !== void 0) return {
-			chainId: inherited.chainId,
-			hop: inherited.hop + 1
-		};
-		actor.team.started += 1;
-		return {
-			chainId: `c${actor.team.started}`,
-			hop: 0
-		};
-	}
-	/**
-	* Refuse a peer delivery this conversation can no longer afford: too many
-	* relays deep, one ordered pair talked out, or a verbatim repeat. Nothing
-	* here applies to a message addressed to the leader.
-	*/
-	assertBudget(team, chain, fromId, recipient, text) {
-		if (chain.hop > this.config.maxChainHops) throw new TeamError("CHAIN_EXHAUSTED", `relay ${chain.hop} of at most ${this.config.maxChainHops}`);
-		const record = team.chains.get(chain.chainId);
-		if (record === void 0) return;
-		const edge = edgeKey(fromId, recipient.id);
-		if ((record.edges.get(edge) ?? 0) >= this.config.maxChainRoundTrips) throw new TeamError("PING_PONG", `${this.config.maxChainRoundTrips} message(s) already went to ${recipient.name} in this conversation`);
-		if (record.said.get(edge) === text) throw new TeamError("REPEATED_MESSAGE", recipient.name);
-	}
-	/** Charge one accepted peer delivery to its chain, and hand the chain on. */
-	recordDelivery(team, chain, fromId, recipient, text) {
-		if (recipient.kind !== "member") return;
-		team.inbox.set(recipient.id, chain);
-		let record = team.chains.get(chain.chainId);
-		if (record === void 0) {
-			record = {
-				edges: /* @__PURE__ */ new Map(),
-				said: /* @__PURE__ */ new Map()
-			};
-			team.chains.set(chain.chainId, record);
-			for (const stale of team.chains.keys()) {
-				if (team.chains.size <= CHAIN_MEMORY) break;
-				team.chains.delete(stale);
-			}
-		}
-		const edge = edgeKey(fromId, recipient.id);
-		record.edges.set(edge, (record.edges.get(edge) ?? 0) + 1);
-		record.said.set(edge, text);
-	}
-	/** Deliver one message, choosing the transport the recipient's runtime requires. */
-	async deliver(actor, recipient, content, signal, chain) {
-		const source = {
-			kind: "team-message",
-			form: "relay",
-			senderSessionId: actor.member?.memberId ?? actor.leader.id,
-			senderName: actor.member?.name ?? "leader",
-			chainId: chain.chainId,
-			hop: chain.hop
-		};
-		if (recipient.kind === "leader") {
-			const message = createUserMessage({
-				content,
-				source
-			});
-			actor.leader.send(message, "next-turn", true);
-			return message.id;
-		}
-		return await queueHostSubagentPrompt(this.ctx.subagents, actor.leader, SessionId(recipient.id), content, source, signal);
-	}
-	/**
-	* The route this spawn runs on. A request that names its own provider or
-	* model wins exactly as given; one that names neither falls back to the
-	* deployment's teammate route, so a single `teammateProvider` pair turns
-	* every teammate local without overriding a leader that asked for a
-	* specific route. Model ids are provider-scoped, so a route change without
-	* a model is refused instead of sending the leader's model id to a provider
-	* that never advertised it.
-	*/
-	resolveRoute(leader, request) {
-		const explicit = request.provider !== void 0 || request.model !== void 0;
-		const provider = explicit ? request.provider : this.config.teammateProvider === "" ? void 0 : this.config.teammateProvider;
-		const model = explicit ? request.model : this.config.teammateModel === "" ? void 0 : this.config.teammateModel;
-		if (provider !== void 0 && provider !== leader.options.provider && model === void 0) throw new TeamError("MODEL_REQUIRED", provider);
-		return {
-			...provider !== void 0 ? { provider } : {},
-			...model !== void 0 ? { model } : {}
-		};
-	}
-	/**
-	* Reject a spawn aimed at a provider this deployment never registered, at
-	* spawn rather than on the teammate's first request: the failure would
-	* otherwise arrive as an adapter error inside the teammate's own turn,
-	* where the leader cannot see it or correct the route.
-	*/
-	assertProviderRegistered(leader, provider) {
-		if (provider === void 0 || provider === leader.options.provider) return;
-		const llm = this.ctx.get("llm");
-		if (llm === void 0) return;
-		const registered = llm.listProviders();
-		if (registered.length === 0 || registered.some((entry) => entry.id === provider)) return;
-		throw new TeamError("UNKNOWN_PROVIDER", `${provider}; registered: ${registered.map((entry) => entry.id).join(", ")}`);
-	}
-	/**
-	* Reject a reasoning effort the selected model does not offer, at spawn
-	* rather than on the teammate's every later request. Validation needs an
-	* exact provider/model route: without one the adapter stays the authority.
-	*/
-	async assertEffortOffered(leader, request, route) {
-		if (request.reasoningEffort === void 0) return;
-		const llm = this.ctx.get("llm");
-		const provider = route.provider ?? leader.options.provider;
-		const model = route.model ?? leader.options.model;
-		if (llm === void 0 || provider === void 0 || model === void 0) return;
-		let info;
-		try {
-			info = await llm.resolveModelInfo(provider, model);
-		} catch {
-			return;
-		}
-		const offered = info.reasoning?.efforts ?? [];
-		if (offered.some((effort) => effort.id === request.reasoningEffort)) return;
-		throw new TeamError("UNKNOWN_EFFORT", offered.length === 0 ? `${model} exposes no reasoning efforts` : `${model} offers ${offered.map((effort) => effort.id).join(", ")}`);
-	}
-	/**
-	* Stop one teammate's current work. Residency belongs to the continuation
-	* manager, so dismissal interrupts rather than disposes: an interrupted
-	* teammate settles on its own and its session stays readable.
-	*/
-	stopMember(leader, memberId) {
-		try {
-			this.ctx.subagents.interrupt(SessionId(memberId), {
-				kind: "ancestor",
-				agent: leader
-			});
-		} catch (error) {
-			this.ctx.logger.warn("dsh-team: interrupt of teammate %s failed: %s", memberId, String(error));
-		}
-	}
-	/** Service teardown: live teams are rebuilt from their logs on next touch. */
-	stop() {
-		this.teams.clear();
-		this.pending.clear();
-	}
-};
-/** Strip the live-view fields a roster fact does not carry. */
-function memberFact(member) {
-	return {
-		memberId: member.memberId,
-		name: member.name,
-		relation: member.relation,
-		...member.role !== void 0 ? { role: member.role } : {},
-		...member.provider !== void 0 ? { provider: member.provider } : {},
-		...member.model !== void 0 ? { model: member.model } : {},
-		...member.effort !== void 0 ? { effort: member.effort } : {},
-		...member.skills !== void 0 ? { skills: [...member.skills] } : {}
-	};
-}
-/** One ordered pair, as the chain ledger keys it. */
-function edgeKey(fromId, toId) {
-	return `${fromId} ${toId}`;
-}
-/** Case-insensitive roster lookup by display name. */
-function findByName(team, name) {
-	const wanted = name.trim().toLowerCase();
-	for (const member of team.members.values()) if (member.name.toLowerCase() === wanted) return member;
-}
-/** Short stable task id, unique within one team's live list. */
-function taskIdOf(team) {
-	let next = team.tasks.size + 1;
-	while (team.tasks.has(`t${next}`)) next += 1;
-	return `t${next}`;
-}
-/** The teammate's first turn: who it is, and what the leader asked for. */
-function brief(request) {
-	return [
-		request.role === void 0 ? `You are ${request.name}, a teammate in this agent team.` : `You are ${request.name} (${request.role}), a teammate in this agent team.`,
-		"",
-		"The leader assigned you this task:",
-		request.task
-	].join("\n");
-}
-//#endregion
 //#region src/teammate.ts
 /** Guidance order: after the harness tool sections, before the persona. */
 const TEAM_SECTION_ORDER = 118;
@@ -3878,7 +4156,8 @@ function installLeaderTools(ctx, config, agent) {
 		agent.ctx.tools.register(taskTool(ctx)),
 		agent.ctx.tools.register(relationTool(ctx)),
 		agent.ctx.tools.register(dismissTool(ctx)),
-		agent.ctx.tools.register(listTool(ctx))
+		agent.ctx.tools.register(listTool(ctx)),
+		agent.ctx.tools.register(waitTool(ctx))
 	];
 	return () => {
 		for (const dispose of disposers.reverse()) dispose();
