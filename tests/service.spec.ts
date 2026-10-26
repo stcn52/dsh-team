@@ -895,14 +895,17 @@ describe('wait', () => {
   }
 
   /**
-   * Count the live `agent/created` subscriptions for the duration of one case, by
-   * wrapping this world's own `on`. Cordis keeps a listener registered until its
-   * disposer runs, and a wait gets no automatic cleanup, so the disposers a wait
-   * has NOT called are exactly the leak this measures.
-   * @param scene - the world whose context the wait subscribes on.
+   * Count the live subscriptions to the given events for the duration of one
+   * case, by wrapping this world's own `on`. Cordis keeps a listener registered
+   * until its disposer runs, and a wait gets no automatic cleanup, so the
+   * disposers a wait has NOT called are exactly the leak this measures. The
+   * service's construction-time `agent/disposed` listener is registered before
+   * this wrapper, so it is never counted.
+   * @param scene - the world whose context the waits subscribe on.
+   * @param names - the event names to count.
    * @returns the live disposers; empty once every subscription was dropped.
    */
-  function trackCreated(scene: World): Set<() => void> {
+  function trackSubscriptions(scene: World, names: readonly string[]): Set<() => void> {
     const live = new Set<() => void>()
     const loose = scene.ctx as unknown as {
       on: (name: string, listener: (payload: { agent: { id: string } }) => void) => () => boolean
@@ -910,7 +913,7 @@ describe('wait', () => {
     const original = loose.on.bind(loose)
     loose.on = (name, listener) => {
       const dispose = original(name, listener)
-      if (name !== 'agent/created') return dispose
+      if (!names.includes(name)) return dispose
       const tracked = (): boolean => {
         live.delete(tracked)
         return dispose()
@@ -919,6 +922,15 @@ describe('wait', () => {
       return tracked
     }
     return live
+  }
+
+  /**
+   * Count the live `agent/created` subscriptions through {@link trackSubscriptions}.
+   * @param scene - the world whose context the wait subscribes on.
+   * @returns the live disposers; empty once every subscription was dropped.
+   */
+  function trackCreated(scene: World): Set<() => void> {
+    return trackSubscriptions(scene, ['agent/created'])
   }
 
   it('returns at once with every member done when nobody is running', async () => {
@@ -1061,17 +1073,21 @@ describe('wait', () => {
    * resident during the window and is gone at the deadline occupies no turn, so
    * it is done — the deadline is what keeps the wait from hanging on a ghost,
    * not the "no agent means nothing left to do" shortcut that broke cold members.
+   * Its disposal is heard as it happens, so the answer arrives without waiting
+   * the budget out: `timedOut` reports that an observation actually settled.
    */
   it('counts a member seen resident, then reaped, as done', async () => {
     const scene = world()
     const alice = await spawn(scene, 'Alice')
     alice.status = 'running'
 
-    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+    const started = Date.now()
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
     await sleep(40)
     scene.agents.remove(alice.id)
 
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(Date.now() - started).toBeLessThan(500)
   })
 
   /**
@@ -1546,5 +1562,137 @@ describe('wait', () => {
 
     expect(await scene.service.wait(scene.leader.agent, { members: ['Alice', 'alice', alice.id] }))
       .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+  })
+
+  /**
+   * The latency lock for the reported bug. A member that is reaped while it is
+   * being observed takes its `whenIdle()` promise with it: the disposed agent
+   * never settles it, so a wait that raced only the idle signal sat out its whole
+   * budget and THEN classified the member correctly from the registry. The
+   * answer was right — `all finished: a, b` — and the latency was the defect:
+   * 20 041 ms against a 20 000 ms budget, in the host trace that found this.
+   *
+   * Disposal is a finish signal of its own — a reaped agent occupies no turn —
+   * so the wait must return on it, far inside the budget.
+   */
+  it('returns as soon as a running member is reaped, instead of sitting out the budget', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+
+    const started = Date.now()
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
+    // Past the settle window, so the wait is holding a live `whenIdle()`.
+    await sleep(80)
+    scene.agents.remove(alice.id)
+
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    // Seconds, not the budget: the bug returned after ~2 000 ms here.
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
+  /**
+   * The negative control for the disposal signal. A listener that released on
+   * ANY `agent/disposed` would answer "done" for a member that is still working
+   * the moment a different member is reaped — the same false "everyone is back"
+   * the cold rules exist to prevent, only arriving early. Only the disposal of
+   * the very agent an observation follows may settle it.
+   */
+  it('does not finish a running member because a different agent was reaped', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    alice.status = 'running'
+
+    const resolved: boolean[] = []
+    const waiting = scene.service.wait(scene.leader.agent, { members: ['Alice'], timeoutMs: 150 })
+      .then((value) => { resolved.push(true); return value })
+    // Past the settle window: Alice is being observed, Bob is not a target.
+    await sleep(60)
+    expect(resolved).toEqual([])
+
+    scene.agents.remove(bob.id)
+    await sleep(50)
+    // Bob's disposal is not news about Alice's turn.
+    expect(resolved).toEqual([])
+
+    expect(await waiting).toEqual({ done: [], busy: ['Alice'], cold: [], timedOut: true })
+  })
+
+  /**
+   * The disposal subscription lives exactly as long as the observation it feeds.
+   * Dropped when the member settles.
+   */
+  it('drops its agent/disposed subscription when the member settles', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    const live = trackSubscriptions(scene, ['agent/created', 'agent/disposed'])
+
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 })
+    await sleep(60)
+    // One live observation, one live subscription.
+    expect(live.size).toBe(1)
+
+    alice.goIdle()
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(live.size).toBe(0)
+  })
+
+  /** The same lifetime on the deadline path, where the budget ends the wait. */
+  it('drops its agent/disposed subscription when the wait times out', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    const live = trackSubscriptions(scene, ['agent/created', 'agent/disposed'])
+
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+    await sleep(40)
+    expect(live.size).toBe(1)
+
+    expect(await waiting).toEqual({ done: [], busy: ['Alice'], cold: [], timedOut: true })
+    expect(live.size).toBe(0)
+  })
+
+  /** And on cancellation, where the caller's signal ends it. */
+  it('drops its agent/disposed subscription when the caller cancels', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    alice.status = 'running'
+    const live = trackSubscriptions(scene, ['agent/created', 'agent/disposed'])
+    const controller = new AbortController()
+
+    const waiting = scene.service.wait(scene.leader.agent, { signal: controller.signal, timeoutMs: 5_000 })
+    await sleep(40)
+    expect(live.size).toBe(1)
+
+    controller.abort()
+    expect(await codeOf(() => waiting)).toBe('ABORTED')
+    expect(live.size).toBe(0)
+  })
+
+  /**
+   * The reported scenario end to end: two members answer "just reply OK" and
+   * both are reaped while the leader waits. The answer is `all finished` and the
+   * latency is seconds — the host trace returned the same answer after its full
+   * 20 000 ms budget, which is the defect this locks out. The budget here is
+   * scaled down to 2 000 ms so a regression reports the wait's own timeout rather
+   * than the test runner's.
+   */
+  it('answers a two-member round with both done, in seconds rather than the budget', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    alice.status = 'running'
+    bob.status = 'running'
+
+    const started = Date.now()
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
+    await sleep(100)
+    scene.agents.remove(alice.id)
+    scene.agents.remove(bob.id)
+
+    expect(await waiting).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false })
+    expect(Date.now() - started).toBeLessThan(1_000)
   })
 })

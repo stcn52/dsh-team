@@ -204,12 +204,12 @@ export interface TeamListResult {
 export interface TeamWaitResult {
   /**
    * Members confirmed finished: `whenIdle()` settled during the observation, the
+   * member was disposed during it (a reaped agent occupies no turn), the
    * member was seen live during it and was no longer `running` when the wait
-   * ended (reaped included — a reaped agent occupies no turn), or its session was
-   * already gone while the leader held its report — queued in the leader's inbox
-   * for this round, spliced into the leader's own log after this round's
-   * delivery (the row the queue is built from and outlives it), or already
-   * spliced into its durable mailbox.
+   * ended (reaped included), or its session was already gone while the leader
+   * held its report — queued in the leader's inbox for this round, spliced into
+   * the leader's own log after this round's delivery (the row the queue is built
+   * from and outlives it), or already spliced into its durable mailbox.
    */
   readonly done: readonly string[]
   /**
@@ -777,11 +777,12 @@ export class TeamService extends Service {
       const observing = targets.map((target, index) => this.observeIdle(target, observations[index]!, watch))
       outcome = await this.raceWait(observing, clampWait(request.timeoutMs), request.signal)
     } finally {
-      // Every cold subscription dies with the wait, on all three exits: all
+      // Every watch subscription dies with the wait, on all three exits: all
       // settled, deadline, and cancellation. `whenIdle()` promises abandoned at
       // the deadline cannot be cancelled and are harmless remnants, but a live
-      // `agent/created` listener would wake a dead closure on every later
-      // publication of the session — one leaked listener per timed-out wait.
+      // `agent/created` or `agent/disposed` listener would wake a dead closure on
+      // every later publication or disposal of the session — one leaked listener
+      // per timed-out wait.
       for (const stop of watch) stop()
       watch.clear()
     }
@@ -919,9 +920,11 @@ export class TeamService extends Service {
    * Two paths, because a member can be in one of two very different states:
    *
    * - **Resident** (`agents.get()` yields an agent): mark `seen`, then follow
-   *   `whenIdle()`. A rejected — or synchronously throwing — idle signal records
-   *   as settled too: an unobservable member must not hang the leader's turn, and
-   *   the next wait observes it afresh.
+   *   `whenIdle()` — or the agent's disposal, whichever comes first: a reaped
+   *   agent never settles its idle promise, and waiting out the budget for it
+   *   would answer correctly but slowly. A rejected — or synchronously throwing —
+   *   idle signal records as settled too: an unobservable member must not hang
+   *   the leader's turn, and the next wait observes it afresh.
    * - **Cold** (no agent yet): do NOT settle. A member with no live agent has not
    *   finished anything, it has not started — settling it here was the bug: a
    *   leader that broadcast to a cold member and waited got "everybody is back"
@@ -945,7 +948,7 @@ export class TeamService extends Service {
     const agent = this.ctx.agents.get(SessionId(target.memberId))
     if (agent !== undefined) {
       observation.seen = true
-      return this.idleOf(agent, release)
+      return this.idleOf(agent, release, watch)
     }
     return new Promise<void>((resolve) => {
       // Idempotent, because both the wake path and the wait's `finally` run it:
@@ -967,28 +970,69 @@ export class TeamService extends Service {
         // SERIALLY and the seam forbids a creation listener from awaiting
         // `whenIdle()` — that would hold the member's own creation on the turn it
         // was created to run, which resolves only when that turn ends.
-        void this.idleOf(payload.agent, release).then(resolve)
+        void this.idleOf(payload.agent, release, watch).then(resolve)
       })
       watch.add(stop)
     })
   }
 
   /**
-   * The harness's own quiescence seam for one live agent, reported as `settled`.
-   * A rejection means the member became unobservable; it counts as settled for
-   * the same reason the throwing case does — the alternative is a leader's turn
-   * held hostage by one member's broken signal.
+   * The harness's own quiescence seam for one live agent, reported as `settled`,
+   * raced against that agent's disposal.
+   *
+   * `whenIdle()` alone is not enough on this runtime: the harness disposes a
+   * teammate's agent when its turn is over and its session is reaped, and a
+   * disposed agent never settles the idle promise it handed out. A wait that
+   * raced only `whenIdle()` therefore sat out its whole budget and then read the
+   * registry to find the member correctly gone — the right answer at the wrong
+   * time (20 041 ms against a 20 000 ms budget in the host trace that found
+   * this). A disposed agent occupies no turn, so its disposal is a finish signal
+   * of its own: it releases the member at once.
+   *
+   * A rejection — or a synchronous throw — also counts as settled for the same
+   * reason the throwing case does: the alternative is a leader's turn held
+   * hostage by one member's broken signal.
+   *
+   * The subscription is dropped idempotently on all four exits — `whenIdle()`
+   * settling, disposal, the deadline, and the caller's cancellation — because
+   * the wait's `finally` calls the same `stop` every other watch entry uses. A
+   * `whenIdle()` promise abandoned at the deadline cannot be cancelled and is
+   * harmless: its `then` runs `stop` a second time, which is a no-op, and flips
+   * a flag on a record the finished wait has already read.
    * @param agent - the live agent to wait on.
    * @param release - records the member as settled.
+   * @param watch - the wait's subscription set, so an ending wait can drop this.
    * @returns the observation promise, which never rejects.
    */
-  private idleOf(agent: Agent, release: () => void): Promise<void> {
-    try {
-      return agent.whenIdle().then(release, release)
-    } catch {
-      release()
-      return Promise.resolve()
-    }
+  private idleOf(agent: Agent, release: () => void, watch: WaitWatch): Promise<void> {
+    return new Promise<void>((resolve) => {
+      // Idempotent, for the same reason `observeIdle`'s cold path is: four
+      // different paths reach it and only the first may unsubscribe.
+      let unsubscribe: (() => void) | undefined
+      const stop = (): void => {
+        watch.delete(stop)
+        const drop = unsubscribe
+        unsubscribe = undefined
+        drop?.()
+      }
+      const settle = (): void => {
+        stop()
+        release()
+        resolve()
+      }
+      watch.add(stop)
+      // Only THIS agent's disposal may release it: another member being reaped is
+      // not news about this one.
+      unsubscribe = this.ctx.on('agent/disposed', (payload: { agent: Agent }) => {
+        if (payload.agent.id !== agent.id) return
+        settle()
+      })
+      try {
+        void agent.whenIdle().then(settle, settle)
+      } catch {
+        settle()
+      }
+    })
   }
 
   /**
@@ -1004,8 +1048,8 @@ export class TeamService extends Service {
    * cancelled — the seam takes no signal — and is a harmless remnant: its `then`
    * only flips a flag on a record the finished wait has already read. Never await
    * it a second time; a fresh wait starts a fresh observation instead. Live
-   * `agent/created` subscriptions are NOT harmless and are the caller's to drop
-   * as soon as this race ends, on every exit.
+   * `agent/created` and `agent/disposed` subscriptions are NOT harmless and are
+   * the caller's to drop as soon as this race ends, on every exit.
    * @param observing - one observation promise per member being watched.
    * @param budget - the deadline in milliseconds, already clamped.
    * @param signal - the caller's cancellation, when it supplied one.
