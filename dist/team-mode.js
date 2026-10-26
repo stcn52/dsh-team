@@ -17,6 +17,10 @@ const TEAM_MODE_DENIAL = "团队模式：还没有 teammate。先用 team_spawn 
 * `team_*` surface (the way OUT of the gate) plus the advisory tools that do
 * not investigate the repository. Everything else — bash, read, write, edit,
 * glob, grep, web, jobs, subagent — waits for a team.
+*
+* The three goal tools are bookkeeping on the session's own objective: a
+* leader that dismissed its last teammate still has to be able to read back
+* where the goal stood, and answering that never touches the working tree.
 */
 const TEAM_MODE_ALLOWED = [
 	"skill",
@@ -24,8 +28,24 @@ const TEAM_MODE_ALLOWED = [
 	"ask_user_question",
 	"progress_update",
 	"present",
-	"workflow"
+	"workflow",
+	"create_goal",
+	"get_goal",
+	"update_goal"
 ];
+/**
+* Whole families that stay callable before the first teammate exists, matched
+* by prefix because their rows are composed independently (a deployment may
+* mount any subset of them, and new members appear without this file moving).
+*
+* Both families are accounting, not investigation: `mnemon_*` reads and writes
+* the durable memory/dossier stores, `schedule_*` manages reminders in the
+* session. Neither opens a repository file, runs a command, or delegates work,
+* which is what the gate exists to stop — refusing them only stranded a leader
+* that had just dismissed its last teammate, mid-record, with a refusal that
+* told it to spawn a team it no longer needed.
+*/
+const TEAM_MODE_ALLOWED_PREFIXES = ["mnemon_", "schedule_"];
 const ALLOWED = new Set(TEAM_MODE_ALLOWED);
 /** Placement of the hard rules: after the persona (0), before plan policy (500). */
 const TEAM_MODE_ORDER = 119;
@@ -38,9 +58,14 @@ const TEAM_MODE_SECTION = [
 	"- 每个 teammate 的 brief 写清三件事：素材从哪取、用什么方法与工具、交付时拿什么证据自证。按任务形态指定 provider/model，并在派活时说明一句理由。",
 	"- 你负责复核成员交回的原始证据，不要把结论原样转述给用户；成员完成立即 team_dismiss，保持团队最小。"
 ].join("\n");
-/** Whether `tool` may run before the team exists (all `team_*` plus the advisory set). */
+/**
+* Whether `tool` may run before the team exists: the whole `team_*` surface,
+* the exact advisory set, and the bookkeeping families in
+* {@link TEAM_MODE_ALLOWED_PREFIXES}.
+*/
 function allowedBeforeTeam(tool) {
-	return tool.startsWith("team_") || ALLOWED.has(tool);
+	if (tool.startsWith("team_") || ALLOWED.has(tool)) return true;
+	return TEAM_MODE_ALLOWED_PREFIXES.some((prefix) => tool.startsWith(prefix));
 }
 /**
 * The monotonic check behind the guard, kept pure so a test can exercise the
@@ -80,4 +105,4 @@ function apply(ctx) {
 	});
 }
 //#endregion
-export { TEAM_MODE_ALLOWED, TEAM_MODE_DENIAL, TEAM_MODE_ORDER, TEAM_MODE_SECTION, allowedBeforeTeam, apply, inject, name, noTeamDenial };
+export { TEAM_MODE_ALLOWED, TEAM_MODE_ALLOWED_PREFIXES, TEAM_MODE_DENIAL, TEAM_MODE_ORDER, TEAM_MODE_SECTION, allowedBeforeTeam, apply, inject, name, noTeamDenial };

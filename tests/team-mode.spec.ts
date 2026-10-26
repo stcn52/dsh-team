@@ -14,7 +14,7 @@ import { Context } from '@deepseek-ai/cordis'
 import type { Fiber } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
 import {
-  apply, TEAM_MODE_ALLOWED, TEAM_MODE_DENIAL, TEAM_MODE_ORDER, TEAM_MODE_SECTION,
+  apply, TEAM_MODE_ALLOWED, TEAM_MODE_ALLOWED_PREFIXES, TEAM_MODE_DENIAL, TEAM_MODE_ORDER, TEAM_MODE_SECTION,
 } from '../src/team-mode.ts'
 import { FakeSystemPrompt, FakeTools, fakeAgent, type FakeAgent } from './harness.ts'
 
@@ -94,6 +94,34 @@ describe('no-teammate tool gate', () => {
       ...TEAM_MODE_ALLOWED,
     ]
     for (const tool of tools) expect(guardReason(scene, tool), tool).toBeUndefined()
+  })
+
+  it('admits the bookkeeping families, so dismissing the last teammate does not strand the record', async () => {
+    const scene = await mount()
+    expect(TEAM_MODE_ALLOWED_PREFIXES).toEqual(['mnemon_', 'schedule_'])
+    const tools = [
+      // Memory and dossier accounting: reading and writing the durable stores.
+      'mnemon_runtime_memory', 'mnemon_recall', 'mnemon_remember', 'mnemon_forget',
+      'mnemon_document_search', 'mnemon_document_create', 'mnemon_document_manage',
+      'mnemon_status', 'mnemon_memory_bodies', 'mnemon_memory_body_create',
+      // Reminders: session bookkeeping, no repository access.
+      'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete',
+    ]
+    for (const tool of tools) expect(guardReason(scene, tool), tool).toBeUndefined()
+  })
+
+  it('still refuses the investigation and execution surface, including look-alike names', async () => {
+    const scene = await mount()
+    for (const tool of [
+      'bash', 'read', 'write', 'edit', 'glob', 'grep',
+      'web_search', 'web_fetch', 'browser_open', 'browser_click',
+      'subagent', 'subagent_fork', 'job_output', 'job_kill',
+      // Exact names stay exact: sharing a first word with an allowed tool is
+      // not a licence, and a prefix family only reaches its own separator.
+      'mnemosyne_notes', 'create_goal_now',
+    ]) {
+      expect(guardReason(scene, tool), tool).toBe(TEAM_MODE_DENIAL)
+    }
   })
 
   it('lifts the gate once a teammate exists', async () => {

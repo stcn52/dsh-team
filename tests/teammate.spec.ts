@@ -43,6 +43,9 @@ beforeEach(() => {
   subagents.publishChild = (childId, parentId, options) => {
     agents.add(fakeAgent(String(childId), {
       parent: String(parentId),
+      // The host composition mounts the subagent-control row, so a child here
+      // inherits `send_message` exactly like a real teammate does.
+      globals: ['send_message'],
       ...typeof options?.model === 'string' ? { model: options.model } : {},
       ...typeof options?.reasoningEffort === 'string' ? { reasoningEffort: options.reasoningEffort } : {},
     }))
@@ -109,6 +112,40 @@ describe('composition', () => {
     child.release()
     expect(child.tools.registered).toEqual([])
     expect(child.prompt.sections).toEqual([])
+  })
+
+  it('hides the parent-addressed send_message so one report is not delivered twice', async () => {
+    const child = compose(await spawn('Alice'))
+    // The duplicate delivery: `send_message` reaches the same parent as
+    // `team_send`, so a member that reports through both puts the same report
+    // in the leader's mailbox twice. The control tool is restricted away.
+    expect(child.tools.restrictions).toEqual([{ deny: ['send_message'] }])
+    expect(child.tools.get('send_message')).toBeUndefined()
+  })
+
+  it('keeps the team mailbox through the same restriction', async () => {
+    const child = compose(await spawn('Alice'))
+    // `restrict()` filters what a scope INHERITS; team_send is registered into
+    // this child's own layer, so the mailbox survives by construction.
+    expect(child.tools.get('team_send')).toBeDefined()
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list'])
+  })
+
+  it('composes a teammate where no send_message exists to hide', async () => {
+    // A composition without the subagent-control row: nothing to hide, and
+    // restrict() rejects names the scope cannot see — probed, never assumed.
+    subagents.publishChild = (childId, parentId) => {
+      agents.add(fakeAgent(String(childId), { parent: String(parentId) }))
+    }
+    const child = compose(await spawn('Alice'))
+    expect(child.tools.restrictions).toEqual([])
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list'])
+  })
+
+  it('lifts the hide with the child scope', async () => {
+    const child = compose(await spawn('Alice'))
+    child.release()
+    expect(child.tools.restrictions).toEqual([])
   })
 })
 

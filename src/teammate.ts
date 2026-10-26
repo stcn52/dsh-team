@@ -53,6 +53,40 @@ function release(disposers: readonly (() => void)[]): void {
   if (failures.length > 1) throw new AggregateError(failures, 'dsh-team: teammate teardown failed')
 }
 
+/**
+ * The harness's id-addressed control tool, which reaches a member's direct
+ * parent — the very agent `team_send` addresses as "leader". A member that
+ * reports through both delivers the same report twice (three times when a
+ * retry lands as well), which the leader then reads as independent arrivals.
+ *
+ * It is hidden rather than discouraged: `restrict()` removes the tool from the
+ * child's INHERITED surface and leaves the child's own layer untouched, and
+ * that split is exactly what keeps the fix safe — `send_message` is a global
+ * registration from `@deepseek-ai/dsh-tool-subagent-control`, while
+ * `team_send` is registered into this child's own layer, so the team mailbox
+ * survives by construction rather than by name matching. A guard or a global
+ * deny would have to enumerate both and would take the mailbox with it.
+ */
+const PARENT_MAILBOX_TOOL = 'send_message'
+
+/**
+ * Take `send_message` out of one teammate's tool surface.
+ *
+ * The probe is not optional: `restrict()` rejects names the scope cannot see,
+ * and the control row is a separate composition row. A deployment without it
+ * has nothing to hide, and losing that nicety must never fail the member's
+ * whole composition (`installTeammateWorld` would roll it back), so an absent
+ * tool yields no restriction at all.
+ * @param child - the teammate whose scope is being composed.
+ * @returns the exact restriction disposer, or `undefined` when there is no
+ * `send_message` in this deployment to hide.
+ */
+function hideParentMailbox(child: Agent): (() => void) | undefined {
+  const tools = child.ctx.tools
+  if (tools.get(PARENT_MAILBOX_TOOL, child) === undefined) return undefined
+  return tools.restrict({ deny: [PARENT_MAILBOX_TOOL] })
+}
+
 type ChildSetup = (child: Agent) => () => void
 
 /** Observe the live agent registry so cold resumes and fresh children share one setup path. */
@@ -135,7 +169,8 @@ function briefing(ctx: Context, team: TeamService, child: Agent): string {
     tasks,
     ...assigned === undefined ? [] : [assigned],
     'Nobody sees your session but you, so deliver results to the leader with team_send — a self-contained answer, '
-    + 'not "done". Use team_send when you need something FROM a member mid-task; the reply arrives later as its '
+    + 'not "done". team_send is the only delivery channel inside a team: send_message is hidden here, so do not '
+    + 'call it. Use team_send when you need something FROM a member mid-task; the reply arrives later as its '
     + 'own turn, so do not wait for it in place. team_list shows the roster, the shared task list, and recent '
     + 'traffic. When you have sent the outcome, stop and wait for the next message instead of starting work nobody '
     + 'asked for. A conversation between teammates is budgeted: it may only relay so far and one pair may not '
@@ -164,6 +199,11 @@ export function installTeammateWorld(ctx: Context): () => void {
       }))
       disposers.push(childCtx.tools.register(sendTool(ctx, 'member')))
       disposers.push(childCtx.tools.register(listTool(ctx, 'member')))
+      // After both registrations: the restriction must be the thing that
+      // leaves the mailbox visible, not something a later registration
+      // re-adds. See {@link hideParentMailbox} for why it is a restriction.
+      const mailbox = hideParentMailbox(child)
+      if (mailbox !== undefined) disposers.push(mailbox)
     } catch (error: unknown) {
       release(disposers)
       throw error

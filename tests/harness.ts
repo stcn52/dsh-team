@@ -47,7 +47,8 @@ export interface FakeAgent {
 /**
  * Build one agent double.
  * @param id - the session id this agent is published under.
- * @param options - lineage (`parent` makes it a teammate) and route overrides.
+ * @param options - lineage (`parent` makes it a teammate), route overrides, and
+ * the global (inherited) tool names this scope can see.
  * @returns the double, already usable as an `Agent`.
  */
 export function fakeAgent(id: string, options: {
@@ -57,6 +58,7 @@ export function fakeAgent(id: string, options: {
   readonly model?: string
   readonly reasoningEffort?: string
   readonly events?: SessionEvent[]
+  readonly globals?: readonly string[]
 } = {}): FakeAgent {
   const self: FakeAgent = {
     id: SessionId(id),
@@ -88,6 +90,7 @@ export function fakeAgent(id: string, options: {
       return self as unknown as Agent
     },
   }
+  for (const name of options.globals ?? []) self.tools.inherited.add(name)
   self.ctx.provide('agent', self.agent)
   self.ctx.provide('tools', self.tools)
   self.ctx.provide('systemPrompt', self.prompt)
@@ -238,11 +241,25 @@ export interface FakeGuardExecution {
   readonly agent?: unknown
 }
 
+/** One `tools.restrict()` filter a scoped registry double accepted. */
+export interface FakeToolRestriction {
+  readonly allow?: readonly string[]
+  readonly deny?: readonly string[]
+}
+
 /** The `ctx.tools` double: registration, guards, and exact-disposer semantics. */
 export class FakeTools {
   readonly registered: RegisteredTool[] = []
   /** Monotonic guards, in registration order; the first denial wins. */
   readonly guards: Array<(execution: FakeGuardExecution) => string | undefined> = []
+  /**
+   * Global (inherited) tool names this scope can see. Registrations made
+   * through this double are scope-local, exactly like the real runtime's own
+   * layer — which is why {@link restrict} never touches them.
+   */
+  readonly inherited = new Set<string>()
+  /** Restrictions in registration order; they intersect. */
+  readonly restrictions: FakeToolRestriction[] = []
 
   register(definition: { name: string }): () => void {
     const entry: RegisteredTool = { name: definition.name, definition }
@@ -250,6 +267,42 @@ export class FakeTools {
     return () => {
       const index = this.registered.indexOf(entry)
       if (index >= 0) this.registered.splice(index, 1)
+    }
+  }
+
+  /**
+   * The `ToolRuntime.get` seam as one scope sees it: an own registration wins,
+   * an inherited name has to survive every restriction, and a restricted-away
+   * global reads as absent.
+   */
+  get(name: string): RegisteredTool | undefined {
+    const own = this.registered.find(tool => tool.name === name)
+    if (own !== undefined) return own
+    if (!this.inherited.has(name)) return undefined
+    const admitted = this.restrictions.every(filter =>
+      (filter.allow === undefined || filter.allow.includes(name))
+      && (filter.deny === undefined || !filter.deny.includes(name)))
+    return admitted ? { name, definition: { name } } : undefined
+  }
+
+  /**
+   * The `ToolRuntime.restrict` seam, including its failure contract: a filter
+   * naming a tool this scope cannot see throws, so a caller that fails to
+   * probe for the tool is caught here rather than in production.
+   */
+  restrict(filter: FakeToolRestriction): () => void {
+    const names = [...filter.allow ?? [], ...filter.deny ?? []]
+    if (names.length === 0) throw new Error('FakeTools.restrict({}) is a no-op')
+    const unknown = names.filter(name => !this.inherited.has(name))
+    if (unknown.length > 0) throw new Error(`FakeTools.restrict() names unknown global tool ${unknown.join(', ')}`)
+    const entry: FakeToolRestriction = {
+      ...filter.allow === undefined ? {} : { allow: [...filter.allow] },
+      ...filter.deny === undefined ? {} : { deny: [...filter.deny] },
+    }
+    this.restrictions.push(entry)
+    return () => {
+      const index = this.restrictions.indexOf(entry)
+      if (index >= 0) this.restrictions.splice(index, 1)
     }
   }
 
