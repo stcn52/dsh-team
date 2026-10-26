@@ -334,16 +334,19 @@ interface TeamListResult {
  *
  * The split answers two questions that must not be collapsed into one.
  * `whenIdle()` answers "is this member's turn over" — quiescence. `cold` answers
- * "did this member ever exist as a live session while we watched", which is the
- * question a leader asking "is everyone back" actually depends on: a member that
- * was never resident has not finished, it has not started, and reporting it as
- * done turns a broadcast that woke nobody into a completed round.
+ * "did anything observed show this member finishing", which is the question a
+ * leader asking "is everyone back" actually depends on: a member that no live
+ * session was ever seen for, and that has not written back either, may not have
+ * started — reporting it as done turns a broadcast that woke nobody into a
+ * completed round, while reporting it as "never started" is a claim the
+ * observation cannot support (it may have finished without reporting back).
  */
 interface TeamWaitResult {
   /**
-   * Members confirmed finished: `whenIdle()` settled during the observation, or
-   * the member was seen live during it and was no longer `running` when the wait
-   * ended (reaped included — a reaped agent occupies no turn).
+   * Members confirmed finished: `whenIdle()` settled during the observation, the
+   * member was seen live during it and was no longer `running` when the wait
+   * ended (reaped included — a reaped agent occupies no turn), or its session was
+   * already gone while the leader's mailbox held its report.
    */
   readonly done: readonly string[];
   /**
@@ -352,9 +355,12 @@ interface TeamWaitResult {
    */
   readonly busy: readonly string[];
   /**
-   * Members that never once appeared as a live agent during the observation: not
-   * resident, cold, or already reaped. Usually a delivery that has not been woken
-   * yet — NEVER a completion, and never part of `done`.
+   * Members with no live session at any point during the observation AND no
+   * report from them in the leader's mailbox: not resident, cold, or already
+   * reaped — and silent. Usually a delivery that has not been woken yet, but
+   * possibly a member that finished without writing back, so this is "not
+   * confirmed finished", NEVER evidence that the work came back, and never part
+   * of `done`.
    */
   readonly cold: readonly string[];
   /** Whether the budget expired before every target settled. */
@@ -557,14 +563,22 @@ declare class TeamService extends Service {
    *   that agent's status reads at the time.
    * - `whenIdle()` settling → `done`.
    * - At the deadline: `seen` and still `running` → `busy`; `seen` but no longer
-   *   running (idle or reaped) → `done`; **never `seen` → `cold`**.
+   *   running (idle or reaped) → `done`; never `seen` → `done` when the
+   *   leader's mailbox holds a report from it, `cold` otherwise.
    *
-   * A cold member is the bug this split fixes: "no agent in the registry" is not
-   * "finished", it is "never started". It is usually a `team_send` whose recipient
-   * has not been woken yet, and calling it done made a broadcast that reached
-   * nobody look like a completed round. Because nothing shorter than the caller's
-   * own budget can tell "woken in a moment" from "never woken", a cold member
-   * makes the wait run the full budget instead of answering at once.
+   * "No agent in the registry" is three histories, not one: never started, a
+   * delivery accepted but not yet published, or a turn that ran and was reaped
+   * before the first read. The first two must not be called done — that is the
+   * bug this split fixes, where a broadcast that reached nobody looked like a
+   * completed round — while the third MUST be: a member whose whole turn fits
+   * between the spawn and the wait (1.3 s in the host trace that found this) has
+   * finished, and reporting it as missing is its own false alarm. What separates
+   * them is the leader's own durable mailbox: a report from the member that
+   * nothing has been addressed to it since. A `cold` target therefore means
+   * "nothing observed says it finished", not "it never started", and because
+   * nothing shorter than the caller's own budget can tell "woken in a moment"
+   * from "never woken", it still makes the wait run the full budget rather than
+   * answer at once.
    *
    * The boundary this answer still carries: it reports **quiescence**, not
    * receipt. A member that is idle right now may already be holding a prompt
@@ -574,8 +588,8 @@ declare class TeamService extends Service {
    * indistinguishable from a member that was already idle.
    * @param actorAgent - the acting leader or teammate.
    * @param request - who to wait for, for how long, and the caller's signal.
-   * @returns who is done, who is still running, who never started, and whether
-   *   time ran out.
+   * @returns who is done, who is still running, who had no live session and no
+   *   report, and whether time ran out.
    * @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place
    *   (the leader itself included — it is the one waiting), `ABORTED` when the
    *   caller's signal fires, `NO_TEAM`/`LEADER_AWAY` when there is no team.
@@ -588,14 +602,22 @@ declare class TeamService extends Service {
    * The buckets are disjoint and their union is exactly `targets`: every target
    * is named once, under the first rule that fits. Rules in order:
    * 1. `settled` — `whenIdle()` resolved, so the member's turn really ended.
-   * 2. never `seen` — `cold`: no live agent existed for the whole window, so it
-   *    never started. It must not fall through to the quiescence rule.
-   * 3. `seen`, and no longer `running` at the end — `done`: resident and
+   * 2. never `seen`, but the leader's mailbox holds a message FROM it and nothing
+   *    has been addressed to it since — `done`: it finished a turn and reported
+   *    back, and the runtime has already reaped its session. "No live agent" is
+   *    three different states, and this is the one that used to be misread as
+   *    "never started" (a member whose whole turn fits between the spawn and the
+   *    first read of a wait leaves exactly this trace).
+   * 3. never `seen` and no such report — `cold`: no live agent existed for the
+   *    whole window AND the mailbox has no word from it, so nothing observed
+   *    says it ever finished. It must not fall through to the quiescence rule.
+   * 4. `seen`, and no longer `running` at the end — `done`: resident and
    *    quiescent now (or reaped, which occupies no turn either).
-   * 4. `seen` and still `running` — `busy`.
+   * 5. `seen` and still `running` — `busy`.
    * @param targets - the members this wait was asked about, in order.
    * @param observations - the live observation recorded per target, same order.
    * @param outcome - how the race ended.
+   * @param mailbox - the leader's durable mailbox feed, newest last.
    * @returns the four-field result.
    */
   private bucketOf;
@@ -642,7 +664,8 @@ declare class TeamService extends Service {
    *   in one tick. Nothing shorter than the caller's own budget can tell "woken
    *   in a moment" from "never woken", so subscribe to `agent/created` and join
    *   the normal `whenIdle()` path the moment this member is published; if that
-   *   never happens, the deadline ends the wait and the target is reported cold.
+   *   never happens, the deadline ends the wait and the target is classified by
+   *   what the mailbox says about it: reported back → done, silent → cold.
    *
    * The registry read and the subscription happen in the same tick, with no
    * `await` between them, so a publication cannot slip into the gap: either the

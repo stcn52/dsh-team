@@ -327,7 +327,7 @@ describe('team_wait', () => {
       { agent: leader.agent, signal: controller.signal } as unknown as ToolRunContext,
     )
     // All four buckets cross the seam: `cold` is the one that must not be lost,
-    // because dropping it turns "never started" back into silence.
+    // because dropping it turns "no live session" back into silence.
     expect(value).toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
     expect(team.calls).toEqual([{
       op: 'wait',
@@ -361,20 +361,27 @@ describe('team_wait', () => {
    * The prose is the only place a reader can tell the three states apart, so each
    * gets its own clause, and a wait that ended on the deadline must never read as
    * "all finished".
+   *
+   * `cold` reads "no live session": the wait saw no live agent and no report, and
+   * those two are produced by a member that has not been woken yet AND by one
+   * that finished without writing back. "Never started" asserts the first, which
+   * the observation cannot know.
    */
-  it('keeps "never started" out of the finished sentence', () => {
+  it('reports cold as "no live session" and never claims "never started"', () => {
     const tool = waitTool(ctx)
     const coldOnly = JSON.stringify(tool.output.render({}, {
       done: [], busy: [], cold: ['Carol'], timedOut: true,
     }))
-    expect(coldOnly).toContain('never started: Carol')
+    expect(coldOnly).toContain('no live session: Carol')
+    expect(coldOnly).not.toContain('never started')
     expect(coldOnly).not.toContain('all finished')
 
     const mixed = JSON.stringify(tool.output.render({}, {
       done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true,
     }))
     expect(mixed).toContain('still busy: Bob')
-    expect(mixed).toContain('never started: Carol')
+    expect(mixed).toContain('no live session: Carol')
+    expect(mixed).not.toContain('never started')
     expect(mixed).toContain('finished: Alice')
 
     const complete = JSON.stringify(tool.output.render({}, {
@@ -393,7 +400,8 @@ describe('team_wait', () => {
       content: [{ type: 'text', text }],
     } as unknown as ToolResult)
     expect(card).toMatchObject({ title: 'Waited for the team', content: [{ type: 'text', text }] })
-    expect(text).toContain('never started: Carol')
+    expect(text).toContain('no live session: Carol')
+    expect(text).not.toContain('never started')
   })
 })
 

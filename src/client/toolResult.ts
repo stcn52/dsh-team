@@ -106,10 +106,14 @@ function waitRecord(record: Fields): WaitReport | undefined {
  * The wait result, from its fact when a tool projects one and from its rendered
  * sentence otherwise.
  *
- * Two vocabularies are read on purpose. The wait tool renamed its clauses while
+ * Three vocabularies are read on purpose. The wait tool renamed its clauses while
  * this card was being written (`settled`/`still running` became
  * `finished`/`still busy`, and `cold` joined as `never started`), and sessions
- * logged before that rename still replay their old sentences through this card.
+ * logged before each rename still replay their old sentences through this card.
+ * The newest rename is the one that matters most: `never started` claimed a
+ * member had not begun, which the wait cannot know (a reaped member may have
+ * finished without reporting), so `cold` now reads `no live session` and BOTH
+ * labels are recognized.
  * @param meta - the settled call's `meta`, when it has one.
  * @param output - the settled call's text content.
  * @returns every field the source actually carried; unrecognised sources read
@@ -123,7 +127,7 @@ export function waitReport(meta: unknown, output: string): WaitReport {
   const sentence = output.trim()
   const done = after('finished', sentence) ?? after('settled', sentence)
   const busy = after('still busy', sentence) ?? after('still running', sentence)
-  const cold = after('never started', sentence)
+  const cold = after('no live session', sentence) ?? after('never started', sentence)
   // `timed out` and `returned early` are the two reasons a wait ends with
   // someone still out; only the first one means the budget ran out.
   const timedOut = /^timed out\b/u.test(sentence) ? true : /^returned early\b/u.test(sentence) ? false : undefined

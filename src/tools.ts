@@ -613,19 +613,22 @@ export function waitTool(ctx: Context): ToolDefinition {
     name: 'team_wait',
     description:
       'Block until teammates finish their current turn, then report who is done, who is still running, who '
-      + 'never started, and whether the timeout ran out. Use this — not repeated team_list calls — whenever '
-      + 'you need everyone "back" before you summarise: team_send only accepts a message and never answers, '
-      + 'so this is the only call that waits for the work itself. Read the answer for what it is: it reports '
-      + 'that nobody is running, not that your broadcast has been answered, and a teammate\'s reply reaches '
-      + 'you only when it calls team_send, arriving as your own next turn (team_list shows who has actually '
-      + 'written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for '
-      + 'every member when you name none, returns as soon as they are all done, and gives up after timeout_ms '
-      + `(default ${WAIT_DEFAULT_MS / 60_000} minutes, at most ${WAIT_MAX_MS / 60_000}) with timedOut: true, `
-      + 'the still-running members in busy, and the members that never appeared in cold. An idle member '
-      + 'counts as done. cold means those members had no live session at any point during the wait — usually '
-      + 'a delivery that has not been woken yet — so they are NOT finished and must not be summarised as if '
-      + 'they were; a member that never wakes therefore costs the whole budget instead of being waved through. '
-      + 'It only observes: it never spawns, wakes, messages or cancels anyone.',
+      + 'had no live session, and whether the timeout ran out. Use this — not repeated team_list calls — '
+      + 'whenever you need everyone "back" before you summarise: team_send only accepts a message and never '
+      + 'answers, so this is the only call that waits for the work itself. Read the answer for what it is: it '
+      + 'reports that nobody is running, not that your broadcast has been answered, and a teammate\'s reply '
+      + 'reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has '
+      + 'actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits '
+      + 'for every member when you name none, returns as soon as they are all done, and gives up after '
+      + `timeout_ms (default ${WAIT_DEFAULT_MS / 60_000} minutes, at most ${WAIT_MAX_MS / 60_000}) with `
+      + 'timedOut: true, the still-running members in busy, and the members that never showed a live session '
+      + 'in cold. An idle member counts as done, and so does a member whose session is already gone but whose '
+      + 'report is in your mailbox: a short turn can run and be reaped before this call takes its first look. '
+      + 'cold means no live session was seen for that member AND your mailbox holds no message from it, so it '
+      + 'is NOT finished as far as this call can tell — it may not have started yet, or it may have finished '
+      + 'without writing back — and a leader that summarises it as returned work is claiming more than the '
+      + 'wait observed. A member that never wakes therefore costs the whole budget instead of being waved '
+      + 'through. It only observes: it never spawns, wakes, messages or cancels anyone.',
     parameters: {
       members: {
         type: 'array',
@@ -648,7 +651,9 @@ export function waitTool(ctx: Context): ToolDefinition {
             type: 'array',
             required: true,
             items: { type: 'string' },
-            description: 'Members confirmed finished: their turn ended inside the wait. Never a cold member.',
+            description:
+              'Members confirmed finished: their turn ended inside the wait, or their session was already gone '
+              + 'while their report sat in your mailbox. Never a cold member.',
           },
           busy: {
             type: 'array',
@@ -662,7 +667,8 @@ export function waitTool(ctx: Context): ToolDefinition {
             items: { type: 'string' },
             description:
               'Members with no live session at any point during the wait (not resident, cold, or already '
-              + 'reaped). Usually a delivery that has not been woken yet — NOT a completion.',
+              + 'reaped) and no message from them in your mailbox. Usually a delivery that has not been '
+              + 'woken yet; never a completion, but not proof it never started either.',
           },
           timedOut: { type: 'boolean', required: true },
         },
@@ -675,7 +681,7 @@ export function waitTool(ctx: Context): ToolDefinition {
       title: args.members === undefined ? 'Wait for the team' : `Wait for ${args.members.join(', ')}`,
     }),
     // The card body is the same three-state sentence the model reads: a title
-    // alone cannot tell "finished" from "never started", and that pair is the one
+    // alone cannot tell "finished" from "no live session", and that pair is the one
     // a reviewer must not have to guess at.
     presentResult: (args, result) => result.isError
       ? done('Wait for teammates', `failed: ${failureText(result)}`)
@@ -703,16 +709,23 @@ export function waitTool(ctx: Context): ToolDefinition {
  * Render one `team_wait` answer as the three states a reader must keep apart.
  *
  * Every non-empty bucket gets its own clause, `busy` and `cold` first: a member
- * that is still running and a member that never started are both "not done", and
- * a sentence that only lists what finished would hide the difference. An expired
- * wait says so; a complete one claims nothing about the members it never saw.
+ * that is still running and a member nothing was observed finishing are both
+ * "not done", and a sentence that only lists what finished would hide the
+ * difference. An expired wait says so; a complete one claims nothing about the
+ * members it never saw.
+ *
+ * `cold` reads "no live session", not "never started": the wait saw no live
+ * agent for it and no report from it, which two very different histories produce
+ * — a member that has not been woken yet, and a member that finished without
+ * writing back. Neither the sentence nor the schema may assert the one it cannot
+ * see.
  * @param value - the tool's resolved result.
  * @returns the one-line summary.
  */
 function waitSummary(value: TeamWaitResult): string {
   const segments: string[] = []
   if (value.busy.length > 0) segments.push(`still busy: ${value.busy.join(', ')}`)
-  if (value.cold.length > 0) segments.push(`never started: ${value.cold.join(', ')}`)
+  if (value.cold.length > 0) segments.push(`no live session: ${value.cold.join(', ')}`)
   if (segments.length === 0) {
     return value.done.length === 0 ? 'nothing to wait for' : `all finished: ${value.done.join(', ')}`
   }

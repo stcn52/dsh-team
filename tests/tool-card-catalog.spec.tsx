@@ -112,8 +112,8 @@ describe('team_wait card', () => {
       content: [{ type: 'text', text: 'timed out — still busy: Bob; never started: Carol; finished: Alice' }],
     }))
 
-    expect(screen.getByText('1 finished · 1 still working · 1 never started · Timed out')).toBeTruthy()
-    expect(screen.getByText('Still working: Bob · Never started: Carol')).toBeTruthy()
+    expect(screen.getByText('1 finished · 1 still working · 1 no live session · Timed out')).toBeTruthy()
+    expect(screen.getByText('Still working: Bob · No live session: Carol')).toBeTruthy()
     expect(screen.getByRole('status').textContent).toBe('Waited')
   })
 
@@ -129,8 +129,8 @@ describe('team_wait card', () => {
       meta: { team: 'wait', done: ['Alice'], busy: [], cold: ['Carol'], timedOut: false },
     }))
 
-    expect(screen.getByText('1 finished · 1 never started')).toBeTruthy()
-    expect(screen.getByText('Never started: Carol')).toBeTruthy()
+    expect(screen.getByText('1 finished · 1 no live session')).toBeTruthy()
+    expect(screen.getByText('No live session: Carol')).toBeTruthy()
   })
 
   it('still says something when the result carries neither a fact nor a sentence', () => {

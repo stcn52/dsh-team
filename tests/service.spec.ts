@@ -11,7 +11,7 @@ import { TeamError } from '../src/errors.ts'
 import { TeamService } from '../src/service.ts'
 import type { TeamConfig } from '../src/config.ts'
 import {
-  FakeAgents, FakeLlm, FakeSubagents, fakeAgent, toolResultEvent, type FakeAgent,
+  FakeAgents, FakeLlm, FakeSubagents, fakeAgent, toolResultEvent, userMessageEvent, type FakeAgent,
 } from './harness.ts'
 
 const CONFIG: TeamConfig = {
@@ -1037,6 +1037,111 @@ describe('wait', () => {
     scene.agents.remove(alice.id)
 
     expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+  })
+
+  /**
+   * The reported false alarm, as a lock: a member that finished a whole turn
+   * between the spawn and the wait — the host trace showed 1.3 s — has already
+   * been reaped by the time the wait runs its first read. "No live agent" then
+   * means "nothing of it is left to watch", NOT "never started", and the trace of
+   * its work is its own report in the leader's mailbox. Calling that "never
+   * started" reports a completed member as missing.
+   */
+  it('counts a member that finished and was reaped, then reported back, as done', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // The only remaining trace: the leader's own log, exactly the two rows a
+    // finished turn leaves in it — the roster fact from the spawn, and the
+    // member's report folded into the mailbox. Nothing live is left: the session
+    // was reaped after the turn, which is the host trace.
+    scene.leader.session.events.push(
+      toolResultEvent({
+        team: 'member-added',
+        member: { memberId: alice.id, name: 'Alice', relation: 'managed' },
+      } as never),
+      userMessageEvent({
+        kind: 'team-message',
+        form: 'relay',
+        chainId: 'c1',
+        hop: 1,
+        senderSessionId: alice.id,
+        senderName: 'Alice',
+      }, 'OK'),
+    )
+    scene.agents.remove(alice.id)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+  })
+
+  /**
+   * The other side of the same judgement: the mailbox is checked PER MEMBER. A
+   * teammate that wrote back does not stand in for one that said nothing, so a
+   * roster with one report and one silent member still reports the silent member
+   * as cold.
+   */
+  it('keeps a member cold when the only mailbox rows come from someone else', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    scene.leader.session.events.push(
+      toolResultEvent({
+        team: 'member-added',
+        member: { memberId: bob.id, name: 'Bob', relation: 'managed' },
+      } as never),
+      userMessageEvent({
+        kind: 'team-message',
+        form: 'relay',
+        chainId: 'c2',
+        hop: 1,
+        senderSessionId: bob.id,
+        senderName: 'Bob',
+      }, 'done'),
+    )
+    // Alice never wrote back and nothing live is left of her.
+    scene.agents.remove(alice.id)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true })
+  })
+
+  /**
+   * Why the mailbox rule reads the LAST row naming the member instead of any row
+   * from it. A report from an earlier round is not evidence about this round: once
+   * the leader has addressed the member again, that delivery may simply not have
+   * woken it yet — the exact over-claim that made "no live agent means done" wrong
+   * the first time. The newer outbound row therefore outranks the older report.
+   */
+  it('does not count an older report as done once the member has been addressed again', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.session.events.push(
+      toolResultEvent({
+        team: 'member-added',
+        member: { memberId: alice.id, name: 'Alice', relation: 'managed' },
+      } as never),
+      // Its report from the previous round...
+      userMessageEvent({
+        kind: 'team-message',
+        form: 'relay',
+        chainId: 'c1',
+        hop: 1,
+        senderSessionId: alice.id,
+        senderName: 'Alice',
+      }, 'OK'),
+      // ...and a delivery the leader accepted after it, not yet woken.
+      toolResultEvent({
+        team: 'message',
+        messageId: 'm-2',
+        to: alice.id,
+        text: 'next round',
+        hop: 0,
+      } as never),
+    )
+    scene.agents.remove(alice.id)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
   })
 
   /**
