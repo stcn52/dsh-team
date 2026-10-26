@@ -12,6 +12,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { TeamError } from '../src/errors.ts'
 import { TeamService } from '../src/service.ts'
+import { SHARED_AREA, TeamWorkspace, type WorkspaceEntry } from '../src/workspace.ts'
 import type { TeamConfig } from '../src/config.ts'
 import {
   FakeAgents, FakeLlm, FakeSubagents, fakeAgent, inboxSplicedEvent, toolResultEvent, userMessageEvent,
@@ -686,6 +687,113 @@ describe('team read', () => {
     expect(roster?.self.name).toBe('Alice')
     expect(roster?.others.map(member => member.name)).toEqual(['Bob'])
     expect(scene.service.rosterFor(scene.leader.agent)).toBeUndefined()
+  })
+})
+
+/**
+ * One workspace over a fake storage domain: the real {@link TeamWorkspace}, so
+ * the board read under test is the one the composition attaches.
+ * @returns the workspace and the table behind it.
+ */
+function boardWorkspace(): TeamWorkspace {
+  const table = new FakeWorkspaceTable()
+  const domain = {
+    name: 'team_workspace',
+    table: () => table,
+    close: () => Promise.resolve(),
+  }
+  const ctx = { storageDomain: { open: () => Promise.resolve(domain) } } as unknown as Context
+  return new TeamWorkspace(ctx, CONFIG)
+}
+
+/** The one table of the workspace domain, as the storage form would hand it over. */
+class FakeWorkspaceTable {
+  readonly rows = new Map<string, WorkspaceEntry>()
+
+  get(key: string): WorkspaceEntry | undefined {
+    return this.rows.get(key)
+  }
+
+  entries(): IterableIterator<[string, WorkspaceEntry]> {
+    return [...this.rows.entries()][Symbol.iterator]()
+  }
+
+  async put(key: string, value: WorkspaceEntry): Promise<void> {
+    this.rows.set(key, value)
+    await Promise.resolve()
+  }
+
+  async delete(key: string): Promise<boolean> {
+    await Promise.resolve()
+    return this.rows.delete(key)
+  }
+}
+
+describe('the live shared board', () => {
+  it('shows what a teammate wrote, with its author and one-line preview', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const workspace = boardWorkspace()
+    scene.service.attachWorkspace(workspace)
+    await workspace.write(
+      String(scene.leader.id), SHARED_AREA, 'api decision', '\nwe keep v1\nmore detail', { id: 'child-1', name: 'Alice' }, 100,
+    )
+
+    const view = await scene.service.listWithBoard(scene.leader.agent)
+    expect(view.board).toEqual([{
+      key: 'api decision',
+      authorId: String(alice.id),
+      authorName: 'Alice',
+      updatedAt: 100,
+      preview: 'we keep v1',
+    }])
+  })
+
+  it('reads an empty board with no workspace attached, and keeps the roster', async () => {
+    const scene = world()
+    await spawn(scene, 'Alice', { childId: 'child-1' })
+    const view = await scene.service.listWithBoard(scene.leader.agent)
+    expect(view.board).toEqual([])
+    expect(view.members.map(member => member.name)).toEqual(['Alice'])
+  })
+
+  it('reads the workspace live: a later write is visible on the next read', async () => {
+    const scene = world()
+    await spawn(scene, 'Alice', { childId: 'child-1' })
+    await spawn(scene, 'Bob', { childId: 'child-2' })
+    const workspace = boardWorkspace()
+    scene.service.attachWorkspace(workspace)
+    const leaderId = String(scene.leader.id)
+    await workspace.write(leaderId, SHARED_AREA, 'plan', 'first', { id: 'child-1', name: 'Alice' }, 100)
+    expect((await scene.service.listWithBoard(scene.leader.agent)).board.map(entry => entry.preview))
+      .toEqual(['first'])
+
+    await workspace.write(leaderId, SHARED_AREA, 'plan', 'second', { id: 'child-2', name: 'Bob' }, 200)
+    expect((await scene.service.listWithBoard(scene.leader.agent)).board).toEqual([{
+      key: 'plan', authorId: 'child-2', authorName: 'Bob', updatedAt: 200, preview: 'second',
+    }])
+  })
+
+  it('keeps the roster available when the workspace cannot be read', async () => {
+    const scene = world()
+    await spawn(scene, 'Alice', { childId: 'child-1' })
+    scene.service.attachWorkspace({ index: () => Promise.reject(new Error('domain closed')) })
+
+    const view = await scene.service.listWithBoard(scene.leader.agent)
+    expect(view.board).toEqual([])
+    expect(view.members).toHaveLength(1)
+  })
+
+  it('empties the board once the workspace is detached', async () => {
+    const scene = world()
+    await spawn(scene, 'Alice', { childId: 'child-1' })
+    const workspace = boardWorkspace()
+    scene.service.attachWorkspace(workspace)
+    await workspace.write(String(scene.leader.id), SHARED_AREA, 'plan', 'ours', { id: 'child-1', name: 'Alice' }, 100)
+    expect((await scene.service.listWithBoard(scene.leader.agent)).board).toHaveLength(1)
+
+    scene.service.attachWorkspace(undefined)
+    expect((await scene.service.listWithBoard(scene.leader.agent)).board).toEqual([])
   })
 })
 

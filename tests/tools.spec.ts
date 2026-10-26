@@ -60,6 +60,22 @@ class FakeTeam {
 
   list(...args: unknown[]): unknown {
     this.record('list', ...args)
+    return this.teamRead()
+  }
+
+  async listWithBoard(...args: unknown[]): Promise<unknown> {
+    this.record('listWithBoard', ...args)
+    return {
+      ...this.teamRead(),
+      board: [
+        { key: 'plan', authorId: 'child-1', authorName: 'Alice', updatedAt: 200, preview: 'we keep v1' },
+        { key: 'risks', authorId: 'child-1', authorName: 'Alice', updatedAt: 100, preview: 'db migration first' },
+      ],
+    }
+  }
+
+  /** The roster read both list methods start from. */
+  private teamRead(): Record<string, unknown> {
     return {
       active: true,
       members: [{ memberId: 'child-1', name: 'Alice', relation: 'peer', status: 'running' }],
@@ -306,8 +322,56 @@ describe('team_list', () => {
       members: [{ memberId: 'child-1', name: 'Alice', relation: 'peer', status: 'running' }],
       tasks: [{ taskId: 't1', title: 'ship it', status: 'pending' }],
       messages: [{ from: 'leader', to: 'child-1', text: 'go' }],
+      board: [
+        { key: 'plan', author: 'Alice', updatedAt: 200, preview: 'we keep v1' },
+        { key: 'risks', author: 'Alice', updatedAt: 100, preview: 'db migration first' },
+      ],
     })
     expect(tool.presentCall?.({})).toMatchObject({ kind: 'read', title: 'Read the team' })
+  })
+
+  it('carries the shared board the team left behind, with author and preview', async () => {
+    const tool = listTool(ctx)
+    const value = await run(tool, {}, leader) as { board: unknown }
+    expect(value.board).toEqual([
+      { key: 'plan', author: 'Alice', updatedAt: 200, preview: 'we keep v1' },
+      { key: 'risks', author: 'Alice', updatedAt: 100, preview: 'db migration first' },
+    ])
+    // `list` is the synchronous roster; only the tool asks for the live board.
+    expect(team.calls.map(call => call.op)).toEqual(['listWithBoard'])
+    expect(tool.description).toContain('the shared board as it is right now')
+    expect(tool.description).toContain('not the snapshot in your projection')
+  })
+
+  it('renders board rows below the roster, newest first', async () => {
+    const tool = listTool(ctx)
+    const value = await run(tool, {}, leader)
+    const text = (tool.output.render({}, value)[0] as { text: string }).text
+    expect(text).toContain('1 teammate(s), 1 open task(s)')
+    expect(text).toContain('shared board (newest first):')
+    expect(text).toContain('plan — Alice — we keep v1')
+    expect(text.indexOf('plan — Alice')).toBeLessThan(text.indexOf('risks — Alice'))
+  })
+
+  it('bounds the rendered board at ten rows and counts the rest', () => {
+    const tool = listTool(ctx)
+    const board = Array.from({ length: 12 }, (_, index) => ({
+      key: `k${index}`, author: 'Alice', updatedAt: 1_000 - index, preview: `p${index}`,
+    }))
+    const text = (tool.output.render({}, {
+      active: true, members: [], tasks: [], messages: [], board,
+    })[0] as { text: string }).text
+    expect(text).toContain('k9 — Alice — p9')
+    expect(text).not.toContain('k10')
+    expect(text).toContain('+2 more')
+  })
+
+  it('renders no board section when the team left nothing', () => {
+    const tool = listTool(ctx)
+    const text = (tool.output.render({}, {
+      active: true, members: [], tasks: [], messages: [], board: [],
+    })[0] as { text: string }).text
+    expect(text).not.toContain('shared board')
   })
 
   it('summarises the team for the model in one line', async () => {

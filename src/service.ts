@@ -33,8 +33,8 @@ import type {} from '@deepseek-ai/dsh-subagent'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import {
-  EMPTY_TEAM_VIEW, type TeamChain, type TeamMemberView, type TeamMessageView, type TeamRelation,
-  type TeamTaskStatus, type TeamTaskView, type TeamView,
+  EMPTY_TEAM_VIEW, type TeamBoardEntryView, type TeamChain, type TeamMemberView, type TeamMessageView,
+  type TeamRelation, type TeamTaskStatus, type TeamTaskView, type TeamView,
 } from './contract.ts'
 import { TeamError } from './errors.ts'
 import { foldTeam, TEAM_MEMBER_RECORD, type TeamMemberFact, type TeamMemberRecord } from './fold.ts'
@@ -188,6 +188,34 @@ export interface TeamListResult {
 }
 
 /**
+ * The durable workspace, narrowed to the one read the team service makes of it.
+ *
+ * Structural on purpose: the service owns no storage and imports no workspace.
+ * A deployment without a storage-domain form simply never attaches a reader,
+ * and the board then reads as empty instead of the read failing. The shape
+ * matches `TeamWorkspace.index()`, so the composition attaches the workspace
+ * itself.
+ */
+export interface TeamBoardReader {
+  /**
+   * The shared area of one team's workspace, newest first.
+   * @param leaderId - the team's leader session id.
+   */
+  index(leaderId: string): Promise<readonly TeamBoardEntryView[]>
+}
+
+/**
+ * {@link TeamListResult} plus the shared board as it is right now.
+ *
+ * The board is read from the durable workspace, which teammates write without
+ * any session log recording it, so it cannot be folded out of the leader's own
+ * projection (that one is a snapshot of the last time the leader looked).
+ */
+export interface TeamListView extends TeamListResult {
+  readonly board: readonly TeamBoardEntryView[]
+}
+
+/**
  * What one `team_wait` observed when it returned: three disjoint buckets whose
  * union is exactly the set of targets the wait was asked about, named in the
  * order they were asked about, plus whether the clock ran out.
@@ -328,6 +356,12 @@ export class TeamService extends Service {
   private readonly teams = new Map<string, TeamState>()
   /** Spawns in flight, keyed by leader session id (team tools never overlap). */
   private readonly pending = new Map<string, PendingSpawn>()
+  /**
+   * The durable workspace whose shared area backs {@link listWithBoard}.
+   * Undefined in a composition without a storage domain, which is why the
+   * board read must degrade to empty instead of refusing the roster.
+   */
+  private boardReader: TeamBoardReader | undefined
 
   constructor(ctx: Context, private readonly config: TeamConfig) {
     super(ctx, 'team')
@@ -675,6 +709,19 @@ export class TeamService extends Service {
   }
 
   /**
+   * Attach — or detach — the durable workspace the shared board is read from.
+   *
+   * Called by the composition once the storage domain is open, and called with
+   * `undefined` when that form is disposed: the service outlives the domain, so
+   * a stale reader would otherwise keep a later `team_list` reading a closed
+   * table.
+   * @param reader - the workspace, or undefined to detach it.
+   */
+  attachWorkspace(reader: TeamBoardReader | undefined): void {
+    this.boardReader = reader
+  }
+
+  /**
    * The roster, task list, and recent leader-visible mailbox traffic, from the
    * point of view of any member of the team.
    * @param actorAgent - the acting leader or teammate.
@@ -693,6 +740,37 @@ export class TeamService extends Service {
       })),
       tasks: [...actor.team.tasks.values()],
       messages: [...view.messages],
+    }
+  }
+
+  /**
+   * {@link list} plus the team's shared board as it is RIGHT NOW.
+   *
+   * `list()` stays synchronous because two host seams it must serve are
+   * synchronous — the teammate briefing's `systemPrompt.section` text and the
+   * team-mode tool guard — while the board can only be read asynchronously from
+   * the durable workspace. That is why the live board is this additive read
+   * rather than a field `list()` fills: the roster keeps working for every
+   * synchronous caller, and `team_list` — the one call a leader reads to see
+   * what its team left behind — gets the live index.
+   *
+   * The read degrades instead of failing. `team_list` is a read, and a leader
+   * must keep its roster when the board is unreadable (no storage domain at all,
+   * a domain that failed to open, a disposed workspace): those all answer an
+   * empty board. The tradeoff is deliberate — an unreadable board and an empty
+   * one read the same here, and the roster stays available.
+   * @param actorAgent - the acting leader or teammate.
+   * @returns the live team read plus the shared board, newest first.
+   */
+  async listWithBoard(actorAgent: Agent): Promise<TeamListView> {
+    const view = this.list(actorAgent)
+    const actor = this.tryResolveActor(actorAgent)
+    const reader = this.boardReader
+    if (actor === undefined || reader === undefined) return { ...view, board: [] }
+    try {
+      return { ...view, board: await reader.index(actor.leader.id) }
+    } catch {
+      return { ...view, board: [] }
     }
   }
 

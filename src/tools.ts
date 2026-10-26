@@ -506,6 +506,14 @@ export function dismissTool(ctx: Context): ToolDefinition {
 }
 
 /**
+ * How many board entries `team_list` renders before collapsing the rest into
+ * one count. The board is an index, not a transcript: a leader that needs every
+ * key asks `team_board` for the rest, and an unbounded render would bury the
+ * roster the call was made for.
+ */
+const BOARD_RENDER_LIMIT = 10
+
+/**
  * `team_list` — the shared read every member uses to decide who to talk to.
  * @param ctx - context carrying the team service.
  * @param audience - whose reading of an empty team this registration serves.
@@ -514,11 +522,15 @@ export function dismissTool(ctx: Context): ToolDefinition {
 export function listTool(ctx: Context, audience: 'leader' | 'member' = 'leader'): ToolDefinition {
   const description = audience === 'leader'
     ? 'Read your team: every member with its role, relation and live state (running, idle, or ready to wake), '
-      + 'the shared task list, and the recent mailbox traffic. Use it before messaging or assigning work, and '
-      + 'to check whether a teammate is still busy. It reads a team you built yourself — before your first '
-      + 'team_spawn it reports an empty team, so do not call it to find out whether you have one.'
+      + 'the shared task list, the recent mailbox traffic, and the shared board as it is right now — every entry '
+      + 'a teammate left there, with its author and a one-line preview, newest first. That board is the live '
+      + 'workspace, not the snapshot in your projection, so this call alone answers "what did my team write down" '
+      + 'and you do not need team_board first to find out who wrote what. Use it before messaging or assigning '
+      + 'work, and to check whether a teammate is still busy. It reads a team you built yourself — before your '
+      + 'first team_spawn it reports an empty team, so do not call it to find out whether you have one.'
     : 'Read the team: every member with its role, relation and live state (running, idle, or ready to wake), '
-      + 'the shared task list, and the recent mailbox traffic the leader can see. Use it before messaging or '
+      + 'the shared task list, the recent mailbox traffic the leader can see, and the shared board as it is right '
+      + 'now — every entry on it, with its author and a one-line preview, newest first. Use it before messaging or '
       + 'assigning work, and to check whether a teammate is still busy.'
   return defineTool({
     name: 'team_list',
@@ -561,22 +573,48 @@ export function listTool(ctx: Context, audience: 'leader' | 'member' = 'leader')
               },
             },
           },
+          board: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                key: { type: 'string', required: true },
+                author: { type: 'string', required: true },
+                updatedAt: { type: 'number', required: true },
+                preview: { type: 'string', required: true },
+              },
+            },
+          },
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.active
+      render: (_args, value) => {
+        const lines = [value.active
           ? `${value.members.length} teammate(s), ${value.tasks.filter(task => task.status !== 'done').length} open task(s)`
           : audience === 'leader'
             ? 'no team yet — team_spawn starts one'
-            : 'the team is not readable from here right now; its main session is not loaded',
-      }],
+            : 'the team is not readable from here right now; its main session is not loaded']
+        // The board section appears only when the board holds something: an
+        // empty header on every call would read as "there is a board feature",
+        // not "your team wrote nothing yet".
+        if (value.board.length > 0) {
+          lines.push('shared board (newest first):')
+          for (const entry of value.board.slice(0, BOARD_RENDER_LIMIT)) {
+            lines.push(`${entry.key} — ${entry.author} — ${entry.preview}`)
+          }
+          if (value.board.length > BOARD_RENDER_LIMIT) {
+            lines.push(`+${value.board.length - BOARD_RENDER_LIMIT} more`)
+          }
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
     },
     presentCall: () => ({ card: 'generic', title: 'Read the team', kind: 'read' }),
     presentResult: (_args, result) => result.isError ? done('Read the team', 'failed') : done('Team state'),
-    execute(_args, exec) {
-      const team = ctx.team.list(actor(exec.agent))
-      return Promise.resolve({
+    async execute(_args, exec) {
+      const team = await ctx.team.listWithBoard(actor(exec.agent))
+      return {
         active: team.active,
         members: team.members.map(member => ({ ...memberValue(member), status: member.status })),
         tasks: team.tasks.map(task => ({
@@ -592,7 +630,13 @@ export function listTool(ctx: Context, audience: 'leader' | 'member' = 'leader')
           text: message.text,
           ...message.hop !== undefined ? { hop: message.hop } : {},
         })),
-      })
+        board: team.board.map(entry => ({
+          key: entry.key,
+          author: entry.authorName,
+          updatedAt: entry.updatedAt,
+          preview: entry.preview,
+        })),
+      }
     },
   })
 }

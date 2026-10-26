@@ -123,7 +123,16 @@ function equipLeaders(ctx: Context, install: (agent: Agent) => () => void): () =
 function installWorkspaces(ctx: Context, config: TeamConfig): void {
   ctx.inject(['storageDomain'], (workspaceCtx: Context) => {
     const workspace = new TeamWorkspace(workspaceCtx, config)
-    workspaceCtx.effect(() => () => { workspace.dispose() }, 'team: workspace domain')
+    // The service owns no storage, so the composition hands it the workspace the
+    // shared board is read from — `team_list` reads it live, because a teammate's
+    // note lands in this domain and in no session log. Detached with the form:
+    // the service outlives it, and a stale reader would read a closed table.
+    const team = workspaceCtx.team
+    team.attachWorkspace(workspace)
+    workspaceCtx.effect(() => () => {
+      team.attachWorkspace(undefined)
+      workspace.dispose()
+    }, 'team: workspace domain')
 
     // Notes outlive turns, not teams: a disbanded team's board and a dismissed
     // member's private pad have no owner left to read them.

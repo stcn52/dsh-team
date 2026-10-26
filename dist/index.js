@@ -1289,6 +1289,12 @@ var TeamService = class extends Service {
 	teams = /* @__PURE__ */ new Map();
 	/** Spawns in flight, keyed by leader session id (team tools never overlap). */
 	pending = /* @__PURE__ */ new Map();
+	/**
+	* The durable workspace whose shared area backs {@link listWithBoard}.
+	* Undefined in a composition without a storage domain, which is why the
+	* board read must degrade to empty instead of refusing the roster.
+	*/
+	boardReader;
 	constructor(ctx, config) {
 		super(ctx, "team");
 		this.config = config;
@@ -1581,6 +1587,18 @@ var TeamService = class extends Service {
 		};
 	}
 	/**
+	* Attach — or detach — the durable workspace the shared board is read from.
+	*
+	* Called by the composition once the storage domain is open, and called with
+	* `undefined` when that form is disposed: the service outlives the domain, so
+	* a stale reader would otherwise keep a later `team_list` reading a closed
+	* table.
+	* @param reader - the workspace, or undefined to detach it.
+	*/
+	attachWorkspace(reader) {
+		this.boardReader = reader;
+	}
+	/**
 	* The roster, task list, and recent leader-visible mailbox traffic, from the
 	* point of view of any member of the team.
 	* @param actorAgent - the acting leader or teammate.
@@ -1605,6 +1623,45 @@ var TeamService = class extends Service {
 			tasks: [...actor.team.tasks.values()],
 			messages: [...view.messages]
 		};
+	}
+	/**
+	* {@link list} plus the team's shared board as it is RIGHT NOW.
+	*
+	* `list()` stays synchronous because two host seams it must serve are
+	* synchronous — the teammate briefing's `systemPrompt.section` text and the
+	* team-mode tool guard — while the board can only be read asynchronously from
+	* the durable workspace. That is why the live board is this additive read
+	* rather than a field `list()` fills: the roster keeps working for every
+	* synchronous caller, and `team_list` — the one call a leader reads to see
+	* what its team left behind — gets the live index.
+	*
+	* The read degrades instead of failing. `team_list` is a read, and a leader
+	* must keep its roster when the board is unreadable (no storage domain at all,
+	* a domain that failed to open, a disposed workspace): those all answer an
+	* empty board. The tradeoff is deliberate — an unreadable board and an empty
+	* one read the same here, and the roster stays available.
+	* @param actorAgent - the acting leader or teammate.
+	* @returns the live team read plus the shared board, newest first.
+	*/
+	async listWithBoard(actorAgent) {
+		const view = this.list(actorAgent);
+		const actor = this.tryResolveActor(actorAgent);
+		const reader = this.boardReader;
+		if (actor === void 0 || reader === void 0) return {
+			...view,
+			board: []
+		};
+		try {
+			return {
+				...view,
+				board: await reader.index(actor.leader.id)
+			};
+		} catch {
+			return {
+				...view,
+				board: []
+			};
+		}
 	}
 	/**
 	* Block until the named teammates stop running, or until the budget expires.
@@ -3250,6 +3307,13 @@ function dismissTool(ctx) {
 	}));
 }
 /**
+* How many board entries `team_list` renders before collapsing the rest into
+* one count. The board is an index, not a transcript: a leader that needs every
+* key asks `team_board` for the rest, and an unbounded render would bury the
+* roster the call was made for.
+*/
+const BOARD_RENDER_LIMIT = 10;
+/**
 * `team_list` — the shared read every member uses to decide who to talk to.
 * @param ctx - context carrying the team service.
 * @param audience - whose reading of an empty team this registration serves.
@@ -3258,7 +3322,7 @@ function dismissTool(ctx) {
 function listTool(ctx, audience = "leader") {
 	return defineTool({
 		name: "team_list",
-		description: audience === "leader" ? "Read your team: every member with its role, relation and live state (running, idle, or ready to wake), the shared task list, and the recent mailbox traffic. Use it before messaging or assigning work, and to check whether a teammate is still busy. It reads a team you built yourself — before your first team_spawn it reports an empty team, so do not call it to find out whether you have one." : "Read the team: every member with its role, relation and live state (running, idle, or ready to wake), the shared task list, and the recent mailbox traffic the leader can see. Use it before messaging or assigning work, and to check whether a teammate is still busy.",
+		description: audience === "leader" ? "Read your team: every member with its role, relation and live state (running, idle, or ready to wake), the shared task list, the recent mailbox traffic, and the shared board as it is right now — every entry a teammate left there, with its author and a one-line preview, newest first. That board is the live workspace, not the snapshot in your projection, so this call alone answers \"what did my team write down\" and you do not need team_board first to find out who wrote what. Use it before messaging or assigning work, and to check whether a teammate is still busy. It reads a team you built yourself — before your first team_spawn it reports an empty team, so do not call it to find out whether you have one." : "Read the team: every member with its role, relation and live state (running, idle, or ready to wake), the shared task list, the recent mailbox traffic the leader can see, and the shared board as it is right now — every entry on it, with its author and a one-line preview, newest first. Use it before messaging or assigning work, and to check whether a teammate is still busy.",
 		parameters: {},
 		output: {
 			schema: {
@@ -3320,13 +3384,47 @@ function listTool(ctx, audience = "leader") {
 								hop: { type: "number" }
 							}
 						}
+					},
+					board: {
+						type: "array",
+						required: true,
+						items: {
+							type: "object",
+							additionalProperties: false,
+							properties: {
+								key: {
+									type: "string",
+									required: true
+								},
+								author: {
+									type: "string",
+									required: true
+								},
+								updatedAt: {
+									type: "number",
+									required: true
+								},
+								preview: {
+									type: "string",
+									required: true
+								}
+							}
+						}
 					}
 				}
 			},
-			render: (_args, value) => [{
-				type: "text",
-				text: value.active ? `${value.members.length} teammate(s), ${value.tasks.filter((task) => task.status !== "done").length} open task(s)` : audience === "leader" ? "no team yet — team_spawn starts one" : "the team is not readable from here right now; its main session is not loaded"
-			}]
+			render: (_args, value) => {
+				const lines = [value.active ? `${value.members.length} teammate(s), ${value.tasks.filter((task) => task.status !== "done").length} open task(s)` : audience === "leader" ? "no team yet — team_spawn starts one" : "the team is not readable from here right now; its main session is not loaded"];
+				if (value.board.length > 0) {
+					lines.push("shared board (newest first):");
+					for (const entry of value.board.slice(0, BOARD_RENDER_LIMIT)) lines.push(`${entry.key} — ${entry.author} — ${entry.preview}`);
+					if (value.board.length > BOARD_RENDER_LIMIT) lines.push(`+${value.board.length - BOARD_RENDER_LIMIT} more`);
+				}
+				return [{
+					type: "text",
+					text: lines.join("\n")
+				}];
+			}
 		},
 		presentCall: () => ({
 			card: "generic",
@@ -3334,9 +3432,9 @@ function listTool(ctx, audience = "leader") {
 			kind: "read"
 		}),
 		presentResult: (_args, result) => result.isError ? done("Read the team", "failed") : done("Team state"),
-		execute(_args, exec) {
-			const team = ctx.team.list(actor(exec.agent));
-			return Promise.resolve({
+		async execute(_args, exec) {
+			const team = await ctx.team.listWithBoard(actor(exec.agent));
+			return {
 				active: team.active,
 				members: team.members.map((member) => ({
 					...memberValue(member),
@@ -3354,8 +3452,14 @@ function listTool(ctx, audience = "leader") {
 					to: message.to ?? "leader",
 					text: message.text,
 					...message.hop !== void 0 ? { hop: message.hop } : {}
+				})),
+				board: team.board.map((entry) => ({
+					key: entry.key,
+					author: entry.authorName,
+					updatedAt: entry.updatedAt,
+					preview: entry.preview
 				}))
-			});
+			};
 		}
 	});
 }
@@ -4450,7 +4554,7 @@ function briefing(ctx, team, child) {
 		list,
 		mine.length === 0 ? "No task on the shared list is assigned to you right now." : `Assigned to you on the shared task list: ${mine.map((task) => `${task.taskId} "${task.title}"`).join("; ")}.`,
 		...assigned === void 0 ? [] : [assigned],
-		"Nobody sees your session but you, so deliver results to the leader with team_send — a self-contained answer, not \"done\". team_send is the only delivery channel inside a team: send_message is hidden here, so do not call it. Use team_send when you need something FROM a member mid-task; the reply arrives later as its own turn, so do not wait for it in place. team_list shows the roster, the shared task list, and recent traffic. When you have sent the outcome, stop and wait for the next message instead of starting work nobody asked for. A conversation between teammates is budgeted: it may only relay so far and one pair may not keep trading messages inside it, so put everything you need into one message rather than negotiating. Reaching the leader is never refused — when an exchange with a peer stops converging, say so to the leader and move on."
+		"Nobody sees your session but you, so deliver results to the leader with team_send — a self-contained answer, not \"done\". team_send is the only delivery channel inside a team: send_message is hidden here, so do not call it. Use team_send when you need something FROM a member mid-task; the reply arrives later as its own turn, so do not wait for it in place. team_list shows the roster, the shared task list, the shared board, and recent traffic. When you have sent the outcome, stop and wait for the next message instead of starting work nobody asked for. A conversation between teammates is budgeted: it may only relay so far and one pair may not keep trading messages inside it, so put everything you need into one message rather than negotiating. Reaching the leader is never refused — when an exchange with a peer stops converging, say so to the leader and move on."
 	].join("\n");
 }
 /**
@@ -4692,7 +4796,10 @@ function equipLeaders(ctx, install) {
 function installWorkspaces(ctx, config) {
 	ctx.inject(["storageDomain"], (workspaceCtx) => {
 		const workspace = new TeamWorkspace(workspaceCtx, config);
+		const team = workspaceCtx.team;
+		team.attachWorkspace(workspace);
 		workspaceCtx.effect(() => () => {
+			team.attachWorkspace(void 0);
 			workspace.dispose();
 		}, "team: workspace domain");
 		workspaceCtx.on("team/changed", (payload) => {
