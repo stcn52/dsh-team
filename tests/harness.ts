@@ -36,6 +36,12 @@ export interface FakeAgent {
   readonly tools: FakeTools
   readonly prompt: FakeSystemPrompt
   readonly received: AcceptedMessage[]
+  /**
+   * The pending-work queue the real Agent publishes as `inbox`. `send` routes
+   * into it exactly as the runtime does, so a test can also seed one directly:
+   * a message sitting here has been accepted but not yet spliced into the log.
+   */
+  readonly inbox: { readonly nextTurn: UserMessage[]; readonly nextStep: UserMessage[] }
   /** Messages accepted through `steer` (the command plane's submission path). */
   readonly steered: UserMessage[]
   /** Resolvers of `whenIdle()` calls still pending, oldest first. */
@@ -87,11 +93,16 @@ export function fakeAgent(id: string, options: {
     tools: new FakeTools(),
     prompt: new FakeSystemPrompt(),
     received: [],
+    inbox: { nextTurn: [], nextStep: [] },
     steered: [],
     idleWaiters: [],
     idleCalls: 0,
     send(message, target, wakeup) {
       this.received.push({ message, target, wakeup })
+      // The real `Agent.send` parks the message on the chosen inbox boundary;
+      // mirroring that is what lets a test read the queue a wait sees.
+      if (target === 'next-step') this.inbox.nextStep.push(message)
+      else this.inbox.nextTurn.push(message)
     },
     steer(message) {
       this.steered.push(message)

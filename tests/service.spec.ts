@@ -6,6 +6,9 @@
  */
 
 import { Context } from '@deepseek-ai/cordis'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { TeamError } from '../src/errors.ts'
 import { TeamService } from '../src/service.ts'
@@ -105,6 +108,37 @@ async function spawn(scene: World, name: string, options: {
   const child = scene.agents.getFake(member.memberId)
   if (child === undefined) throw new Error(`published child ${member.memberId} is missing`)
   return child
+}
+
+/**
+ * Build one leader-inbox message the way the runtime's continuation manager
+ * does when a teammate's turn ends: the settlement notice, which lands on
+ * `next-step` and is spliced into the log only at the next step boundary.
+ * @param memberId - the child session that settled.
+ * @param summary - the one-line account the notice carries.
+ * @returns the queued message.
+ */
+function settlementNotice(memberId: string, summary = 'Alice finished.'): UserMessage {
+  return createUserMessage({
+    content: [{ type: 'text', text: summary }],
+    source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: SessionId(memberId) },
+  })
+}
+
+/**
+ * Build one queued `team_send` reply from a teammate into the leader's inbox.
+ * @param memberId - the sending member's session id.
+ * @param name - the sender's display name.
+ * @param text - the reply body.
+ * @returns the queued message.
+ */
+function queuedReply(memberId: string, name: string, text = 'OK'): UserMessage {
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'team-message', form: 'relay', senderSessionId: memberId, senderName: name, chainId: 'c1', hop: 0,
+    },
+  })
 }
 
 describe('spawn', () => {
@@ -1142,6 +1176,99 @@ describe('wait', () => {
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
       .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+  })
+
+  /**
+   * The reported bug, as a lock. A member that was sent "just reply OK" answers
+   * and its whole turn fits between the delivery and the wait — so when the wait
+   * reads the registry the member is already reaped, and its report has not
+   * reached the log yet either: the runtime parks the settlement notice in the
+   * LEADER'S INBOX, and the log only sees it at the next step boundary. The
+   * session log alone therefore said "no live session, no report" and the leader
+   * was told `cold` about a member that had already answered.
+   */
+  it('counts a member whose settlement notice is queued in the leader inbox as done', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.agents.remove(alice.id)
+    // Exact shape the harness's continuation manager queues on next-step.
+    scene.leader.inbox.nextStep.push(settlementNotice(alice.id))
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+  })
+
+  /**
+   * The same judgement for the other queued shape: a member that answered
+   * through `team_send` leaves the delivery itself parked on `next-turn`.
+   */
+  it('counts a member whose queued team_send reply has not been consumed yet as done', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.agents.remove(alice.id)
+    scene.leader.inbox.nextTurn.push(queuedReply(alice.id, 'Alice'))
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+  })
+
+  /**
+   * The inbox rule is per member, not "somebody reported": Bob's queued reply
+   * says nothing about Alice, so Alice stays cold.
+   */
+  it('does not credit a member with another member\u2019s queued report', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    scene.agents.remove(alice.id)
+    scene.agents.remove(bob.id)
+    scene.leader.inbox.nextStep.push(settlementNotice(bob.id, 'Bob finished.'))
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true })
+  })
+
+  /**
+   * The over-claim the inbox rule must not introduce. A reply from the previous
+   * round may still be queued, because nothing has consumed it yet; once the
+   * leader delivers a NEW task to that member, the old reply is no evidence
+   * about the new one, which may simply not have been woken. The delivery
+   * therefore freezes whatever was already queued, and only a message that
+   * arrives after it can count.
+   */
+  it('does not count a queued reply from an earlier round once a new delivery is pending', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // Round one's answer, still sitting in the queue...
+    scene.leader.inbox.nextTurn.push(queuedReply(alice.id, 'Alice'))
+    scene.agents.remove(alice.id)
+    // ...and round two's task, accepted but not woken yet.
+    await scene.service.send(scene.leader.agent, 'Alice', 'one more thing', signal)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+  })
+
+  /**
+   * The queue is read per target and still lands each member in exactly one
+   * bucket: one running, one finished with its notice queued, one silent.
+   */
+  it('keeps the three buckets disjoint when a member reports through the inbox', async () => {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3 } })
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    const carol = await spawn(scene, 'Carol', { childId: 'child-3' })
+    alice.status = 'running'
+    scene.agents.remove(bob.id)
+    scene.agents.remove(carol.id)
+    scene.leader.inbox.nextStep.push(settlementNotice(bob.id, 'Bob finished.'))
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], cold: ['Carol'], timedOut: true })
+
+    const flat = [...observed.done, ...observed.busy, ...observed.cold]
+    expect(new Set(flat).size).toBe(flat.length)
+    expect([...flat].sort()).toEqual(['Alice', 'Bob', 'Carol'])
   })
 
   /**

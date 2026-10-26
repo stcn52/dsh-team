@@ -1300,6 +1300,7 @@ var TeamService = class extends Service {
 			members: new Map(view.members.map((member) => [member.memberId, memberFact(member)])),
 			tasks: new Map(view.tasks.map((task) => [task.taskId, task])),
 			inbox: /* @__PURE__ */ new Map(),
+			staleReports: /* @__PURE__ */ new Map(),
 			chains: /* @__PURE__ */ new Map(),
 			started: 0
 		};
@@ -1533,6 +1534,7 @@ var TeamService = class extends Service {
 			actor.team.members.clear();
 			actor.team.tasks.clear();
 			actor.team.inbox.clear();
+			actor.team.staleReports.clear();
 			actor.team.chains.clear();
 			actor.team.active = false;
 			this.publish(actor.leader, {
@@ -1550,6 +1552,7 @@ var TeamService = class extends Service {
 		this.stopMember(actor.leader, recipient.id);
 		actor.team.members.delete(recipient.id);
 		actor.team.inbox.delete(recipient.id);
+		actor.team.staleReports.delete(recipient.id);
 		this.publish(actor.leader, {
 			version: 1,
 			op: "remove",
@@ -1607,8 +1610,9 @@ var TeamService = class extends Service {
 	*   that agent's status reads at the time.
 	* - `whenIdle()` settling → `done`.
 	* - At the deadline: `seen` and still `running` → `busy`; `seen` but no longer
-	*   running (idle or reaped) → `done`; never `seen` → `done` when the
-	*   leader's mailbox holds a report from it, `cold` otherwise.
+	*   running (idle or reaped) → `done`; never `seen` → `done` when the leader
+	*   holds a report from it — queued in its inbox for this round, or in its
+	*   durable mailbox with nothing addressed to it since — and `cold` otherwise.
 	*
 	* "No agent in the registry" is three histories, not one: never started, a
 	* delivery accepted but not yet published, or a turn that ran and was reaped
@@ -1617,12 +1621,17 @@ var TeamService = class extends Service {
 	* completed round — while the third MUST be: a member whose whole turn fits
 	* between the spawn and the wait (1.3 s in the host trace that found this) has
 	* finished, and reporting it as missing is its own false alarm. What separates
-	* them is the leader's own durable mailbox: a report from the member that
-	* nothing has been addressed to it since. A `cold` target therefore means
-	* "nothing observed says it finished", not "it never started", and because
-	* nothing shorter than the caller's own budget can tell "woken in a moment"
-	* from "never woken", it still makes the wait run the full budget rather than
-	* answer at once.
+	* them is the leader's own report trail. The durable mailbox alone was not
+	* enough: a report reaches that log only at the leader's next step boundary,
+	* so a wait issued in the same turn saw "no live session, no report" for a
+	* member that had already answered while the report sat in the inbox queue.
+	* The queue is therefore read first (see {@link reportedIntoInbox}), with the
+	* mailbox as the already-spliced half of the same question, and the delivery
+	* boundary keeps an older round's reply from standing in for this one. A
+	* `cold` target therefore means "nothing observed says it finished", not "it
+	* never started", and because nothing shorter than the caller's own budget can
+	* tell "woken in a moment" from "never woken", it still makes the wait run the
+	* full budget rather than answer at once.
 	*
 	* The boundary this answer still carries: it reports **quiescence**, not
 	* receipt. A member that is idle right now may already be holding a prompt
@@ -1664,7 +1673,7 @@ var TeamService = class extends Service {
 			for (const stop of watch) stop();
 			watch.clear();
 		}
-		return this.bucketOf(targets, observations, outcome, this.durableView(actor.leader).messages);
+		return this.bucketOf(actor, targets, observations, outcome, this.durableView(actor.leader).messages);
 	}
 	/**
 	* Split the observed targets into the three disjoint buckets, from what the
@@ -1673,25 +1682,28 @@ var TeamService = class extends Service {
 	* The buckets are disjoint and their union is exactly `targets`: every target
 	* is named once, under the first rule that fits. Rules in order:
 	* 1. `settled` — `whenIdle()` resolved, so the member's turn really ended.
-	* 2. never `seen`, but the leader's mailbox holds a message FROM it and nothing
-	*    has been addressed to it since — `done`: it finished a turn and reported
-	*    back, and the runtime has already reaped its session. "No live agent" is
-	*    three different states, and this is the one that used to be misread as
-	*    "never started" (a member whose whole turn fits between the spawn and the
-	*    first read of a wait leaves exactly this trace).
+	* 2. never `seen`, but the leader's inbox queue holds a report FROM it that
+	*    arrived after its latest delivery, or its durable mailbox holds one and
+	*    nothing has been addressed to it since — `done`: it finished a turn and
+	*    reported back, and the runtime has already reaped its session. "No live
+	*    agent" is three different states, and this is the one that used to be
+	*    misread as "never started" (a member whose whole turn fits between the
+	*    spawn and the first read of a wait leaves exactly this trace).
 	* 3. never `seen` and no such report — `cold`: no live agent existed for the
-	*    whole window AND the mailbox has no word from it, so nothing observed
-	*    says it ever finished. It must not fall through to the quiescence rule.
+	*    whole window AND neither mailbox nor inbox has a word from it, so nothing
+	*    observed says it ever finished. It must not fall through to the
+	*    quiescence rule.
 	* 4. `seen`, and no longer `running` at the end — `done`: resident and
 	*    quiescent now (or reaped, which occupies no turn either).
 	* 5. `seen` and still `running` — `busy`.
+	* @param actor - the team, and the leader whose inbox queue is read.
 	* @param targets - the members this wait was asked about, in order.
 	* @param observations - the live observation recorded per target, same order.
 	* @param outcome - how the race ended.
 	* @param mailbox - the leader's durable mailbox feed, newest last.
 	* @returns the four-field result.
 	*/
-	bucketOf(targets, observations, outcome, mailbox) {
+	bucketOf(actor, targets, observations, outcome, mailbox) {
 		const done = [];
 		const busy = [];
 		const cold = [];
@@ -1702,7 +1714,7 @@ var TeamService = class extends Service {
 				return;
 			}
 			if (!observation.seen) {
-				if (reportedBack(mailbox, target.memberId)) {
+				if (this.reportedIntoInbox(actor, target.memberId, mailbox) || reportedBack(mailbox, target.memberId)) {
 					done.push(target.name);
 					return;
 				}
@@ -2130,7 +2142,55 @@ var TeamService = class extends Service {
 			actor.leader.send(message, "next-turn", true);
 			return message.id;
 		}
+		this.freezeQueuedReports(actor, recipient.id);
 		return await queueHostSubagentPrompt(this.ctx.subagents, actor.leader, SessionId(recipient.id), content, source, signal);
+	}
+	/**
+	* Remember which of this member's messages are already waiting in the
+	* leader's inbox, right before a task is delivered to it.
+	*
+	* A queued message carries no timestamp, so "is this reply about the task I
+	* just sent" cannot be read off the queue afterwards. Delivery time is the
+	* one moment that answers it: everything queued now belongs to an earlier
+	* round, everything queued later is an answer to this one. Overwritten on
+	* every delivery (only the latest boundary matters) and kept in memory: it
+	* describes this process's live queue, not durable state.
+	* @param actor - the team, and the leader whose inbox is the queue.
+	* @param memberId - the member the task is being delivered to.
+	*/
+	freezeQueuedReports(actor, memberId) {
+		const stale = /* @__PURE__ */ new Set();
+		for (const message of [...actor.leader.inbox.nextTurn, ...actor.leader.inbox.nextStep]) if (reportSenderOf(message.source) === memberId) stale.add(String(message.id));
+		actor.team.staleReports.set(memberId, stale);
+	}
+	/**
+	* Whether this round's completion is already sitting in the leader's inbox.
+	*
+	* The completion message is the one trace a finished member leaves when its
+	* turn ends before the wait's first read: the runtime parks the settlement
+	* notice on `next-step` (and a `team_send` reply on `next-turn`), and the
+	* leader's log only receives it at the next step boundary — which is AFTER
+	* this tool call. So the log alone reports "no live session, no report" for a
+	* member that has already answered, while the queue already holds the answer.
+	*
+	* Freshness is the delicate half: a reply that was queued BEFORE the latest
+	* delivery belongs to the previous round and says nothing about the task just
+	* sent. {@link freezeQueuedReports} is the boundary; see
+	* {@link TeamState.staleReports}.
+	* @param actor - the team, and the leader whose inbox is read.
+	* @param memberId - the member whose report is being looked for.
+	* @param mailbox - the leader's durable mailbox rows, newest last, used only
+	*   when this process never delivered to this member (no freeze boundary).
+	* @returns true when the queue holds a report from this member about the
+	*   current round.
+	*/
+	reportedIntoInbox(actor, memberId, mailbox) {
+		const queued = [];
+		for (const message of [...actor.leader.inbox.nextTurn, ...actor.leader.inbox.nextStep]) if (reportSenderOf(message.source) === memberId) queued.push(String(message.id));
+		if (queued.length === 0) return false;
+		const stale = actor.team.staleReports.get(memberId);
+		if (stale !== void 0) return queued.some((id) => !stale.has(id));
+		return !mailbox.some((row) => row.from === memberId || row.to === memberId) || reportedBack(mailbox, memberId);
 	}
 	/**
 	* The route this spawn runs on. A request that names its own provider or
@@ -2254,6 +2314,28 @@ function reportedBack(mailbox, memberId) {
 		if (row.to === memberId) return false;
 	}
 	return false;
+}
+/**
+* The sender one queued leader-inbox message is attributed to, or undefined
+* when the message is not a teammate report at all.
+*
+* Two kinds carry a member's report into the leader's inbox:
+* - `team-message`, built by this plugin's `deliver` for an explicit
+*   `team_send` reply (`senderSessionId`, `senderName`, `chainId`, `hop`);
+* - `subagent-settled`, built by the harness's continuation manager when the
+*   child's turn ends (`form: 'notice'`, `summary`, `senderSessionId`). This is
+*   what a member that simply ANSWERS leaves behind — the reported bug's shape.
+* Reading the sender, not the text, is what makes the answer per-member.
+* @param source - the message's durable attribution.
+* @returns the sender's session id, or undefined for any other source.
+*/
+function reportSenderOf(source) {
+	if (typeof source !== "object" || source === null) return void 0;
+	const record = source;
+	const kind = record["kind"];
+	if (kind !== "team-message" && kind !== "subagent-settled") return void 0;
+	const sender = record["senderSessionId"];
+	return typeof sender === "string" ? sender : void 0;
 }
 /**
 * Clamp one requested wait budget into the window `team_wait` honours: an
@@ -3081,7 +3163,7 @@ function listTool(ctx, audience = "leader") {
 function waitTool(ctx) {
 	return defineTool({
 		name: "team_wait",
-		description: `Block until teammates finish their current turn, then report who is done, who is still running, who had no live session, and whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all done, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true, the still-running members in busy, and the members that never showed a live session in cold. An idle member counts as done, and so does a member whose session is already gone but whose report is in your mailbox: a short turn can run and be reaped before this call takes its first look. cold means no live session was seen for that member AND your mailbox holds no message from it, so it is NOT finished as far as this call can tell — it may not have started yet, or it may have finished without writing back — and a leader that summarises it as returned work is claiming more than the wait observed. A member that never wakes therefore costs the whole budget instead of being waved through. It only observes: it never spawns, wakes, messages or cancels anyone.`,
+		description: `Block until teammates finish their current turn, then report who is done, who is still running, who had no live session, and whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all done, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true, the still-running members in busy, and the members that never showed a live session in cold. An idle member counts as done, and so does a member whose session is already gone but whose report has reached you — queued in your own inbox, or already in your mailbox: a short turn can run and be reaped before this call takes its first look, and its settlement notice waits in your inbox until your next turn starts. cold means no live session was seen for that member AND neither your inbox nor your mailbox holds a report from it about this round, so it is NOT finished as far as this call can tell — it may not have started yet, or it may have finished without writing back — and a leader that summarises it as returned work is claiming more than the wait observed. A member that never wakes therefore costs the whole budget instead of being waved through. It only observes: it never spawns, wakes, messages or cancels anyone.`,
 		parameters: {
 			members: {
 				type: "array",
@@ -3102,7 +3184,7 @@ function waitTool(ctx) {
 						type: "array",
 						required: true,
 						items: { type: "string" },
-						description: "Members confirmed finished: their turn ended inside the wait, or their session was already gone while their report sat in your mailbox. Never a cold member."
+						description: "Members confirmed finished: their turn ended inside the wait, or their session was already gone while their report had reached you (queued in your inbox, or already in your mailbox). Never a cold member."
 					},
 					busy: {
 						type: "array",
@@ -3114,7 +3196,7 @@ function waitTool(ctx) {
 						type: "array",
 						required: true,
 						items: { type: "string" },
-						description: "Members with no live session at any point during the wait (not resident, cold, or already reaped) and no message from them in your mailbox. Usually a delivery that has not been woken yet; never a completion, but not proof it never started either."
+						description: "Members with no live session at any point during the wait (not resident, cold, or already reaped) and no report from them about this round in your inbox or mailbox. Usually a delivery that has not been woken yet; never a completion, but not proof it never started either."
 					},
 					timedOut: {
 						type: "boolean",
