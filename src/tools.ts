@@ -209,6 +209,16 @@ export function spawnTool(ctx: Context): ToolDefinition {
 }
 
 /**
+ * The `to` argument as one card line. A broadcast is one message to several
+ * mailboxes, so its card names them all instead of hiding all but the first.
+ * @param to - the recipient argument as the model sent it.
+ * @returns the address text a card can show.
+ */
+function addressLabel(to: string | readonly string[]): string {
+  return typeof to === 'string' ? to : to.join(', ')
+}
+
+/**
  * `team_send` — the mailbox, shared by the leader and every teammate. The
  * service decides what the caller's relation allows.
  * @param ctx - context carrying the team service.
@@ -218,11 +228,17 @@ export function spawnTool(ctx: Context): ToolDefinition {
 export function sendTool(ctx: Context, audience: 'leader' | 'member'): ToolDefinition {
   const description = audience === 'leader'
     ? 'Send a message to one teammate you have already spawned — with no team yet there is nobody to write '
-      + 'to, so team_spawn comes first. It becomes that teammate\'s next turn: if it is busy, the message '
+      + 'to, so team_spawn comes first. Address a member by name or id, pass a list of addresses, or pass "*" '
+      + 'for everyone else on the team, and the same message goes to each of them in one call. A broadcast is '
+      + 'all-or-nothing: every address and every rule is checked before anything is sent, so one bad name '
+      + 'delivers to nobody. It becomes that teammate\'s next turn: if it is busy, the message '
       + 'waits until the current turn ends, so it cannot redirect work already underway. Delivery is '
       + 'asynchronous — this returns once the message is accepted, never the teammate\'s answer; the reply '
       + 'arrives later as its own message to you.'
     : 'Send a message to another team member. Address the leader as "leader", or a teammate by its name. '
+      + 'Pass a list of addresses to reach several at once, or "*" for everyone you may reach: the leader '
+      + 'plus the other members if you are a peer, and only the leader if you are managed. A broadcast checks '
+      + 'every address before sending any, so one bad name delivers to nobody. '
       + 'The message becomes the recipient\'s next turn; you get no answer back from this call. Use it to ask '
       + 'a peer for input, hand work over, or raise something with the leader mid-task. Finished work goes to '
       + 'the leader through team_send. A conversation between teammates carries a budget: it '
@@ -233,35 +249,97 @@ export function sendTool(ctx: Context, audience: 'leader' | 'member'): ToolDefin
     name: 'team_send',
     description,
     parameters: {
-      to: { type: 'string', required: true, description: 'Recipient: a teammate name, a member id, or "leader".' },
+      // String or list of strings: the schema DSL's exact-one union, which is the
+      // only form that keeps one schema serving both a single address and a
+      // broadcast without a comma convention the model has to guess at.
+      to: {
+        required: true,
+        description:
+          'Recipient, or list of recipients: a teammate name, a member id, "leader", or "*" for everyone '
+          + 'else on the team. A list delivers the same message to each named address once.',
+        oneOf: [
+          { type: 'string' },
+          { type: 'array', items: { type: 'string' } },
+        ],
+      },
       message: { type: 'string', required: true, description: 'Self-contained message; the recipient does not see your conversation.' },
     },
     output: {
+      // Two shapes, because a single address keeps the result it always had and
+      // a broadcast has one per recipient. Their required keys are disjoint, so
+      // exactly one branch ever matches.
       schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          messageId: { type: 'string', required: true },
-          to: { type: 'string', required: true },
-          name: { type: 'string', required: true },
-          hop: { type: 'number', required: true },
-        },
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              messageId: { type: 'string', required: true },
+              to: { type: 'string', required: true },
+              name: { type: 'string', required: true },
+              hop: { type: 'number', required: true },
+            },
+          },
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              count: { type: 'number', required: true },
+              deliveries: {
+                type: 'array',
+                required: true,
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    messageId: { type: 'string', required: true },
+                    to: { type: 'string', required: true },
+                    name: { type: 'string', required: true },
+                    hop: { type: 'number', required: true },
+                  },
+                },
+              },
+            },
+          },
+        ],
       },
-      render: (_args, value) => [{ type: 'text', text: `message queued as the next turn of ${value.name}` }],
-      presentationMeta: (args, value) => ({
-        team: 'message',
-        messageId: value.messageId,
-        to: value.to,
-        text: args.message,
-        hop: value.hop,
-      }),
+      render: (_args, value) => [{
+        type: 'text',
+        text: 'deliveries' in value
+          ? `message queued as the next turn of ${value.deliveries.map(entry => entry.name).join(', ')}`
+          : `message queued as the next turn of ${value.name}`,
+      }],
+      presentationMeta: (args, value) => 'deliveries' in value
+        ? {
+            team: 'broadcast',
+            text: args.message,
+            deliveries: value.deliveries.map(entry => ({ messageId: entry.messageId, to: entry.to, hop: entry.hop })),
+          }
+        : {
+            team: 'message',
+            messageId: value.messageId,
+            to: value.to,
+            text: args.message,
+            hop: value.hop,
+          },
     },
-    presentCall: args => call(`Message ${args.to}`, args.message),
+    presentCall: args => call(`Message ${addressLabel(args.to)}`, args.message),
     presentResult: (args, result) => result.isError
-      ? done(`Message ${args.to}`, `not delivered: ${failureText(result)}`)
-      : done(`Message sent to ${args.to}`),
+      ? done(`Message ${addressLabel(args.to)}`, `not delivered: ${failureText(result)}`)
+      : done(`Message sent to ${addressLabel(args.to)}`),
     async execute(args, exec) {
       const sent = await ctx.team.send(actor(exec.agent), args.to, args.message, exec.signal)
+      if ('deliveries' in sent) {
+        return {
+          count: sent.deliveries.length,
+          deliveries: sent.deliveries.map(entry => ({
+            messageId: entry.messageId,
+            to: entry.recipient.id,
+            name: entry.recipient.name,
+            hop: entry.chain.hop,
+          })),
+        }
+      }
       return {
         messageId: sent.messageId,
         to: sent.recipient.id,

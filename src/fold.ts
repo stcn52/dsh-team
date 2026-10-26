@@ -126,6 +126,22 @@ export type TeamFact =
     /** Depth of the delivery in its conversation chain. */
     readonly hop?: number
   }
+  /**
+   * One broadcast: the same text to several mailboxes. Carried as one fact with
+   * the text at the top so a broadcast to ten teammates logs the message once,
+   * while the fold still records one row per mailbox.
+   */
+  | {
+    readonly team: 'broadcast'
+    /** The text every recipient of this broadcast received. */
+    readonly text: string
+    /** One row per recipient, each with its own message id and chain depth. */
+    readonly deliveries: readonly {
+      readonly messageId: string
+      readonly to: string
+      readonly hop?: number
+    }[]
+  }
   | { readonly team: 'task'; readonly task: TeamTaskView }
   | { readonly team: 'board'; readonly entries: readonly TeamBoardEntryView[]; readonly at: number }
 
@@ -280,6 +296,23 @@ export function readFact(meta: unknown): TeamFact | undefined {
         ...hop !== undefined ? { hop } : {},
       }
     }
+    case 'broadcast': {
+      const rows = record['deliveries']
+      // A broadcast with no recipient is not a broadcast: reject it whole rather
+      // than folding an empty fact that would look like a successful send.
+      if (!Array.isArray(rows) || rows.length === 0) return undefined
+      const deliveries: { messageId: string; to: string; hop?: number }[] = []
+      for (const row of rows) {
+        const entry = asRecord(row)
+        if (entry === undefined) return undefined
+        const messageId = asText(entry['messageId'])
+        const to = asText(entry['to'])
+        if (messageId === undefined || to === undefined) return undefined
+        const hop = asCount(entry['hop'])
+        deliveries.push({ messageId, to, ...hop !== undefined ? { hop } : {} })
+      }
+      return { team: 'broadcast', text: asText(record['text']) ?? '', deliveries }
+    }
     case 'task': {
       const task = readTask(record['task'])
       return task === undefined ? undefined : { team: 'task', task }
@@ -417,6 +450,22 @@ function applyFact(view: TeamView, fact: TeamFact, time: number, bound: number):
           ...fact.hop !== undefined ? { hop: fact.hop } : {},
         }, bound),
       }
+    case 'broadcast': {
+      // One row per mailbox, in address order: a broadcast is several deliveries
+      // that happen to share a text, so the panel shows them like any other send.
+      let messages = view.messages
+      for (const delivery of fact.deliveries) {
+        messages = appended(messages, {
+          messageId: delivery.messageId,
+          to: delivery.to,
+          kind: 'message',
+          text: fact.text,
+          time,
+          ...delivery.hop !== undefined ? { hop: delivery.hop } : {},
+        }, bound)
+      }
+      return { ...view, messages }
+    }
     case 'task':
       return { ...view, tasks: upsertTask(view.tasks, fact.task) }
     case 'board':

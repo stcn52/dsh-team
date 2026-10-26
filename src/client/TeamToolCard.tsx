@@ -88,9 +88,15 @@ function presentation(tool: TeamTool, block: ToolCallBlock, state: TeamPanelStat
       break
     }
     case 'team_send': {
-      const reference = fact?.team === 'message' ? fact.to : argument(args, 'to')
+      // A broadcast reports one row per mailbox, so the card names them all
+      // rather than falling back to the generic "teammate" label.
+      const reference = fact?.team === 'message'
+        ? fact.to
+        : fact?.team === 'broadcast'
+          ? fact.deliveries.map(delivery => delivery.to).join(', ')
+          : argument(args, 'to')
       people = [who(sessionId, t('tool.sender')), who(reference, argument(args, 'to') ?? t('tool.teammate'))]
-      summary = fact?.team === 'message' ? fact.text : argument(args, 'message') ?? ''
+      summary = fact?.team === 'message' || fact?.team === 'broadcast' ? fact.text : argument(args, 'message') ?? ''
       caption = t('tool.recipient', { name: people[1]!.name })
       break
     }

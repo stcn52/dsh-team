@@ -251,6 +251,22 @@ type TeamFact = {
   readonly text: string;
   /** Depth of the delivery in its conversation chain. */
   readonly hop?: number;
+} |
+/**
+ * One broadcast: the same text to several mailboxes. Carried as one fact with
+ * the text at the top so a broadcast to ten teammates logs the message once,
+ * while the fold still records one row per mailbox.
+ */
+{
+  readonly team: 'broadcast';
+  /** The text every recipient of this broadcast received. */
+  readonly text: string;
+  /** One row per recipient, each with its own message id and chain depth. */
+  readonly deliveries: readonly {
+    readonly messageId: string;
+    readonly to: string;
+    readonly hop?: number;
+  }[];
 } | {
   readonly team: 'task';
   readonly task: TeamTaskView;
@@ -344,6 +360,24 @@ type Recipient = {
   readonly name: string;
   readonly member: TeamMemberFact;
 };
+/** One accepted mailbox delivery: the message an inbox took, and its chain. */
+interface TeamDelivery {
+  /** Identity of the message the recipient's inbox accepted. */
+  readonly messageId: string;
+  /** Who took it, after address resolution and de-duplication. */
+  readonly recipient: Recipient;
+  /**
+   * The conversation this delivery belongs to. One broadcast shares a single
+   * chain, so every recipient inherits the same id and the same depth; each
+   * recipient's own replies deepen only its own leg of it.
+   */
+  readonly chain: TeamChain;
+}
+/** Every delivery one broadcast made, in address order. */
+interface TeamBroadcastResult {
+  /** One entry per distinct recipient: the same address twice delivers once. */
+  readonly deliveries: readonly TeamDelivery[];
+}
 /** `Context.team`: roster, mailbox routing, tasks, and team lifecycle. */
 declare class TeamService extends Service {
   private readonly config;
@@ -396,29 +430,44 @@ declare class TeamService extends Service {
    */
   spawn(leader: Agent, request: TeamSpawnRequest, signal: AbortSignal): Promise<TeamMemberFact>;
   /**
-   * Deliver one mailbox message. The leader may message any teammate; a peer
-   * teammate may message the leader or any other teammate; a managed teammate
-   * may message only the leader.
+   * Deliver a mailbox message to one address, a list of addresses, or everyone.
+   * The leader may message any teammate; a peer teammate may message the leader
+   * or any other teammate; a managed teammate may message only the leader, so
+   * its wildcard collapses to that one address.
    *
    * A teammate-to-teammate delivery also spends chain budget: it continues the
    * conversation its sender is working from, and that conversation may only
    * relay so far and may not repeat one ordered pair. Escalation to the leader
    * spends nothing, so the guard converges a peer exchange without ever
    * trapping a member with something to say.
+   *
+   * A broadcast is all-or-nothing. Every address is resolved, every relation and
+   * every per-recipient budget is checked before the first mailbox is touched,
+   * so a refusal anywhere delivers nothing anywhere — there is no half-sent
+   * broadcast. The whole broadcast shares ONE chain: recipients are charged
+   * their own `sender → recipient` leg of it, so reaching three teammates does
+   * not cost any one of them three relays, and no broadcast deepens a chain past
+   * the hop budget it has already spent.
+   *
+   * A single address keeps the one-delivery result every existing caller reads;
+   * a list or `"*"` answers with the deliveries it made. `"*"` passed through an
+   * untyped `string` still broadcasts at runtime — pass the literal so the type
+   * matches what happens.
    * @param from - the acting agent (leader or teammate).
-   * @param to - recipient member id or member name; `leader` addresses the leader.
-   * @param text - the message content.
-   * @param signal - cancellation owning the delivery until inbox acceptance.
-   * @returns the accepted message id, the resolved recipient, and the chain it joined.
-   * @throws {TeamError} when the actor is outside the team, the recipient is
-   *   unknown, the actor's relation forbids the delivery, or the conversation
-   *   has spent its budget.
+   * @param to - recipient member id or member name, `leader`, a list of those,
+   *   or `"*"` for everyone else on the team.
+   * @param text - the message content, identical for every recipient.
+   * @param signal - cancellation owning each delivery until inbox acceptance.
+   * @returns one accepted delivery for a single address, or the whole broadcast.
+   * @throws {TeamError} when the actor is outside the team, an address is
+   *   unknown (the refusal names it), the actor's relation forbids a delivery,
+   *   or the conversation has spent its budget — all before anything is sent.
    */
-  send(from: Agent, to: string, text: string, signal: AbortSignal): Promise<{
-    readonly messageId: string;
-    readonly recipient: Recipient;
-    readonly chain: TeamChain;
-  }>;
+  send(from: Agent, to: '*', text: string, signal: AbortSignal): Promise<TeamBroadcastResult>;
+  send(from: Agent, to: readonly string[], text: string, signal: AbortSignal): Promise<TeamBroadcastResult>;
+  /** A single address, answered with the one delivery it made. */
+  send(from: Agent, to: string, text: string, signal: AbortSignal): Promise<TeamDelivery>;
+  send(from: Agent, to: string | readonly string[], text: string, signal: AbortSignal): Promise<TeamDelivery | TeamBroadcastResult>;
   /**
    * Create or update one shared task. Writes are the leader's: a teammate's
    * own tool calls land in its own log, which the leader's durable team state
@@ -500,6 +549,38 @@ declare class TeamService extends Service {
   private tryResolveActor;
   /** Resolve one address (member id, member name, or `leader`) to a recipient. */
   private resolveRecipient;
+  /**
+   * Resolve one address, a list of them, or the wildcard to the distinct
+   * recipients one send must reach, in the order given.
+   *
+   * The wildcard means "everyone else on this team", which the sender's
+   * relation decides: every member for the leader, the leader plus the other
+   * members for a peer, and only the leader for a managed member — the one
+   * address that relation may reach. The sender is never a recipient of its own
+   * wildcard, while an address the sender spelled out for itself is refused
+   * later by {@link assertDeliverable} rather than silently dropped: a member
+   * that named itself made a mistake worth reporting.
+   * @param actor - who is sending, which fixes both the wildcard and self.
+   * @param address - one address, the wildcard, or a list mixing the two.
+   * @returns the distinct recipients, never empty and never the sender.
+   * @throws {TeamError} when an address is unknown (the refusal names that one
+   *   address), or when nothing is left to address.
+   */
+  private resolveRecipients;
+  /**
+   * Everyone the wildcard reaches from this sender: the whole roster for the
+   * leader, the leader and the other members for a peer, and the leader alone
+   * for a managed member.
+   * @param actor - who is sending, and therefore who is left out.
+   * @returns the expansion, empty only for a leader with no teammates.
+   */
+  private everyoneElse;
+  /**
+   * Refuse one delivery the actor's relation or its own identity forbids. The
+   * relation check runs first so a managed member writing to itself is told
+   * what it may not do as a managed member, exactly as before.
+   */
+  private assertDeliverable;
   /**
    * The chain one send belongs to. A teammate continues the conversation it is
    * working from — that is what turns a peer exchange into one bounded
