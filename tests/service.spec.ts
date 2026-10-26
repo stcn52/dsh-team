@@ -933,6 +933,28 @@ describe('wait', () => {
     return trackSubscriptions(scene, ['agent/created'])
   }
 
+  /**
+   * Record EVERY subscription armed in this world, in order — not just the live
+   * ones. {@link trackSubscriptions} answers "what is still armed", which cannot
+   * tell "never subscribed" from "subscribed and dropped on the way out": a wait
+   * that armed a listener and released it before returning leaves it empty too.
+   * The precheck claims it arms nothing at all, so this counts the arming.
+   * @param scene - the world whose context the waits subscribe on.
+   * @returns the event name of each subscription, in the order it was armed.
+   */
+  function armedSubscriptions(scene: World): string[] {
+    const armed: string[] = []
+    const loose = scene.ctx as unknown as {
+      on: (name: string, listener: (payload: { agent: { id: string } }) => void) => () => boolean
+    }
+    const original = loose.on.bind(loose)
+    loose.on = (name, listener) => {
+      armed.push(name)
+      return original(name, listener)
+    }
+    return armed
+  }
+
   it('returns at once with every member done when nobody is running', async () => {
     const scene = world()
     await spawn(scene, 'Alice', { childId: 'child-1' })
@@ -1238,8 +1260,10 @@ describe('wait', () => {
     // Nothing is queued: the evidence exists only in the log.
     expect(scene.leader.inbox.nextStep).toEqual([])
 
+    // Answered from the log BEFORE the clock starts, so the same member is
+    // `done` without spending the budget — the deadline no longer decides it.
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
   })
 
   /**
@@ -1306,10 +1330,12 @@ describe('wait', () => {
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
       .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
 
-    // Round two's answer, spliced after the delivery, is the one that counts.
+    // Round two's answer, spliced after the delivery, is the one that counts —
+    // and it is counted before the wait arms anything, so this one does not time
+    // out either. The watermark, not the clock, is what separates the two halves.
     scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
   })
 
   /**
@@ -1694,5 +1720,132 @@ describe('wait', () => {
 
     expect(await waiting).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false })
     expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  /**
+   * The reported trace, one clock tick later — the case the disposal race cannot
+   * reach. Both members finished and were reaped BEFORE the wait was called, so
+   * at wait start there is no live agent to race and no `agent/disposed` still to
+   * come: `observeIdle` takes its cold path, subscribes to an `agent/created`
+   * that will never fire for a dead session, and sits out the whole budget before
+   * `bucketOf` finally reads the spliced rows that were there from the start
+   * (20 037 ms against a 20 000 ms budget in the host trace).
+   *
+   * The evidence that the round happened is durable and already in the log, so
+   * the wait owes an answer at once — not the right answer at the deadline.
+   */
+  it('returns at once when the whole round finished and was reaped before the wait began', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    // What a finished "just reply OK" turn leaves behind: the settlement row the
+    // runtime spliced on the leader's inbox boundary, and the consumption that
+    // removed it with nothing inserted.
+    scene.leader.session.events.push(
+      inboxSplicedEvent([settlementNotice(alice.id, 'Alice finished.')]),
+      inboxSplicedEvent([settlementNotice(bob.id, 'Bob finished.')]),
+      inboxSplicedEvent([], { removed: 2 }),
+    )
+    scene.agents.remove(alice.id)
+    scene.agents.remove(bob.id)
+
+    const started = Date.now()
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
+    const elapsed = Date.now() - started
+
+    // Seconds, not the budget: the answer was already in the log when the wait
+    // began, so there was nothing left to watch.
+    expect(elapsed).toBeLessThan(1_000)
+    expect(observed).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false })
+  })
+
+  /**
+   * The economy of the precheck, not just its verdict: a member settled from the
+   * log must arm NOTHING. `observeIdle`'s cold path buys a publication
+   * subscription, and for a session that is already gone there is no publication
+   * to hear — arming one is pure leftovers. Counted at the arming, because a
+   * listener dropped on the way out is invisible to a "still live" count.
+   */
+  it('arms no subscription for a member it settles from the log', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
+    scene.agents.remove(alice.id)
+    const armed = armedSubscriptions(scene)
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 2_000 })
+
+    // Not one listener: no `agent/created` to wait for, no `agent/disposed` to
+    // race — the member was already answered before the window opened. Asserted
+    // first, because this is the claim that is specific to the precheck.
+    expect(armed).toEqual([])
+    expect(observed).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+  })
+
+  /**
+   * The line the precheck must not cross, and the reason it reuses the DELIVERY
+   * watermark instead of "does this member have a report at all".
+   *
+   * Round one answered and its spliced row is in the log; round two was delivered
+   * after it and has not been woken yet. An unbounded precheck would read that
+   * old row as this round's answer and report a cold member as done in one tick —
+   * the exact over-claim the bounded rule exists to stop. With the watermark, the
+   * row sits before `deliveredAt` and settles nothing, so the wait takes the
+   * normal cold path: one publication subscription, and the full budget.
+   */
+  it('does not pre-settle a member whose only report predates its delivery', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // Round one's answer, already spliced and consumed in the log...
+    scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
+    scene.agents.remove(alice.id)
+    // ...and round two's task, accepted after it, whose answer has not come.
+    await scene.service.send(scene.leader.agent, 'Alice', 'one more thing', signal)
+    const live = trackCreated(scene)
+
+    const started = Date.now()
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 120 })
+    await sleep(50)
+    // Precheck missed: the cold observation is armed exactly as before.
+    expect(live.size).toBe(1)
+
+    expect(await waiting).toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+    // It really waited the budget out rather than answering early.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(120)
+    expect(live.size).toBe(0)
+  })
+
+  /**
+   * All three states in one window, which is where a precheck could go wrong: a
+   * member whose round is over (no live agent, report in the log), one still
+   * working (live and running), and one that never started (no live agent, no
+   * report). Only the first may be settled without watching; the other two keep
+   * their old rules, and every target lands in exactly one bucket.
+   */
+  it('settles the finished member and still watches the running and the silent one', async () => {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3 } })
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    const carol = await spawn(scene, 'Carol', { childId: 'child-3' })
+    // Alice answered and was reaped before the wait: her round is over.
+    scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
+    scene.agents.remove(alice.id)
+    // Bob is still working. Carol was never started and never reports.
+    bob.status = 'running'
+    scene.agents.remove(carol.id)
+    carol.status = 'running'
+    const armed = armedSubscriptions(scene)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 150 })
+
+    // Exactly one publication subscription: Carol's. Alice was settled from the
+    // log without watching, Bob was already resident. Two `agent/created` here
+    // would mean the precheck left Alice on the cold path.
+    expect(armed.filter(name => name === 'agent/created')).toEqual(['agent/created'])
+    expect(observed).toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
+
+    const flat = [...observed.done, ...observed.busy, ...observed.cold]
+    // Disjoint: no name twice. Union: every target named exactly once.
+    expect(new Set(flat).size).toBe(flat.length)
+    expect([...flat].sort()).toEqual(['Alice', 'Bob', 'Carol'])
   })
 })

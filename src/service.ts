@@ -205,11 +205,14 @@ export interface TeamWaitResult {
   /**
    * Members confirmed finished: `whenIdle()` settled during the observation, the
    * member was disposed during it (a reaped agent occupies no turn), the
-   * member was seen live during it and was no longer `running` when the wait
-   * ended (reaped included), or its session was already gone while the leader
-   * held its report — queued in the leader's inbox for this round, spliced into
-   * the leader's own log after this round's delivery (the row the queue is built
-   * from and outlives it), or already spliced into its durable mailbox.
+   * member's round was already over when the wait began — it had no live agent
+   * and its report was in the leader's own log past its latest delivery, so it
+   * was settled before any observation was armed — the member was seen live
+   * during it and was no longer `running` when the wait ended (reaped included),
+   * or its session was already gone while the leader held its report: queued in
+   * the leader's inbox for this round, spliced into the leader's own log after
+   * this round's delivery (the row the queue is built from and outlives it), or
+   * already spliced into its durable mailbox.
    */
   readonly done: readonly string[]
   /**
@@ -283,7 +286,9 @@ interface WaitObservation {
   seen: boolean
   /**
    * `whenIdle()` resolved (its rejection counts: an unobservable member must not
-   * hang the leader's turn). Only this means the member's turn really ended.
+   * hang the leader's turn), or the member was settled before the window opened
+   * because its round was already provably over (see {@link presettleReported}).
+   * Only this means the member's turn really ended.
    */
   settled: boolean
 }
@@ -706,7 +711,9 @@ export class TeamService extends Service {
    * - Every target is watched for the whole window, recording `seen` the moment
    *   `agents.get()` (or an `agent/created` for it) yields a live agent, however
    *   that agent's status reads at the time.
-   * - `whenIdle()` settling → `done`.
+   * - `whenIdle()` settling → `done`. So does a cold target whose report was
+   *   already in the log past its own delivery when the wait began: it is
+   *   settled before any observation is armed (see {@link presettleReported}).
    * - At the deadline: `seen` and still `running` → `busy`; `seen` but no longer
    *   running (idle or reaped) → `done`; never `seen` → `done` when the leader
    *   holds a report from it — queued in its inbox for this round, spliced into
@@ -734,6 +741,18 @@ export class TeamService extends Service {
    * never started", and because nothing shorter than the caller's own budget can
    * tell "woken in a moment" from "never woken", it still makes the wait run the
    * full budget rather than answer at once.
+   *
+   * That last sentence holds for a member with nothing on its record — and not
+   * for one whose round is already provably over. A member reaped BEFORE the
+   * wait began leaves the report that says so in the log, yet the cold path would
+   * still spend the whole budget on an `agent/created` that can never come: the
+   * right answer at the deadline, which the host trace showed as 20 037 ms for a
+   * round that had finished at 1.1 s. So before one listener is armed, the same
+   * delivery-bounded log judgement is applied once to the cold targets and a hit
+   * is settled on the spot (see {@link presettleReported}). A finished-and-reaped
+   * round then answers in milliseconds, while a member that never started still
+   * gets the full window — nothing on its record says otherwise, and no report of
+   * an earlier round can stand in for this one.
    *
    * The boundary this answer still carries: it reports **quiescence**, not
    * receipt. A member that is idle right now may already be holding a prompt
@@ -774,7 +793,15 @@ export class TeamService extends Service {
     const watch: WaitWatch = new Set()
     let outcome: 'done' | 'timeout'
     try {
-      const observing = targets.map((target, index) => this.observeIdle(target, observations[index]!, watch))
+      // Before arming one listener: a member whose round is already provably over
+      // is settled here and leaves nothing to observe (see
+      // {@link presettleReported}). This is the only path that can answer
+      // without waiting, so it runs first.
+      this.presettleReported(actor, targets, observations)
+      const observing = targets
+        .map((target, index) => ({ target, observation: observations[index]! }))
+        .filter(({ observation }) => !observation.settled)
+        .map(({ target, observation }) => this.observeIdle(target, observation, watch))
       outcome = await this.raceWait(observing, clampWait(request.timeoutMs), request.signal)
     } finally {
       // Every watch subscription dies with the wait, on all three exits: all
@@ -790,12 +817,80 @@ export class TeamService extends Service {
   }
 
   /**
+   * Settle, before anything is watched, the members whose round already ended —
+   * the half of the reaped-member problem that a disposal race cannot reach.
+   *
+   * {@link observeIdle} races `whenIdle()` against `agent/disposed`, which covers
+   * a member reaped DURING the wait. It cannot cover a member reaped BEFORE it:
+   * the wait begins with no live agent, takes the cold path, subscribes to an
+   * `agent/created` that will never fire for a session that is already gone, and
+   * sits out the whole budget — after which {@link bucketOf} finally reads the
+   * spliced report that was in the log from the first millisecond (20 037 ms
+   * against a 20 000 ms budget in the host trace that found this). The answer was
+   * right; only its arrival time was wrong.
+   *
+   * So the durable judgement is taken here as well, BEFORE the observation, and
+   * a hit becomes a `settled` observation with nothing armed behind it. The
+   * judgement itself is not new: it is {@link reportedInLog}, the very read
+   * {@link bucketOf} does at the deadline, reused so both moments can never
+   * disagree.
+   *
+   * Why this cannot over-claim, and how it differs from the "no live agent means
+   * done" shortcut that was wrong:
+   *
+   * - **Only cold targets are eligible.** A resident member is answered by
+   *   `whenIdle()` within the tick anyway, so pre-settling it buys nothing — and
+   *   would be a false claim for one that already replied and is now running the
+   *   next turn. Eligibility is a live registry read, so an agent published
+   *   between the settle window and this line is left to the normal path.
+   * - **The freshness boundary is the delivery, not the precheck.** A hit needs a
+   *   spliced report from THIS member at or after `deliveredAt.get(memberId)` —
+   *   the watermark {@link markDelivery} wrote before the prompt was accepted.
+   *   The unbounded version of this rule ("it has any report at all") would
+   *   settle a member whose previous round's answer is in the log but whose next
+   *   task has not woken it yet, which is exactly the over-claim this boundary
+   *   exists to stop. Reusing the same watermark means the precheck and the
+   *   deadline judgement are the same question asked earlier.
+   * - **The target belongs to this wait.** The walk is restricted to the members
+   *   this call resolved, and credits a spliced row only to the sender its
+   *   `source` names — never to whoever happens to be waiting.
+   *
+   * A miss settles nothing and changes nothing: the target goes on to
+   * {@link observeIdle} exactly as before, resident or cold.
+   * @param actor - the team, and the leader whose log and watermark are read.
+   * @param targets - the members this wait was asked about, in order.
+   * @param observations - this wait's per-target records, updated in place.
+   */
+  private presettleReported(
+    actor: Actor,
+    targets: readonly WaitTarget[],
+    observations: readonly WaitObservation[],
+  ): void {
+    // Which targets have no live agent — the only ones this read can speak for.
+    const cold: number[] = []
+    targets.forEach((target, index) => {
+      if (observations[index]!.settled) return
+      if (this.ctx.agents.get(SessionId(target.memberId)) !== undefined) return
+      cold.push(index)
+    })
+    if (cold.length === 0) return
+    // One reverse walk, over the cold subset only: the floor is the oldest of
+    // THEIR delivery watermarks, so a hot member's boundary cannot widen it.
+    const reported = this.reportedInLog(actor, cold.map(index => targets[index]!))
+    for (const index of cold) {
+      if (reported.has(targets[index]!.memberId)) observations[index]!.settled = true
+    }
+  }
+
+  /**
    * Split the observed targets into the three disjoint buckets, from what the
    * window actually saw rather than from one read taken at the end.
    *
    * The buckets are disjoint and their union is exactly `targets`: every target
    * is named once, under the first rule that fits. Rules in order:
-   * 1. `settled` — `whenIdle()` resolved, so the member's turn really ended.
+   * 1. `settled` — `whenIdle()` resolved, so the member's turn really ended, or
+   *    it was pre-settled because its round was already over when the wait began
+   *    (no live agent, and its report past its delivery in the log).
    * 2. never `seen`, but the leader's inbox queue holds a report FROM it that
    *    arrived after its latest delivery, or its own log holds a spliced report
    *    from it past that same delivery, or its durable mailbox holds one and
@@ -828,9 +923,11 @@ export class TeamService extends Service {
     const done: string[] = []
     const busy: string[] = []
     const cold: string[] = []
-    // Only a target with no live session asks where its report went, so a wait
-    // whose members are all accounted for never reads the log at all.
-    const reported = observations.some(observation => !observation.seen)
+    // Only a target that is neither settled nor seen asks where its report went,
+    // so a wait whose members are all accounted for never reads the log at all —
+    // and a target the precheck already settled (see {@link presettleReported})
+    // does not send this scan looking for it a second time.
+    const reported = observations.some(observation => !observation.seen && !observation.settled)
       ? this.reportedInLog(actor, targets)
       : undefined
     targets.forEach((target, index) => {
