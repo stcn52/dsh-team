@@ -1229,6 +1229,44 @@ describe('wait', () => {
   })
 
   /**
+   * The kind is narrowed BEFORE any sender field is read. The leader's inbox
+   * holds messages from many producers (its own user input, runtime notices),
+   * and a source with no `senderSessionId` at all must be skipped, not thrown
+   * on and not credited to whoever happens to be waiting.
+   */
+  it('ignores a queued inbox message whose source is not a teammate report', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.agents.remove(alice.id)
+    scene.leader.inbox.nextStep.push(createUserMessage({
+      content: [{ type: 'text', text: 'an ordinary user line' }],
+      source: { kind: 'user' },
+    }))
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+  })
+
+  /**
+   * "Something is queued" is not "a member reported". The leader's own
+   * deliveries are `team-message` sources too; only a sender that is one of
+   * THIS wait's targets may be credited, or the leader's own outbound rows
+   * would read as answers from the members it is waiting for.
+   */
+  it('does not count a queued message the leader itself sent as any member\u2019s reply', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    scene.agents.remove(alice.id)
+    scene.agents.remove(bob.id)
+    // Queued on the leader's own boundary, attributed to the leader.
+    scene.leader.inbox.nextTurn.push(queuedReply(String(scene.leader.id), 'leader', 'rebroadcast'))
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: [], busy: [], cold: ['Alice', 'Bob'], timedOut: true })
+  })
+
+  /**
    * The over-claim the inbox rule must not introduce. A reply from the previous
    * round may still be queued, because nothing has consumed it yet; once the
    * leader delivers a NEW task to that member, the old reply is no evidence
