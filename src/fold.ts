@@ -1,15 +1,27 @@
 /**
  * The durable team fold: one leader session's log to {@link TeamView}.
  *
- * The team invents no session event type. rc.6's `Session.append` cannot mark
- * an event `ignorable`, so an out-of-repo event type would be required-on-read
- * and a log written with this plugin would refuse to load once the plugin is
- * gone. Every durable fact therefore rides vocabulary the harness already
- * knows: the `meta` (presentationMeta) of this plugin's own `tool/result`
- * events, the structured facts carried in nested `tool/ptc-dispatch` content,
- * and the `user/message` deliveries whose source is `team-message`. All are
- * plain JSON on a durable boundary, so this module validates them instead of
- * trusting them.
+ * Two vocabularies reach this fold, and neither makes the log unreadable
+ * without this plugin.
+ *
+ * The tool paths ride vocabulary the harness already knows: the `meta`
+ * (presentationMeta) of this plugin's own `tool/result` events, the structured
+ * facts carried in nested `tool/ptc-dispatch` content, and the `user/message`
+ * deliveries whose source is `team-message`.
+ *
+ * Lifecycle changes that no tool call settles — a teammate spawned through the
+ * admin route instead of the tool, a relation change, a dismissal — write one
+ * {@link TeamMemberRecord} as a plugin record: `plugin:dsh-team/member` via
+ * `appendPluginRecord`. That is the harness's own compatibility mechanism for
+ * out-of-repo plugins: the record is committed with `ignorable: true`, so a
+ * reader that does not know the type retains and skips it rather than refusing
+ * the log, and it never enters the model-visible surface. Inventing a RELEASED
+ * event type would be the unsafe move: a type inside the harness catalog is
+ * required-on-read, so a log written here would stop loading once this plugin
+ * is gone.
+ *
+ * Both are plain JSON on a durable boundary, so this module validates them
+ * instead of trusting them.
  *
  * @module dsh-team/fold
  */
@@ -36,6 +48,65 @@ export interface TeamMemberFact {
 }
 
 /**
+ * The record name one lifecycle change commits under. The `plugin:` prefix is
+ * the harness's out-of-repo plugin namespace; appended through
+ * `appendPluginRecord`, the event carries `ignorable: true`.
+ */
+export const TEAM_MEMBER_RECORD = 'plugin:dsh-team/member'
+
+/** The plugin-record type grammar, mirrored from the session package. */
+const PLUGIN_RECORD_TYPE = /^plugin:[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/u
+
+/**
+ * Read one committed event as a plugin record.
+ *
+ * Deliberately local rather than `import { pluginRecordOf } from
+ * '@deepseek-ai/dsh-session'`: this module is reachable from the BROWSER
+ * bundle (`client/TeamToolCard.tsx` parses a tool result's `meta` through
+ * {@link readFact}), and a value import there drags the whole session wire
+ * graph — session, its dependencies, and their dependencies — into the page.
+ * The grammar and the `ignorable` gate are the only two things that read
+ * needs, so they are restated here and pinned by tests.
+ * @param event - any committed session event, live or restored.
+ * @returns the record envelope, or undefined when the event is not an ignorable
+ *   plugin-namespaced record.
+ */
+function pluginRecordOf(event: SessionEvent):
+{ readonly type: string; readonly seq: SessionEvent['seq']; readonly time: number; readonly data: unknown } | undefined {
+  if (event.ignorable !== true) return undefined
+  const type: string = event.type
+  if (!PLUGIN_RECORD_TYPE.test(type)) return undefined
+  return { type, seq: event.seq, time: event.time, data: event.data }
+}
+
+/**
+ * One durable roster change, as committed to the LEADER's session log.
+ *
+ * This is this plugin's OWN shape, not the harness's `team/member` payload:
+ * that one is a `TeamMemberSnapshot` (id, name, description, provider, context,
+ * phase, error) with no `relation`, no `model`, no `effort`, and no `skills`,
+ * and its projection parses the payload strictly. Reusing it would either drop
+ * the fields the roster is built from or make this plugin's writes poison
+ * another plugin's projection. A plugin record keeps the whole
+ * {@link TeamMemberFact} and stays invisible to readers that do not know it.
+ *
+ * Every arm carries the WHOLE post-change entity, never a delta, matching the
+ * `team` meta vocabulary: the fold's transition stays trivial and each logged
+ * row is self-describing.
+ */
+export type TeamMemberRecord =
+  | { readonly version: 1; readonly op: 'upsert'; readonly member: TeamMemberFact }
+  | { readonly version: 1; readonly op: 'remove'; readonly memberId: string }
+  | { readonly version: 1; readonly op: 'ended' }
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface PluginRecordMap {
+    'plugin:dsh-team/member': TeamMemberRecord
+  }
+}
+
+
+/**
  * One settled team-tool result, projected through `presentationMeta`. Every
  * arm carries the WHOLE post-change entity, never a delta, so the fold's
  * transition stays trivial and each logged row is self-describing.
@@ -43,6 +114,8 @@ export interface TeamMemberFact {
 export type TeamFact =
   | { readonly team: 'member-added'; readonly member: TeamMemberFact }
   | { readonly team: 'member-updated'; readonly member: TeamMemberFact }
+  /** An idempotent `member-added` that keeps the existing `joinedAt`. */
+  | { readonly team: 'member-merged'; readonly member: TeamMemberFact }
   | { readonly team: 'member-removed'; readonly memberId: string }
   | { readonly team: 'ended' }
   | {
@@ -110,6 +183,36 @@ function readMember(value: unknown): TeamMemberFact | undefined {
     ...model !== undefined ? { model } : {},
     ...effort !== undefined ? { effort } : {},
     ...skills !== undefined ? { skills } : {},
+  }
+}
+
+/**
+ * Narrow one committed plugin record into a roster fact, or reject it.
+ *
+ * The record is durable JSON that an earlier build of this plugin wrote, so it
+ * is validated exactly like the `meta` vocabulary: an unknown version or op,
+ * or a member without its required identity, folds to nothing rather than
+ * corrupting the view.
+ * @param data - the record's committed payload.
+ * @returns the fact to apply, or undefined when the record is not this
+ *   plugin's current shape.
+ */
+function readMemberRecord(data: unknown): TeamFact | undefined {
+  const record = asRecord(data)
+  if (record === undefined || record['version'] !== 1) return undefined
+  switch (record['op']) {
+    case 'upsert': {
+      const member = readMember(record['member'])
+      return member === undefined ? undefined : { team: 'member-merged', member }
+    }
+    case 'remove': {
+      const memberId = asText(record['memberId'])
+      return memberId === undefined ? undefined : { team: 'member-removed', memberId }
+    }
+    case 'ended':
+      return { team: 'ended' }
+    default:
+      return undefined
   }
 }
 
@@ -271,6 +374,22 @@ function applyFact(view: TeamView, fact: TeamFact, time: number, bound: number):
         active: true,
         members: upsertMember(view.members, { ...fact.member, joinedAt: time }),
       }
+    case 'member-merged': {
+      // The durable path and the tool path both report the same member, and a
+      // browser refresh re-folds every row, so this arm MUST be idempotent: an
+      // existing row keeps its original `joinedAt`, and folding the same record
+      // twice yields the same view. Unlike `member-updated` it also ADDS,
+      // because a spawn made through the admin route has no prior row.
+      const previous = view.members.find(candidate => candidate.memberId === fact.member.memberId)
+      return {
+        ...view,
+        active: true,
+        members: upsertMember(view.members, {
+          ...fact.member,
+          joinedAt: previous?.joinedAt ?? time,
+        }),
+      }
+    }
     case 'member-updated': {
       const previous = view.members.find(candidate => candidate.memberId === fact.member.memberId)
       if (previous === undefined) return view
@@ -361,6 +480,14 @@ function textOf(content: unknown): string {
  * @returns the next view, or `view` itself when nothing changed.
  */
 export function applyTeamEvent(view: TeamView, event: SessionEvent, bound: number): TeamView {
+  // The durable lifecycle path. It is checked first and by TYPE rather than by
+  // `event.type`, because `pluginRecordOf` is also what keeps a foreign
+  // `plugin:` record from another package out of this fold.
+  const record = pluginRecordOf(event)
+  if (record !== undefined && record.type === TEAM_MEMBER_RECORD) {
+    const fact = readMemberRecord(record.data)
+    return fact === undefined ? view : applyFact(view, fact, event.time, bound)
+  }
   if (event.type === 'tool/result') {
     if (event.data.error !== undefined) return view
     const fact = readFact(event.data.meta)

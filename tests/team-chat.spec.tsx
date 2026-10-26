@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { useSyncExternalStore } from 'react'
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
@@ -128,6 +128,32 @@ describe('team presence in the conversation header', () => {
 
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(document.activeElement).toBe(toggle)
+  })
+
+  it('offers the invite entry before a team exists and posts the session it shows', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ member: alice }) }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      presence({ currentId: 'leader', members: [], tasks: [], messages: [], board: [] })
+      expect(screen.queryByRole('dialog')).toBeNull()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Invite a teammate' }))
+      const dialog = screen.getByRole('dialog')
+      expect(document.activeElement).toBe(within(dialog).getByLabelText('Name'))
+      fireEvent.change(within(dialog).getByLabelText('Name'), { target: { value: 'Alice' } })
+      fireEvent.change(within(dialog).getByLabelText('First task'), { target: { value: 'Review the storage layer' } })
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Invite' }))
+
+      await waitFor(() => { expect(fetchMock).toHaveBeenCalledTimes(1) })
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+      expect(url).toBe('/api/team/mutation')
+      const body = JSON.parse(String(init.body)) as { readonly session?: string; readonly op?: string }
+      expect(body.op).toBe('spawn')
+      expect(body.session).toBe('leader')
+      await waitFor(() => { expect(within(dialog).getByRole('status').textContent).toBe('Alice joined the team') })
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('closes the old roster when a different team comes into view', () => {

@@ -6,8 +6,10 @@
  *
  * Every mutating tool projects the WHOLE post-change entity through
  * `presentationMeta`, mirrored into finalized content for PTC-mode calls.
- * That projection is the team's durable record — see ./fold.ts for why the
- * plugin cannot append a session event of its own.
+ * That projection is the durable record for a tool-driven change. A change
+ * that starts in the panel instead commits a `plugin:dsh-team/member` record
+ * through `appendPluginRecord` (see ./fold.ts and ./service.ts); ./fold.ts
+ * folds both paths into one roster.
  *
  * @module dsh-team/tools
  */
@@ -72,8 +74,12 @@ const TASK_PROPERTIES = {
   note: { type: 'string' },
 } as const
 
-/** Drop the undefined optional members a JSON fact must not carry. */
-function memberValue(member: TeamMemberFact): {
+/**
+ * Drop the undefined optional members a JSON fact must not carry. Shared with
+ * `./admin.ts`: a teammate spawned by a tool and one spawned by the HTTP panel
+ * are projected by the same code, so their answers cannot drift apart.
+ */
+export function memberValue(member: TeamMemberFact): {
   memberId: string; name: string; role?: string; relation: 'managed' | 'peer'
   provider?: string; model?: string; effort?: string; skills?: string[]
 } {

@@ -1,6 +1,6 @@
 import z from "@deepseek-ai/schemastery";
-import { Context, Service } from "@deepseek-ai/cordis";
 import { SessionEvent } from "@deepseek-ai/dsh-session";
+import { Context, Service } from "@deepseek-ai/cordis";
 import { Agent } from "@deepseek-ai/dsh-agent";
 //#region src/config.d.ts
 /** Validated team configuration. */
@@ -192,6 +192,38 @@ interface TeamMemberFact {
   readonly skills?: string[];
 }
 /**
+ * One durable roster change, as committed to the LEADER's session log.
+ *
+ * This is this plugin's OWN shape, not the harness's `team/member` payload:
+ * that one is a `TeamMemberSnapshot` (id, name, description, provider, context,
+ * phase, error) with no `relation`, no `model`, no `effort`, and no `skills`,
+ * and its projection parses the payload strictly. Reusing it would either drop
+ * the fields the roster is built from or make this plugin's writes poison
+ * another plugin's projection. A plugin record keeps the whole
+ * {@link TeamMemberFact} and stays invisible to readers that do not know it.
+ *
+ * Every arm carries the WHOLE post-change entity, never a delta, matching the
+ * `team` meta vocabulary: the fold's transition stays trivial and each logged
+ * row is self-describing.
+ */
+type TeamMemberRecord = {
+  readonly version: 1;
+  readonly op: 'upsert';
+  readonly member: TeamMemberFact;
+} | {
+  readonly version: 1;
+  readonly op: 'remove';
+  readonly memberId: string;
+} | {
+  readonly version: 1;
+  readonly op: 'ended';
+};
+declare module '@deepseek-ai/dsh-session/types' {
+  interface PluginRecordMap {
+    'plugin:dsh-team/member': TeamMemberRecord;
+  }
+}
+/**
  * One settled team-tool result, projected through `presentationMeta`. Every
  * arm carries the WHOLE post-change entity, never a delta, so the fold's
  * transition stays trivial and each logged row is self-describing.
@@ -201,6 +233,11 @@ type TeamFact = {
   readonly member: TeamMemberFact;
 } | {
   readonly team: 'member-updated';
+  readonly member: TeamMemberFact;
+} |
+/** An idempotent `member-added` that keeps the existing `joinedAt`. */
+{
+  readonly team: 'member-merged';
   readonly member: TeamMemberFact;
 } | {
   readonly team: 'member-removed';
@@ -323,6 +360,22 @@ declare class TeamService extends Service {
    * @returns the mutable live team state.
    */
   teamOf(leader: Agent): TeamState;
+  /**
+   * Commit one roster change to the LEADER's session log.
+   *
+   * `ctx.emit('team/changed')` is a same-process edge only — it tells observers
+   * to look again, and it dies with the process. The roster the panel renders is
+   * rebuilt from this log ({@link durableView}), so a lifecycle change that only
+   * emitted would be gone after a refresh, and a spawn made through the admin
+   * route has no tool result to carry it. This record is that durable half.
+   *
+   * The event is a plugin record, not a released type: it is committed
+   * `ignorable`, never enters the model-visible surface, and a reader that does
+   * not know the type skips it instead of refusing the log.
+   * @param leader - the leader whose session log carries the team.
+   * @param record - the WHOLE post-change roster fact.
+   */
+  private publish;
   /**
    * Adopt one continuable child into the team world while its scope is being
    * composed. Called from the teammate setup contribution after the child is

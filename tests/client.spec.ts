@@ -434,22 +434,42 @@ describe('chat contributions', () => {
     expect(utilities.map(entry => entry.id)).toEqual(['team-presence'])
   })
 
-  it('withdraws live presence on disband while preserving the historical call renderers', () => {
+  it('offers the header invite entry in a main session with no team yet', () => {
+    sessions.seed('leader-1', teamOf([]))
+    sessions.select('leader-1')
+
+    expect(tabs).toEqual([])
+    expect(utilities.map(entry => entry.id)).toEqual(['team-presence'])
+    expect(utilities[0]!.face.hooks.team.getSnapshot()).toMatchObject({ currentId: 'leader-1', members: [] })
+  })
+
+  it('keeps the invite entry off a teammate session that has no team', () => {
+    sessions.seed('child-9', teamOf([]))
+    sessions.addresses.set('child-9', { parentSessionId: 'leader-9', childSessionId: 'child-9', mode: 'continuable' })
+    sessions.select('child-9')
+
+    expect(utilities).toEqual([])
+  })
+
+  it('swaps live presence for the invite entry on disband while preserving the historical call renderers', () => {
     seedTeam()
     const cards = [...toolViews]
     sessions.faces.get('leader-1')!.set(teamOf([]))
 
-    expect(utilities).toEqual([])
+    expect(utilities.map(entry => entry.id)).toEqual(['team-presence'])
+    expect(utilities[0]!.face.hooks.team.getSnapshot()).toMatchObject({ currentId: 'leader-1', members: [] })
     expect(toolViews).toEqual(cards)
     expect(toolViews[0]!.face.hooks.team.getSnapshot().members).toEqual([])
   })
 
-  it('removes the avatars when navigating into an unrelated conversation', () => {
+  it('replaces the roster with the invite entry in a conversation without a team', () => {
     seedTeam()
     sessions.seed('other')
     sessions.select('other')
 
-    expect(utilities).toEqual([])
+    expect(tabs).toEqual([])
+    expect(utilities.map(entry => entry.id)).toEqual(['team-presence'])
+    expect(utilities[0]!.face.hooks.team.getSnapshot()).toMatchObject({ currentId: 'other', members: [] })
   })
 
   it('releases every chat contribution on plugin unload', () => {

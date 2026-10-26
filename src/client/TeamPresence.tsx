@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from 'react'
 import type { PropsLocale, PropsRuntime, SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { MemberAvatar } from './MemberAvatar.tsx'
+import { TeamAdmin } from './TeamAdmin.tsx'
 import type { TeamInjected, TeamPanelState } from './TeamStage.tsx'
 import { IconTeam16 } from './icons.tsx'
 import theme from './TeamStage.module.css'
@@ -16,8 +17,79 @@ export type TeamPresenceProps = PropsRuntime<'conversation.session.header.utilit
 
 export function TeamPresence(props: TeamPresenceProps) {
   const state = props.useTeam(snapshot => snapshot)
-  if (state.leaderId === undefined || state.members.length === 0) return null
+  if (state.members.length === 0) {
+    // A session with no team yet: the header keeps one compact way in, and the
+    // session id the mutation needs is the one the follower published.
+    const sessionId = state.leaderId ?? state.currentId
+    return sessionId === undefined ? null : <InvitePresence key={sessionId} {...props} sessionId={sessionId as SessionId} />
+  }
+  if (state.leaderId === undefined) return null
   return <PresenceRoster key={state.leaderId} {...props} state={state as TeamPanelState & { leaderId: string }} />
+}
+
+/**
+ * The empty-team seat in the conversation header: one compact button that opens
+ * the same roster panel shell, with the admin form already expanded so the
+ * first teammate can be invited without a team existing beforehand.
+ */
+function InvitePresence(props: TeamPresenceProps & { readonly sessionId: string }) {
+  const { sessionId, t } = props
+  const [expanded, setExpanded] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+  const toggle = useRef<HTMLButtonElement>(null)
+  const panelId = useId()
+
+  useEffect(() => {
+    if (!expanded) return
+    const outside = (event: PointerEvent): void => {
+      if (event.target instanceof Node && !root.current?.contains(event.target)) setExpanded(false)
+    }
+    document.addEventListener('pointerdown', outside)
+    return () => { document.removeEventListener('pointerdown', outside) }
+  }, [expanded])
+
+  const dismiss = (): void => {
+    setExpanded(false)
+    toggle.current?.focus({ preventScroll: true })
+  }
+
+  return (
+    <div ref={root} className={`${theme.theme} ${css.presence}`} data-team-presence data-team-invite onKeyDown={event => {
+      if (event.key !== 'Escape' || !expanded) return
+      event.stopPropagation()
+      dismiss()
+    }} onBlur={event => {
+      if (event.relatedTarget !== null && !event.currentTarget.contains(event.relatedTarget)) setExpanded(false)
+    }}>
+      <button
+        ref={toggle}
+        type="button"
+        className={css.presenceInvite}
+        aria-label={t('presence.invite')}
+        aria-haspopup="dialog"
+        aria-expanded={expanded}
+        aria-controls={expanded ? panelId : undefined}
+        onClick={() => { setExpanded(value => !value) }}
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden><path d="M8 3v10M3 8h10" /></svg>
+        <span>{t('presence.invite')}</span>
+      </button>
+      {expanded && (
+        <section id={panelId} className={css.presencePanel} role="dialog" aria-label={t('presence.title')}>
+          <header className={css.presenceHead}>
+            <div>
+              <strong><IconTeam16 size={16} />{t('presence.title')}</strong>
+              <p>{t('presence.emptyHint')}</p>
+            </div>
+            <button type="button" className={css.iconButton} aria-label={t('presence.close')} onClick={dismiss}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden><path d="m4 4 8 8M12 4l-8 8" /></svg>
+            </button>
+          </header>
+          <TeamAdmin sessionId={sessionId} members={[]} t={t} defaultOpen />
+        </section>
+      )}
+    </div>
+  )
 }
 
 function PresenceRoster(props: TeamPresenceProps & { readonly state: TeamPanelState & { leaderId: string } }) {
@@ -134,6 +206,7 @@ function PresenceRoster(props: TeamPresenceProps & { readonly state: TeamPanelSt
               </li>
             ))}
           </ul>
+          <TeamAdmin sessionId={leaderId} members={members} t={t} />
           {tasks.length > 0 && (
             <footer className={css.presenceProgress}>
               <span>{t('presence.progress')}</span>

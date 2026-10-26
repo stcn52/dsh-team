@@ -32,11 +32,6 @@ const PLATFORM_MODULES = [
 
 const CLIENT_EXTERNALS: readonly string[] = [...PLATFORM_MODULES]
 
-/**
- * Pure libraries with no cross-plugin runtime identity, safe to inline.
- * dsh-client-store qualifies: its snapshot-store engine (zustand/vanilla +
- * immer) keeps no global registry, so a per-plugin copy behaves identically.
- */
 const INLINE_SAFE = /^@deepseek-ai\/dsh-(host-apiproxy|session|llm|tools|brand|session-projection|client-store)(\/|$)/
 
 const CSS_VIRTUAL_PREFIX = '\0dsh-css:'

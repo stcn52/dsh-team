@@ -4,6 +4,9 @@
 .stackMember:hover { z-index: 1; transform: translateY(-2px); }
 .presenceDot { position: absolute; right: -1px; bottom: 1px; width: 7px; height: 7px; border: 1.5px solid var(--team-page); border-radius: 50%; background: var(--team-faint); }
 .stackMember[data-running='true'] .presenceDot { background: var(--team-hue); box-shadow: 0 0 0 2px color-mix(in srgb, var(--team-hue) 12%, transparent); }
+.presenceInvite { display: inline-flex; align-items: center; gap: 5px; min-height: 32px; padding: 3px 9px; border: 1px dashed var(--team-line); border-radius: 8px; background: transparent; color: var(--team-faint); font: var(--team-caption); white-space: nowrap; cursor: pointer; }
+.presenceInvite:hover, .presenceInvite[aria-expanded='true'] { color: var(--team-hue); border-color: color-mix(in srgb, var(--team-hue) 35%, var(--team-line)); background: var(--team-surface-1); }
+.presenceInvite svg { flex: none; }
 .presenceToggle { display: flex; align-items: center; gap: 5px; min-height: 32px; padding: 4px 6px; border: 0; border-radius: 7px; color: var(--team-muted); background: transparent; white-space: nowrap; cursor: pointer; font-variant-numeric: tabular-nums; }
 .presenceToggle:hover, .presenceToggle[aria-expanded='true'] { color: var(--team-hue); background: var(--team-surface-1); }
 .presencePanel { position: absolute; top: calc(100% + 12px); right: 0; z-index: 50; width: min(352px, calc(100vw - 32px)); max-height: calc(100dvh - 110px); overflow: auto; border: 1px solid var(--team-line); border-radius: 16px; background: var(--team-page); box-shadow: var(--dsw-shadow-lv3, 0 12px 32px var(--dsw-alias-bg-mask-2)); scrollbar-width: thin; }
@@ -31,6 +34,44 @@
 .presenceProgress progress::-webkit-progress-bar { background: var(--team-surface-2); }
 .presenceProgress progress::-webkit-progress-value { background: var(--team-hue); border-radius: 4px; }
 .presenceProgress progress::-moz-progress-bar { background: var(--team-hue); border-radius: 4px; }
+
+.admin { margin: 0 8px 12px; padding: 11px 10px 10px; border: 1px solid var(--team-line); border-radius: 12px; background: var(--team-surface-1); }
+.adminHead { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.adminTitle { color: var(--team-faint); font: var(--team-caption); font-weight: 650; letter-spacing: 0.035em; }
+.adminAdd { display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 3px 9px; border: 1px solid var(--team-line); border-radius: 7px; background: var(--team-page); color: var(--team-muted); font: var(--team-caption); white-space: nowrap; cursor: pointer; }
+.adminAdd:hover, .adminAdd[aria-expanded='true'] { color: var(--team-hue); border-color: color-mix(in srgb, var(--team-hue) 30%, var(--team-line)); }
+.adminAdd > span { font-size: 13px; line-height: 1; }
+.adminNotice { margin: 9px 0 0; padding: 7px 9px; border-radius: 7px; background: color-mix(in srgb, var(--team-leaf) 10%, var(--team-page)); color: color-mix(in srgb, var(--team-leaf) 62%, var(--team-ink)); font: var(--team-caption); line-height: 1.6; overflow-wrap: anywhere; }
+.adminNotice[data-kind='error'] { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 9%, var(--team-page)); color: var(--dsw-alias-state-error-primary); }
+.adminForm { display: grid; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--team-line); }
+.adminFields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 8px; }
+.adminField { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.adminWide { grid-column: 1 / -1; }
+.adminLabel { color: var(--team-faint); font: var(--team-caption); }
+.adminInput { width: 100%; min-width: 0; min-height: 28px; padding: 5px 8px; border: 1px solid var(--team-line); border-radius: 7px; background: var(--team-page); color: var(--team-ink); font: var(--team-small); }
+.adminInput::placeholder { color: var(--team-faint); }
+.adminInput:focus-visible { border-color: color-mix(in srgb, var(--team-hue) 55%, var(--team-line)); outline: 2px solid color-mix(in srgb, var(--team-hue) 30%, transparent); outline-offset: 1px; }
+.adminInput[aria-invalid='true'] { border-color: var(--dsw-alias-state-error-primary); }
+.adminTextarea { min-height: 62px; resize: vertical; line-height: 1.6; }
+.adminActions { display: flex; justify-content: flex-end; gap: 8px; }
+.adminPrimary, .adminGhost { min-height: 28px; padding: 4px 12px; border-radius: 7px; border: 1px solid transparent; font: var(--team-small); cursor: pointer; }
+.adminPrimary { border-color: color-mix(in srgb, var(--team-hue) 32%, transparent); background: color-mix(in srgb, var(--team-hue) 12%, var(--team-page)); color: var(--team-hue); }
+.adminPrimary:hover:not(:disabled) { background: color-mix(in srgb, var(--team-hue) 18%, var(--team-page)); }
+.adminGhost { background: transparent; color: var(--team-muted); }
+.adminGhost:hover { color: var(--team-ink); background: var(--team-surface-2); }
+.adminPrimary:disabled, .adminGhost:disabled, .adminMiniButton:disabled { opacity: 0.55; cursor: default; }
+.adminMembers { display: grid; gap: 2px; margin-top: 10px; }
+.adminEmpty { margin: 2px 0; color: var(--team-faint); font: var(--team-caption); }
+.adminMember { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; align-items: center; gap: 1px 8px; padding: 7px 6px; border-radius: 8px; }
+.adminMember + .adminMember { border-top: 1px solid var(--team-line); border-radius: 0 0 8px 8px; }
+.adminMember:hover { background: var(--team-surface-2); }
+.adminMemberName { grid-area: 1 / 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.adminMemberMeta { grid-area: 2 / 1; display: flex; gap: 5px; min-width: 0; color: var(--team-faint); font: var(--team-caption); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.adminMemberMeta > span[data-relation='peer'] { color: color-mix(in srgb, var(--team-hue) 70%, var(--team-ink)); }
+.adminMemberActions { grid-area: 1 / 2 / 3 / 3; display: flex; align-items: center; gap: 6px; }
+.adminMiniButton { min-height: 24px; padding: 2px 7px; border: 1px solid var(--team-line); border-radius: 6px; background: var(--team-page); color: var(--team-muted); font: var(--team-caption); white-space: nowrap; cursor: pointer; }
+.adminMiniButton:hover:not(:disabled) { color: var(--team-ink); background: var(--team-surface-2); }
+.adminMiniButton[data-danger='true']:hover:not(:disabled) { color: var(--dsw-alias-state-error-primary); border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 35%, transparent); }
 
 .toolCard { container-type: inline-size; margin: 8px 0; border: 1px solid var(--team-line); border-radius: 12px; background: var(--team-page); overflow: hidden; font-size: var(--dsh-content-font-size-secondary, 13px); }
 .toolHeader { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 6px 10px 6px 14px; background: var(--team-surface-1); }
@@ -72,6 +113,10 @@ button.toolPerson:hover { color: var(--team-hue); background: var(--team-surface
   .avatarStack .stackMember:nth-child(n + 3) { display: none; }
   .presence { gap: 4px; }
   .presenceToggle { font-size: 11px; }
+}
+@media (max-width: 400px) {
+  .adminFields { grid-template-columns: 1fr; }
+  .adminMemberActions { flex-direction: column; align-items: stretch; }
 }
 @keyframes team-working { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 @media (prefers-reduced-motion: reduce) {

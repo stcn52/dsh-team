@@ -62,6 +62,15 @@ function present(state: TeamPanelState): boolean {
 }
 
 /**
+ * Whether the header should still offer starting a team: a main session is on
+ * screen and no team owns it yet. Teammate sessions never reach this state —
+ * the follower keeps them empty instead of naming them.
+ */
+function invitable(state: TeamPanelState): boolean {
+  return state.leaderId === undefined && state.currentId !== undefined
+}
+
+/**
  * Register the locale dictionary and the view tab, and keep the stage store
  * pointed at the right session.
  * @param ctx - client root context.
@@ -122,6 +131,13 @@ export function apply(ctx: ClientContext): void {
     } else if (leaderId !== undefined && leader === undefined && held.leaderId === leaderId
       && list.projectionsBySession[leaderId]?.state !== 'ready') {
       if (held.currentId !== current) store.set({ ...held, currentId: current })
+    } else if (sessions.subagentAddress(current) === undefined && list.byId[current]?.parentId === undefined) {
+      // A main session with no team: publish its id so the header keeps one
+      // invite entry. A teammate session has no team of its own to start.
+      const heldNow = store.getSnapshot()
+      if (heldNow.leaderId !== undefined || heldNow.currentId !== current || heldNow.members.length > 0) {
+        store.set({ ...EMPTY, currentId: current })
+      }
     } else {
       store.set(EMPTY)
     }
@@ -180,7 +196,7 @@ export function apply(ctx: ClientContext): void {
   ctx.slots.inject('conversation.session.header.utilities', () => {
     let disposePresence: (() => void) | null = null
     const sync = (): void => {
-      const wanted = present(store.getSnapshot()) && worlds.getSnapshot() === 0
+      const wanted = (present(store.getSnapshot()) || invitable(store.getSnapshot())) && worlds.getSnapshot() === 0
       if (wanted === (disposePresence !== null)) return
       disposePresence?.()
       disposePresence = wanted ? ctx.slots.register({

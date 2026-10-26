@@ -1,6 +1,6 @@
-import { t as TeamService } from "./service-BG3yFUSQ.js";
-import { Context } from "@deepseek-ai/cordis";
+import { t as TeamService } from "./service-DD0KY6U2.js";
 import { ToolExecution } from "@deepseek-ai/dsh-tools";
+import { Context } from "@deepseek-ai/cordis";
 //#region src/team-mode.d.ts
 declare const name = "team-mode";
 /**

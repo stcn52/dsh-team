@@ -88,6 +88,10 @@ export function teamProjection(maxRecentMessages: number): TeamProjectionUnit {
     // 6: nested results carry the same whole facts as native results, including
     //    note writes and complete board snapshots; legacy references normalize.
     // 7: nested calls arrive as session-format V4 tool/ptc-dispatch records.
-    stateVersion: 7,
+    // 8: lifecycle changes are also durable — `plugin:dsh-team/member` records
+    //    (spawn, relation change, dismissal, end) fold into the same members
+    //    list, so a route-driven change survives a refresh. Bumping this is
+    //    what retires a 7 checkpoint whose value predates those records.
+    stateVersion: 8,
   }
 }

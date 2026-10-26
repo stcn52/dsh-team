@@ -1,9 +1,10 @@
 /**
  * dsh-team: agent teams for DeepSeek Harness.
  *
- * One plugin row, four registrations: the `ctx.team` service, the leader tool
+ * One plugin row, five registrations: the `ctx.team` service, the leader tool
  * set on every ordinary session, the teammate world on every continuable child
- * that belongs to a team, and the human `/agent-teams` slash command. Over the
+ * that belongs to a team, the human `/agent-teams` slash command, and the
+ * authenticated `/api/team/*` channel a panel drives. Over the
  * storage domain form ride two more durable contributions: the virtual
  * workspaces (per team) and the member dossiers (per name, outliving every
  * team). Teammates themselves are `ctx.subagents` continuable children — the
@@ -23,6 +24,7 @@ import { Config, type TeamConfig } from './config.ts'
 import { installCommand } from './command.ts'
 import { MemberDossiers } from './dossier.ts'
 import { teamProjection } from './projection.ts'
+import { registerAdminRoutes } from './routes.ts'
 import { TeamService } from './service.ts'
 import { installTeammateDossier, installTeammateWorkspace, installTeammateWorld } from './teammate.ts'
 import {
@@ -183,8 +185,9 @@ function installDossiers(ctx: Context, config: TeamConfig): void {
 
 /**
  * Compose the team capability: the service, the durable projection unit, the
- * teammate world, the per-session leader tools, the virtual workspaces, and
- * the human `/agent-teams` command.
+ * teammate world, the per-session leader tools, the virtual workspaces, the
+ * member dossiers, the human `/agent-teams` command, and the authenticated
+ * `/api/team/*` channel a panel drives.
  *
  * `commands` is injected softly rather than declared on the row, like
  * `storageDomain`: UI-less compositions ship no command adapter, and the row
@@ -210,5 +213,8 @@ export function apply(ctx: Context, config: TeamConfig): void {
     )
     installWorkspaces(teamCtx, config)
     installDossiers(teamCtx, config)
+    // The panel's channel rides Connection's authenticated `/api` transport;
+    // a deployment without one simply never runs the injection inside.
+    registerAdminRoutes(teamCtx)
   })
 }

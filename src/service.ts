@@ -26,7 +26,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { appendPluginRecord, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subagent'
@@ -37,7 +37,7 @@ import {
   type TeamTaskStatus, type TeamTaskView, type TeamView,
 } from './contract.ts'
 import { TeamError } from './errors.ts'
-import { foldTeam, type TeamMemberFact } from './fold.ts'
+import { foldTeam, TEAM_MEMBER_RECORD, type TeamMemberFact, type TeamMemberRecord } from './fold.ts'
 import type { TeamConfig } from './config.ts'
 
 /** Live lifecycle of one teammate, as `list_agents` names the same states. */
@@ -184,6 +184,40 @@ export class TeamService extends Service {
   }
 
   /**
+   * Commit one roster change to the LEADER's session log.
+   *
+   * `ctx.emit('team/changed')` is a same-process edge only — it tells observers
+   * to look again, and it dies with the process. The roster the panel renders is
+   * rebuilt from this log ({@link durableView}), so a lifecycle change that only
+   * emitted would be gone after a refresh, and a spawn made through the admin
+   * route has no tool result to carry it. This record is that durable half.
+   *
+   * The event is a plugin record, not a released type: it is committed
+   * `ignorable`, never enters the model-visible surface, and a reader that does
+   * not know the type skips it instead of refusing the log.
+   * @param leader - the leader whose session log carries the team.
+   * @param record - the WHOLE post-change roster fact.
+   */
+  private publish(leader: Agent, record: TeamMemberRecord): void {
+    try {
+      appendPluginRecord(leader.session, TEAM_MEMBER_RECORD, record)
+    } catch (error: unknown) {
+      // The roster already changed in memory, and a refusal here is not worth
+      // failing a spawn whose child is live (a reentrant append is the
+      // realistic cause). The divergence is reported, never swallowed.
+      this.ctx.logger.warn(
+        'dsh-team: publishing %s to the session log failed: %s',
+        record.op,
+        String(error),
+      )
+      return
+    }
+    // Durability is a checkpoint rather than this call's contract: the route
+    // answers once the fact is in the log, and the backend drains its buffer.
+    void this.ctx.sessions.flush(leader.session)
+  }
+
+  /**
    * Adopt one continuable child into the team world while its scope is being
    * composed. Called from the teammate setup contribution after the child is
    * published — on cold resume the child is already on the leader's roster,
@@ -277,6 +311,7 @@ export class TeamService extends Service {
     const fact: TeamMemberFact = { ...pending.fact, memberId: childId }
     team.members.set(childId, fact)
     team.active = true
+    this.publish(leader, { version: 1, op: 'upsert', member: fact })
     this.ctx.emit('team/changed', { leaderId: leader.id })
     return fact
   }
@@ -383,6 +418,7 @@ export class TeamService extends Service {
     if (recipient.kind !== 'member') throw new TeamError('UNKNOWN_MEMBER', target)
     const fact: TeamMemberFact = { ...recipient.member, relation }
     actor.team.members.set(fact.memberId, fact)
+    this.publish(actor.leader, { version: 1, op: 'upsert', member: fact })
     this.ctx.emit('team/changed', { leaderId: actor.leader.id })
     return fact
   }
@@ -406,6 +442,7 @@ export class TeamService extends Service {
       actor.team.inbox.clear()
       actor.team.chains.clear()
       actor.team.active = false
+      this.publish(actor.leader, { version: 1, op: 'ended' })
       this.ctx.emit('team/changed', { leaderId: actor.leader.id, ended: true })
       return { ended: true }
     }
@@ -416,6 +453,7 @@ export class TeamService extends Service {
     // A dismissed member carries no conversation forward; a later member
     // reusing its id would otherwise inherit a stranger's chain.
     actor.team.inbox.delete(recipient.id)
+    this.publish(actor.leader, { version: 1, op: 'remove', memberId: recipient.id })
     this.ctx.emit('team/changed', { leaderId: actor.leader.id, removedMember: recipient.id })
     return { ended: false, memberId: recipient.id }
   }
