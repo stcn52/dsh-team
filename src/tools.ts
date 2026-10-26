@@ -623,11 +623,12 @@ export function waitTool(ctx: Context): ToolDefinition {
       + `timeout_ms (default ${WAIT_DEFAULT_MS / 60_000} minutes, at most ${WAIT_MAX_MS / 60_000}) with `
       + 'timedOut: true, the still-running members in busy, and the members that never showed a live session '
       + 'in cold. An idle member counts as done, and so does a member whose session is already gone but whose '
-      + 'report has reached you — queued in your own inbox, or already in your mailbox: a short turn can run '
+      + 'report has reached you — queued in your own inbox, spliced into your own session log, or already in '
+      + 'your mailbox: a short turn can run '
       + 'and be reaped before this call takes its first look, and its settlement notice waits in your inbox '
       + 'until your next turn starts. '
-      + 'cold means no live session was seen for that member AND neither your inbox nor your mailbox holds a '
-      + 'report from it about this round, so it '
+      + 'cold means no live session was seen for that member AND nothing from it has reached you for this '
+      + 'round — not your inbox, not your own log, not your mailbox — so it '
       + 'is NOT finished as far as this call can tell — it may not have started yet, or it may have finished '
       + 'without writing back — and a leader that summarises it as returned work is claiming more than the '
       + 'wait observed. A member that never wakes therefore costs the whole budget instead of being waved '
@@ -656,7 +657,8 @@ export function waitTool(ctx: Context): ToolDefinition {
             items: { type: 'string' },
             description:
               'Members confirmed finished: their turn ended inside the wait, or their session was already gone '
-              + 'while their report had reached you (queued in your inbox, or already in your mailbox). '
+              + 'while their report had reached you (queued in your inbox, spliced into your log, or already in '
+              + 'your mailbox). '
               + 'Never a cold member.',
           },
           busy: {

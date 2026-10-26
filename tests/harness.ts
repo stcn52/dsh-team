@@ -29,6 +29,14 @@ export interface FakeAgent {
   readonly session: {
     header: Record<string, unknown>
     events: SessionEvent[]
+    /**
+     * The real Session's `seq`: the number the next appended event will carry,
+     * which its contract pins to the log length. This double's events come from
+     * one counter shared across builder call sites, so its positions have gaps —
+     * the highest seq plus one is the next free one, and only the ORDER is
+     * something a reader may rely on here.
+     */
+    readonly seq: number
     snapshotEvents(): readonly SessionEvent[]
   }
   readonly options: { provider?: string; model?: string; reasoningEffort?: string }
@@ -82,6 +90,11 @@ export function fakeAgent(id: string, options: {
         ? { origin: 'user', isSeeded: false }
         : { origin: 'subagent', parentSession: SessionId(options.parent), isSeeded: false },
       events: options.events ?? [],
+      get seq(): number {
+        let next = 0
+        for (const event of this.events) next = Math.max(next, Number(event.seq) + 1)
+        return next
+      },
       snapshotEvents() { return this.events },
     },
     options: {
@@ -406,6 +419,40 @@ export function userMessageEvent(source: MessageSource, text: string, time?: num
     seq,
     time: time ?? 1_700_000_000_000 + seq,
     data: message,
+  } as unknown as SessionEvent
+}
+
+/**
+ * Build one `agent/inbox/spliced` event: one durable mutation of an agent's
+ * pending-message lists, exactly as the runtime commits it.
+ *
+ * This is the trace a settled child leaves in the LEADER's own log. The
+ * insertion (`inserted`) names the child's session in each message's `source`;
+ * the consumption at the next step boundary is a second splice that removes
+ * them with nothing inserted, and — when the turn is interrupted before that
+ * boundary delivers them — no `user/message` is ever written. A reader that
+ * wants "did it report" after consumption therefore has only these rows.
+ * @param inserted - the messages this splice put on the boundary.
+ * @param options - which list, where, how many were removed, and the stamp.
+ * @returns the committed event.
+ */
+export function inboxSplicedEvent(inserted: readonly UserMessage[], options: {
+  readonly target?: 'next-turn' | 'next-step'
+  readonly start?: number
+  readonly removed?: number
+  readonly time?: number
+} = {}): SessionEvent {
+  seq += 1
+  return {
+    type: 'agent/inbox/spliced',
+    seq,
+    time: options.time ?? 1_700_000_000_000 + seq,
+    data: {
+      target: options.target ?? 'next-step',
+      start: options.start ?? 0,
+      ...options.removed === undefined ? {} : { removedCount: options.removed },
+      inserted: [...inserted],
+    },
   } as unknown as SessionEvent
 }
 

@@ -14,7 +14,8 @@ import { TeamError } from '../src/errors.ts'
 import { TeamService } from '../src/service.ts'
 import type { TeamConfig } from '../src/config.ts'
 import {
-  FakeAgents, FakeLlm, FakeSubagents, fakeAgent, toolResultEvent, userMessageEvent, type FakeAgent,
+  FakeAgents, FakeLlm, FakeSubagents, fakeAgent, inboxSplicedEvent, toolResultEvent, userMessageEvent,
+  type FakeAgent,
 } from './harness.ts'
 
 const CONFIG: TeamConfig = {
@@ -1194,6 +1195,103 @@ describe('wait', () => {
     // Exact shape the harness's continuation manager queues on next-step.
     scene.leader.inbox.nextStep.push(settlementNotice(alice.id))
 
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+  })
+
+  /**
+   * The same member, one moment later — and the case the inbox rule cannot see.
+   *
+   * The settlement notice is consumed at the next step boundary: a second
+   * `agent/inbox/spliced` removes it with nothing inserted. When the turn is
+   * interrupted before that boundary delivers the notice as model-visible input,
+   * no `user/message` is ever written, so the durable mailbox never learns that
+   * the member answered. The insertion row stays in the log for good, and it
+   * names the child in `source.senderSessionId`. That row is the evidence, so a
+   * reader that only looks at the live queue reports `cold` for a member that
+   * has already finished.
+   */
+  it('counts a member whose notice was consumed, leaving only the spliced log row', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // 1. The manager inserted the notice on the next-step boundary...
+    scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
+    // 2. ...and the boundary consumed it, with no `user/message` behind it.
+    scene.leader.session.events.push(inboxSplicedEvent([], { removed: 1 }))
+    scene.agents.remove(alice.id)
+    // Nothing is queued: the evidence exists only in the log.
+    expect(scene.leader.inbox.nextStep).toEqual([])
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+  })
+
+  /**
+   * The spliced row is read PER MEMBER, exactly as the queued one is: Bob's
+   * completion says nothing about Alice, who never wrote back.
+   */
+  it('does not credit a member with another member\u2019s spliced report', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    scene.leader.session.events.push(
+      inboxSplicedEvent([settlementNotice(bob.id, 'Bob finished.')]),
+      inboxSplicedEvent([], { removed: 1 }),
+    )
+    scene.agents.remove(alice.id)
+    scene.agents.remove(bob.id)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true })
+  })
+
+  /**
+   * The kind is narrowed BEFORE any sender field is read, on the log side too.
+   * The same boundary carries the leader's own user input and runtime notices;
+   * a source that is not a teammate report must be skipped, not credited to
+   * whoever happens to be waiting.
+   */
+  it('ignores a spliced inbox row whose source is not a teammate report', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.session.events.push(inboxSplicedEvent([
+      createUserMessage({
+        content: [{ type: 'text', text: 'an ordinary user line' }],
+        source: { kind: 'user' },
+      }),
+    ]))
+    scene.agents.remove(alice.id)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+  })
+
+  /**
+   * The over-claim the log rule must not introduce, and the reason its freshness
+   * boundary is the DELIVERY rather than the wait.
+   *
+   * A finished member's spliced row sits BEFORE the wait that reads it — the
+   * member finished while the leader was still writing the tool call — so a
+   * boundary taken at wait start would discard the very evidence it needs. What
+   * must not be read as this round's answer is a row from before the task being
+   * waited on: round one's report, then round two delivered, and the member not
+   * woken yet. The row that answers round two has to sit after the delivery, and
+   * then it counts.
+   */
+  it('reads spliced reports from this round only, not from before the delivery', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // Round one's answer, already spliced into the log...
+    scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
+    scene.agents.remove(alice.id)
+    // ...and round two's task, accepted after it.
+    await scene.service.send(scene.leader.agent, 'Alice', 'one more thing', signal)
+
+    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+
+    // Round two's answer, spliced after the delivery, is the one that counts.
+    scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
       .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
   })

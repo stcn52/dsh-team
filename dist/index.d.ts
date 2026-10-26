@@ -1,4 +1,4 @@
-import { _ as Config, a as EMPTY_TEAM_VIEW, c as TeamChain, d as TeamMessageSource, f as TeamMessageView, g as TeamView, h as TeamTaskView, i as foldTeam, l as TeamMemberView, m as TeamTaskStatus, n as TeamFact, o as TEAM_PROJECTION_KEY, p as TeamRelation, r as TeamMemberFact, s as TeamBoardEntryView, t as TeamService, u as TeamMessageKind, v as TeamConfig } from "./service-BPK8GPHe.js";
+import { _ as Config, a as EMPTY_TEAM_VIEW, c as TeamChain, d as TeamMessageSource, f as TeamMessageView, g as TeamView, h as TeamTaskView, i as foldTeam, l as TeamMemberView, m as TeamTaskStatus, n as TeamFact, o as TEAM_PROJECTION_KEY, p as TeamRelation, r as TeamMemberFact, s as TeamBoardEntryView, t as TeamService, u as TeamMessageKind, v as TeamConfig } from "./service-D39Y6hXu.js";
 import { z } from "zod";
 import { Context } from "@deepseek-ai/cordis";
 import { ProjectionDefinition } from "@deepseek-ai/dsh-session-projection";
