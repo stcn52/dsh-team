@@ -1252,6 +1252,26 @@ const NO_CLOSING_MESSAGE = "It left no closing message.";
 /** The line the same notice appends for a structured return value. */
 const STRUCTURED_PREFIX = "Structured result: ";
 /**
+* What every arm of the settlement template opens with.
+*
+* `settlementSummary()` in
+* `@deepseek-ai/dsh-subagent/lib/types/continuation-messages.js` builds its line
+* as `Background subagent <childId>` plus one ending per `stopReason`, so this
+* subject — not any of the endings — is the part all of them share. It is the
+* only detector that survives the producer's own size bound: the notice stores
+* `boundContextSummary(summary)`, capped at `CONTEXT_SUMMARY_MAX_CHARS` (120)
+* with an ellipsis, which can cut the ending off a long child id while the
+* subject, at 20 characters, is always there.
+*/
+const SETTLEMENT_SUBJECT = "Background subagent";
+/**
+* The sentence one arm of that template ends with (a `completed`, continuable
+* child). Kept beside the subject because a re-shaped notice may carry the
+* sentence without opening with the subject, and because naming it is how the
+* next reader finds the phrase the first host trace happened to show.
+*/
+const SETTLEMENT_FINISHED = "finished and will do no further work";
+/**
 * Did this member's last word in the leader's mailbox come FROM it?
 *
 * A member with no live agent has three possible histories, and the mailbox
@@ -1312,9 +1332,18 @@ function mailboxRowOf(mailbox, memberId) {
 *   possibly `Structured result: …` and a diagnostic. The member's words are
 *   what sits after the marker — everything before it is the runtime speaking
 *   about the member, and a report that carried it would attribute a template
-*   sentence to the teammate. The summary is the fallback, not the body: a child
-*   that left no closing text at all ("It left no closing message.") still
-*   finished, and its one-line account is then the only thing to report.
+*   sentence to the teammate.
+*
+* A member that has not reported yet must answer `undefined` here, and so must a
+* member that settled without leaving any words: this function reports what the
+* member said, and neither of them said anything. The notice's `summary` is the
+* runtime's OWN sentence (`settlementSummary()`), so using it as a fallback —
+* which this function used to do whenever the body was empty — handed a template
+* back as an answer and put a member that had said nothing into `done`. The
+* fallback is therefore conditional: it is used only when the summary is an
+* account rather than the template (see {@link isSettlementTemplate}), and with
+* nothing readable the caller learns there is no report, which is what keeps the
+* member out of `done`.
 * @param message - one delivered message, from the inbox queue or a spliced row.
 * @returns the report text, or undefined when the message carries nothing.
 */
@@ -1330,10 +1359,74 @@ function reportTextOf(message) {
 	}
 	const source = typeof message.source === "object" && message.source !== null ? message.source : void 0;
 	const summary = typeof source?.["summary"] === "string" && source["summary"].trim() !== "" ? source["summary"].trim() : void 0;
-	const closing = source?.["kind"] === "subagent-settled" ? closingWords(texts, summary) : texts.join("\n").trim();
-	const body = closing !== "" ? closing : summary;
+	const body = source?.["kind"] === "subagent-settled" ? settlementReport(texts, summary) : texts.join("\n").trim();
 	if (body === void 0) return void 0;
 	return truncateReport(omitted === 0 ? body : `${body}\n${nonTextNote(omitted)}`);
+}
+/**
+* Is this text the runtime's own settlement template rather than something the
+* member wrote?
+*
+* Both halves are needed. The subject catches every arm of `settlementSummary()`
+* — completed (continuable or not), aborted, max-tokens, refusal, error, and the
+* merge-extensible default — including the arms whose ending the notice's
+* 120-character bound has cut off. The finished sentence catches a notice that
+* carries the ending without opening with the subject. Neither test can fire on
+* a `team_send` relay: this decision is only reached for `subagent-settled`.
+* @param text - one line the runtime wrote about the member, or the member's own.
+* @returns true when the text is the template.
+*/
+function isSettlementTemplate(text) {
+	const line = text.trim();
+	return line.startsWith(SETTLEMENT_SUBJECT) || line.includes(SETTLEMENT_FINISHED);
+}
+/**
+* What a settlement notice says in the member's own words, or undefined when it
+* says nothing of the member's.
+*
+* The body is read first, because the body is where the member's words are. It
+* is emptied of the runtime's opening line BEFORE {@link closingWords} looks for
+* the marker ({@link withoutSettlementLine}), which matters in the one shape the
+* identity test cannot catch: the notice's `summary` is the bounded projection
+* of the same line, so a long child id makes the summary a prefix of the block
+* and the block then survives a `line !== summary` filter — a half template
+* reported as an answer. Whatever the marker slicing leaves is the member's own
+* text, and only non-empty text is a report.
+*
+* The summary is the fallback for a notice whose member left no closing text at
+* all — and only when it is an account, not the template. A silent child whose
+* summary is `Background subagent … finished…` is a finished member with nothing
+* to hand back, so it answers `undefined`; a notice built by a caller that puts
+* its own account there still reports that account.
+* @param texts - the message's non-empty text blocks, in order.
+* @param summary - the notice's own one-line account, when it has one.
+* @returns the member's words, or undefined when there are none.
+*/
+function settlementReport(texts, summary) {
+	const closing = closingWords(texts.map(withoutSettlementLine).filter((text) => text !== ""), summary);
+	if (closing !== "" && !isSettlementTemplate(closing)) return closing;
+	if (summary === void 0) return void 0;
+	const account = withoutSettlementLine(summary);
+	return account === "" ? void 0 : account;
+}
+/**
+* One text the runtime wrote, with its own opening line removed.
+*
+* Three shapes reach this function. The opening line alone — every arm of the
+* template, whether or not the size bound truncated its ending — contributes
+* nothing, so it becomes the empty string and the caller drops it. The opening
+* line with the member's closing words stuck to it, which a notice whose blocks
+* were joined produces, keeps everything after the line. Any other text — the
+* marker, the member's body, a diagnostic — is returned unchanged, because
+* removing it is not this function's judgement to make: the marker and the
+* runtime's trailers are {@link closingWords}'s, and they are already its.
+* @param text - one text block or the notice's summary.
+* @returns the member-owned remainder, or an empty string when none is left.
+*/
+function withoutSettlementLine(text) {
+	if (!isSettlementTemplate(text)) return text;
+	const marker = text.indexOf(CLOSING_MARKER);
+	return (marker >= 0 ? text.slice(marker + 20) : text).split("\n").filter((line) => !isSettlementTemplate(line) && line !== NO_CLOSING_MESSAGE && !line.startsWith(STRUCTURED_PREFIX)).join("\n").trim();
 }
 /**
 * The member's own words inside one settlement notice, template removed.

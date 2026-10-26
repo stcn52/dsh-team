@@ -128,15 +128,60 @@ function settlementNotice(memberId: string, summary = 'Alice finished.'): UserMe
 }
 
 /**
+ * The runtime's opening line, reproduced arm for arm from the producer.
+ *
+ * `settlementSummary()` in
+ * `@deepseek-ai/dsh-subagent/lib/types/continuation-messages.js` is not a public
+ * export (neither it nor `createSettlementMessage()` reaches the package index),
+ * so its wording is mirrored here in the producer's own order. A case that
+ * proves the template is not mistaken for a member's answer has to be built from
+ * the sentences the runtime really writes: a phrase a test author guessed would
+ * pass against a detector that guesses the same phrase, and both would be wrong.
+ *
+ * The mirror is not free — it is the coupling the detector carries. Two producer
+ * properties matter to it and are reproduced here rather than assumed:
+ * every arm starts with the same subject (`Background subagent <childId>`), and
+ * a `completed` child has TWO endings depending on `continuable`.
+ * @param childId - the settled child's durable session id.
+ * @param stopReason - how the child's last ordinary turn ended.
+ * @param continuable - whether the child accepts a later message.
+ * @returns the notice's opening line, exactly as the runtime writes it.
+ */
+function settlementSummaryOf(
+  childId: string,
+  stopReason = 'completed',
+  continuable = true,
+): string {
+  const subject = `Background subagent ${childId}`
+  switch (stopReason) {
+    case 'completed':
+      return continuable
+        ? `${subject} finished and will do no further work unless you send it more.`
+        : `${subject} finished. It cannot receive follow-up messages.`
+    case 'aborted':
+      return `${subject} was stopped before it finished.`
+    case 'max-tokens':
+      return `${subject} ran out of room before it finished.`
+    case 'refusal':
+      return `${subject} declined the task.`
+    case 'error':
+      return `${subject} failed before it finished.`
+    default:
+      return `${subject} ended abnormally (${stopReason}) before it finished.`
+  }
+}
+
+/**
  * Build the settlement notice exactly as the harness builds it.
  *
  * `createSettlementMessage()` in
  * `@deepseek-ai/dsh-subagent/lib/types/continuation-messages.js` is not a public
- * export, so its shape is mirrored here: the runtime's one-line summary, then the
- * literal marker `Its closing message:`, then the child's own text — or, for a
- * silent child, `It left no closing message.` That template is exactly what the
- * wait must strip: a report that carried it would attribute a sentence the
- * runtime wrote about the member to the member itself.
+ * export, so its shape is mirrored here: the runtime's one-line summary (see
+ * {@link settlementSummaryOf}), then the literal marker `Its closing message:`,
+ * then the child's own text — or, for a silent child, `It left no closing
+ * message.` That template is exactly what the wait must strip: a report that
+ * carried it would attribute a sentence the runtime wrote about the member to
+ * the member itself.
  * @param memberId - the child session that settled.
  * @param closing - the child's closing text blocks; empty for a silent child.
  * @param summary - the one-line account the notice carries, when a case wants its own.
@@ -147,8 +192,7 @@ function settlementWithClosing(
   closing: readonly string[],
   summary?: string,
 ): UserMessage {
-  const line = summary ?? `Background subagent ${memberId} finished and will do no further work `
-    + 'unless you send it more.'
+  const line = summary ?? settlementSummaryOf(memberId)
   return createUserMessage({
     content: [
       { type: 'text', text: line },
@@ -2160,20 +2204,175 @@ describe('wait', () => {
   })
 
   /**
-   * The empty half of the same rule. A child that produced no closing text still
-   * finished, and the one-line account remains: reporting nothing would hide a
-   * completion the wait just confirmed, while reporting the template would fake a
-   * sentence. The summary is the honest floor.
+   * The regression lock for the host trace that found the defect.
+   *
+   * `reportTextOf()` stripped the template out of the notice's BODY and then fell
+   * back to `source.summary` whenever nothing was left — but for a settlement
+   * notice the summary IS the template (`settlementSummary()`), so a member whose
+   * words had not arrived yet was handed back as
+   * `Background subagent … finished and will do no further work unless you send
+   * it more.` and counted in `done`. The host answered
+   * `all finished: a, b` with that sentence as a's report while a had said
+   * nothing at all. A wait that returns the runtime's own sentence as the
+   * member's answer is worse than one that returns nothing: the leader believes
+   * the teammate said it.
+   *
+   * No readable words must therefore mean what it means everywhere else in the
+   * wait — finished, report not observed: `busy`, with no `done` entry and no
+   * `reports` entry.
    */
-  it('falls back to the notice summary when the member left no closing text', async () => {
+  it('does not hand the settlement template back as a member’s report', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    // Exactly what the runtime delivers for a child that ended before it wrote
+    // anything: its template, then `It left no closing message.`
+    scene.leader.inbox.nextStep.push(settlementWithClosing(alice.id, []))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+
+    expect(observed.done).toEqual([])
+    expect(observed.busy).toEqual(['Alice'])
+    expect(observed.cold).toEqual([])
+    expect(observed.reports).toEqual([])
+    // The acceptance criterion, stated as the thing that must never appear.
+    for (const report of observed.reports) expect(report.text).not.toContain('Background subagent')
+  })
+
+  /**
+   * The host trace that reported this, reproduced as one round: two members, one
+   * that had handed its work back and one that had merely settled. The real host
+   * answered `all finished: a, b` — b with `CLOSED-T5`, and a with
+   * `Background subagent b4fa2d9d-… finished and will do no further work unless
+   * you send it more.` as its report, while a had said nothing at all. The
+   * acceptance criterion in the caller's own terms: one member in `done` with the
+   * text it reported, the other in `busy`, and no template anywhere in `reports`.
+   */
+  it('separates the member that reported from the member that only settled', async () => {
+    const scene = world()
+    const a = await spawn(scene, 'a', { childId: 'b4fa2d9d-858f-452c-beb7-ad8c636e8380' })
+    const b = await spawn(scene, 'b', { childId: 'child-b' })
+    scene.leader.inbox.nextStep.push(
+      settlementWithClosing(a.id, []),
+      settlementWithClosing(b.id, ['CLOSED-T5']),
+    )
+    scene.agents.remove(a.id)
+    scene.agents.remove(b.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+
+    expect(observed.done).toEqual(['b'])
+    expect(observed.busy).toEqual(['a'])
+    expect(observed.reports).toEqual([{ member: 'b', text: 'CLOSED-T5' }])
+    for (const report of observed.reports) expect(report.text).not.toContain('Background subagent')
+  })
+
+  /**
+   * The same rule for every arm of the template, not only the one the host trace
+   * showed: `settlementSummary()` has an ending per `stopReason`, and five of the
+   * six do not contain the `finished and will do no further work` sentence at
+   * all. A detector keyed on that sentence alone — the quickest possible fix —
+   * would let an aborted, truncated, refused or failed child through, in exactly
+   * the moment a leader is most likely to be misled about what a member did.
+   * The arms are built by {@link settlementSummaryOf}, from the producer's own
+   * wording, so this case also fails if the runtime rewords its template.
+   */
+  it.each([
+    { stopReason: 'completed', continuable: true },
+    { stopReason: 'completed', continuable: false },
+    { stopReason: 'aborted', continuable: true },
+    { stopReason: 'max-tokens', continuable: true },
+    { stopReason: 'refusal', continuable: true },
+    { stopReason: 'error', continuable: true },
+    { stopReason: 'an-unnameable-ending', continuable: true },
+  ])('refuses the $stopReason template as a report', async ({ stopReason, continuable }) => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const template = settlementSummaryOf(alice.id, stopReason, continuable)
+    scene.leader.inbox.nextStep.push(settlementWithClosing(alice.id, [], template))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+
+    expect(observed.reports).toEqual([])
+    expect(observed.done).toEqual([])
+    expect(observed.busy).toEqual(['Alice'])
+  })
+
+  /**
+   * Why the detector cannot be the sentence, in one case: the notice's durable
+   * `summary` is `boundContextSummary(summary)`, bounded to
+   * `CONTEXT_SUMMARY_MAX_CHARS` (120) with an ellipsis
+   * (`@deepseek-ai/dsh-llm/lib/types/message.js`). A child id long enough pushes
+   * `finished and will do no further work` past that bound, so the stored summary
+   * keeps the subject and loses the ending — while the message BODY still carries
+   * the whole template. Keyed on the sentence, the detector would report a
+   * half-template as a member's answer here; keyed on the subject, it cannot,
+   * because every arm of `settlementSummary()` opens with it.
+   */
+  it('detects the template in a summary bounded short of its ending', async () => {
+    const scene = world()
+    // 90 characters, so the 120-char bound falls inside the finished sentence.
+    const childId = `child-${'x'.repeat(84)}`
+    const alice = await spawn(scene, 'Alice', { childId })
+    const template = settlementSummaryOf(alice.id)
+    const bounded = `${template.slice(0, 119)}\u2026`
+    // The construction asserts its own premise: the surviving summary must have
+    // lost the sentence, or this case would prove nothing about truncation.
+    expect(bounded).not.toContain('finished and will do no further work')
+    scene.leader.inbox.nextStep.push(createUserMessage({
+      content: [
+        { type: 'text', text: template },
+        { type: 'text', text: 'It left no closing message.' },
+      ],
+      source: {
+        kind: 'subagent-settled', form: 'notice', summary: bounded, senderSessionId: SessionId(alice.id),
+      },
+    }))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+
+    expect(observed.done).toEqual([])
+    expect(observed.busy).toEqual(['Alice'])
+    expect(observed.reports).toEqual([])
+  })
+
+  /**
+   * The other side of the same read, so the fix cannot become "ignore the body
+   * when a summary exists": a message that carries the member's words and no
+   * one-line account at all still reports those words. `subagent-settled` cannot
+   * be that message — its source type requires `form` and `summary` — so the
+   * shape without a summary is the one a member writes itself, `team-message`,
+   * and it must keep working untouched.
+   */
+  it('reports a member whose words arrive without any notice summary', async () => {
     const scene = world()
     const alice = await spawn(scene, 'Alice')
-    const summary = 'Background subagent child-1 finished and will do no further work unless you send it more.'
-    scene.leader.inbox.nextStep.push(settlementWithClosing(alice.id, [], summary))
+    scene.leader.session.events.push(inboxSplicedEvent([queuedReply(alice.id, 'Alice', 'CLOSED-T4')]))
     scene.agents.remove(alice.id)
 
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
-    expect(observed.reports).toEqual([{ member: 'Alice', text: summary }])
+
+    expect(observed.done).toEqual(['Alice'])
+    expect(observed.reports).toEqual([{ member: 'Alice', text: 'CLOSED-T4' }])
+  })
+
+  /**
+   * And the precedence, in the one shape that can be both: a notice that carries
+   * a real account AND the member's own words reports the words. A fix written
+   * as "prefer the summary unless it is the template" would answer `Alice
+   * finished.` here — an account of the member standing in for what it said.
+   */
+  it('prefers a member’s own words over the account of them', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.inbox.nextStep.push(settlementWithClosing(alice.id, ['CLOSED-T4'], 'Alice finished.'))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+
+    expect(observed.reports).toEqual([{ member: 'Alice', text: 'CLOSED-T4' }])
   })
 
   /**
