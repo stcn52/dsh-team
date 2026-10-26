@@ -12,7 +12,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { ToolDefinition, ToolResult, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { foldTeam, readFact } from '../src/fold.ts'
 import { TeamError } from '../src/errors.ts'
-import { REPORT_LINE_MAX_CHARS, dismissTool, listTool, relationTool, sendTool, spawnTool, taskTool, waitTool } from '../src/tools.ts'
+import { REPORT_LINE_MAX_CHARS, dismissTool, listTool, relationTool, sendTool, spawnTool, taskCloseTool, taskTool, waitTool } from '../src/tools.ts'
 import { waitReport } from '../src/client/toolResult.ts'
 import { fakeAgent, fakeExec, toolResultEvent, type FakeAgent } from './harness.ts'
 
@@ -47,6 +47,11 @@ class FakeTeam {
   upsertTask(...args: unknown[]): unknown {
     this.record('upsertTask', ...args)
     return { taskId: 't1', title: 'ship it', status: 'active', assigneeId: 'child-1' }
+  }
+
+  closeTask(...args: unknown[]): unknown {
+    this.record('closeTask', ...args)
+    return { taskId: 't1', title: 'ship it', status: 'done', assigneeId: 'child-1', note: 'merged' }
   }
 
   setRelation(...args: unknown[]): unknown {
@@ -289,6 +294,44 @@ describe('team_task', () => {
     expect(tool.presentCall?.({ task_id: 't1', status: 'done' })).toMatchObject({ title: 'Update task t1' })
     expect(tool.presentResult?.({ title: 'ship it' }, ok())).toMatchObject({ title: 'Task added: ship it' })
     expect(tool.presentResult?.({ task_id: 't1' }, ok())).toMatchObject({ title: 'Task t1 updated' })
+  })
+})
+
+describe('team_task_close', () => {
+  /** The member whose own row is being closed. */
+  const alice = fakeAgent('child-1', { parent: 'leader-1' })
+
+  it('closes through closeTask — never through the leader write — and folds back as the whole row', async () => {
+    const tool = taskCloseTool(ctx)
+    const args = { task_id: 't1', note: 'merged' }
+    const value = await run(tool, args, alice)
+    expect(team.calls).toEqual([{ op: 'closeTask', args: [alice.agent, 't1', 'merged'] }])
+    // The same fact shape `team_task` projects: one vocabulary, two audiences.
+    expect(readFact(tool.output.presentationMeta?.(args, value))).toEqual({
+      team: 'task',
+      task: { taskId: 't1', title: 'ship it', status: 'done', assigneeId: 'child-1', note: 'merged' },
+    })
+  })
+
+  it('carries only the two fields a close needs', () => {
+    const tool = taskCloseTool(ctx)
+    const schema = tool.parameters as unknown as {
+      properties?: Record<string, unknown>
+      required?: readonly string[]
+    }
+    // Everything the leader's `team_task` can reach that a member must not:
+    // creation, renaming, reassignment.
+    expect(Object.keys(schema.properties ?? {}).sort()).toEqual(['note', 'task_id'])
+    expect(schema.required).toEqual(['task_id'])
+  })
+
+  it('titles the card by what the call does', () => {
+    const tool = taskCloseTool(ctx)
+    expect(tool.presentCall?.({ task_id: 't1' })).toMatchObject({ title: 'Close task t1' })
+    expect(tool.presentResult?.({ task_id: 't1' }, ok())).toMatchObject({ title: 'Task t1 closed' })
+    expect(tool.presentResult?.({ task_id: 't1' }, failed('UNAUTHORIZED'))).toMatchObject({
+      title: 'Close task t1', content: [{ type: 'text', text: 'failed: UNAUTHORIZED' }],
+    })
   })
 })
 

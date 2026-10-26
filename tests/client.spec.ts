@@ -417,7 +417,7 @@ describe('the view tab', () => {
 describe('chat contributions', () => {
   it('registers a card for every team tool, including calls before a team exists', () => {
     expect(toolViews.map(entry => entry.key)).toEqual([
-      'team_spawn', 'team_send', 'team_task', 'team_relation',
+      'team_spawn', 'team_send', 'team_task', 'team_task_close', 'team_relation',
       'team_dismiss', 'team_list', 'team_note', 'team_board',
       'team_wait', 'team_learn', 'team_profile', 'team_review', 'team_forget',
     ])

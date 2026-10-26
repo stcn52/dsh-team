@@ -25,10 +25,10 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { describe, expect, it } from 'vitest'
 import type { TeamConfig } from './config.ts'
 import { EMPTY_TEAM_VIEW } from './contract.ts'
-import { foldTeam, TEAM_MEMBER_RECORD, type TeamMemberRecord } from './fold.ts'
+import { foldTeam, TEAM_MEMBER_RECORD, TEAM_TASK_RECORD, type TeamMemberRecord } from './fold.ts'
 import { TeamService } from './service.ts'
 import { taskTool } from './tools.ts'
-import { toolResultEvent, userMessageEvent, FakeSubagents } from '../tests/harness.ts'
+import { toolResultEvent, userMessageEvent, fakeAgent, FakeSubagents } from '../tests/harness.ts'
 
 const CONFIG: TeamConfig = {
   provider: 'spawn', maxTeammates: 4, maxRecentMessages: 20, maxChainHops: 4, maxChainRoundTrips: 2,
@@ -213,10 +213,19 @@ function durableWorld(seed?: readonly SessionEvent[]): {
   readonly service: TeamService
   readonly leader: Agent
   readonly log: () => readonly SessionEvent[]
+  /** Publish one live agent into `ctx.agents`, as the runtime does for a teammate. */
+  readonly register: (agent: Agent) => void
 } {
   const ctx = new Context()
   const sessions = new SessionStore(ctx)
-  ctx.provide('agents', { get: () => undefined, list: () => [] })
+  // The live-agent directory. Empty by default, exactly like a cold host where
+  // no teammate is resident; a member-side call needs a resident leader and
+  // itself, so the test that makes one registers both.
+  const live = new Map<string, Agent>()
+  ctx.provide('agents', {
+    get: (id: string) => live.get(String(id)),
+    list: () => [...live.values()],
+  })
   ctx.provide('subagents', new FakeSubagents())
   const session = sessions.create(SessionId('leader-1'), seed === undefined ? undefined : { seed })
   const leader = {
@@ -225,8 +234,16 @@ function durableWorld(seed?: readonly SessionEvent[]): {
     session,
     options: {},
   } as unknown as Agent
+  live.set('leader-1', leader)
   const service = new TeamService(ctx, CONFIG)
-  return { ctx, sessions, service, leader, log: () => session.snapshotEvents() }
+  return {
+    ctx,
+    sessions,
+    service,
+    leader,
+    log: () => session.snapshotEvents(),
+    register: (agent: Agent) => { live.set(agent.id, agent) },
+  }
 }
 
 describe('through a real session log', () => {
@@ -408,6 +425,59 @@ describe('the task list through a real session log', () => {
     expect(restarted.service.list(restarted.leader).tasks).toEqual([
       { taskId: 't1', title: 'ship it', status: 'done' },
       { taskId: 't2', title: 'review notes', status: 'pending' },
+    ])
+  })
+
+  /**
+   * The member-side close is the one task write that does NOT happen inside the
+   * leader's session: `team_task_close` runs in the MEMBER's turn, so its tool
+   * result is committed to the member's own log, which the leader's fold never
+   * reads.
+   *
+   * That makes this the test that separates a real close from a memory-only one.
+   * A close that only mutates the live team reads `done` in `team_list` until the
+   * page is refreshed, and then reads the row as still `pending`, because the
+   * leader's log never heard about it. The assertion below reads the LEADER's log
+   * with nothing else touched — the exact fold a refresh performs.
+   */
+  it('keeps a MEMBER\'s close in the leader log, so a refresh still reads done', async () => {
+    const { ctx, service, leader, log, register } = durableWorld()
+    // The roster the close is checked against, and the live agents the
+    // member-side call resolves through.
+    appendPluginRecord(leader.session, TEAM_MEMBER_RECORD, {
+      version: 1, op: 'upsert', member: member(),
+    })
+    const alice = fakeAgent('child-1', { parent: 'leader-1' })
+    register(alice.agent)
+    // The leader's own assignment through the real tool, so the row starts in
+    // the log exactly as a live session leaves it.
+    await settleTeamCall(leader.session, taskTool(ctx), { title: 'ship it', assignee: 'child-1' }, leader, 'call-1')
+
+    expect(service.closeTask(alice.agent, 't1', 'merged'))
+      .toMatchObject({ taskId: 't1', status: 'done', note: 'merged' })
+
+    // The wire half: the close landed as ONE ignorable plugin record on the
+    // leader's log, carrying the same `{ team: 'task', task }` fact the leader's
+    // own `team_task` projects — not a member-log artifact and not a released
+    // event type invented for this.
+    const closings = log().filter(event => pluginRecordOf(event)?.type === TEAM_TASK_RECORD)
+    expect(closings).toHaveLength(1)
+    expect(closings[0]?.ignorable).toBe(true)
+    expect(pluginRecordOf(closings[0]!)?.data).toEqual({
+      team: 'task',
+      task: { taskId: 't1', title: 'ship it', status: 'done', assigneeId: 'child-1', note: 'merged' },
+    })
+
+    // The durable half, on the LEADER's side: fold the committed log, no RPC,
+    // no in-memory team map.
+    expect(foldTeam(log(), CONFIG.maxRecentMessages).tasks).toEqual([
+      { taskId: 't1', title: 'ship it', assigneeId: 'child-1', status: 'done', note: 'merged' },
+    ])
+
+    // And a restarted host seeded with that log alone reads the same row.
+    const restarted = durableWorld(log())
+    expect(restarted.service.list(restarted.leader).tasks).toEqual([
+      { taskId: 't1', title: 'ship it', assigneeId: 'child-1', status: 'done', note: 'merged' },
     ])
   })
 })

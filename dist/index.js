@@ -713,6 +713,16 @@ function readDispatchFact(view, data, time) {
 * `appendPluginRecord`, the event carries `ignorable: true`.
 */
 const TEAM_MEMBER_RECORD = "plugin:dsh-team/member";
+/**
+* The record name one MEMBER-side change to the shared task list commits under.
+*
+* A member's tool result is written to the MEMBER's session log, which this
+* fold never reads for the leader, so a member that closes its own row
+* (`TeamService.closeTask`) publishes the row to the LEADER's log here.
+* It carries the same `{ team: 'task', task }` fact the leader's own
+* `team_task` result projects: one vocabulary, two transports, one fold.
+*/
+const TEAM_TASK_RECORD = "plugin:dsh-team/task";
 /** The plugin-record type grammar, mirrored from the session package. */
 const PLUGIN_RECORD_TYPE = /^plugin:[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/u;
 /**
@@ -1107,6 +1117,10 @@ function applyTeamEvent(view, event, bound) {
 		const fact = readMemberRecord(record.data);
 		return fact === void 0 ? view : applyFact(view, fact, event.time, bound);
 	}
+	if (record !== void 0 && record.type === "plugin:dsh-team/task") {
+		const fact = readFact(record.data);
+		return fact !== void 0 && fact.team === "task" ? applyFact(view, fact, event.time, bound) : view;
+	}
 	if (event.type === "tool/result") {
 		if (event.data.error !== void 0) return view;
 		return applyFacts(view, readFacts(event.data.meta), event.time, bound);
@@ -1212,6 +1226,174 @@ function teamProjection(maxRecentMessages) {
 	};
 }
 //#endregion
+//#region src/report.ts
+/**
+* Longest report text one `team_wait` answer carries, in characters.
+*
+* A finished member's closing message is the answer the leader was waiting for,
+* but a tool result becomes model-visible context on every later step of that
+* turn, so one verbose member could otherwise spend a whole context window on
+* its own transcript — and a wait over five members multiplies that by five.
+* The deadline is `WAIT_REPORT_MAX_CHARS` per report, head kept, tail replaced
+* by `…` (see {@link truncateReport}): the conclusion of a report starts where
+* the report starts, while the part that overflows is nearly always the
+* supporting detail a leader that needs it can ask for with one more message.
+*/
+const WAIT_REPORT_MAX_CHARS = 2e3;
+/**
+* The line the continuation manager puts in front of a settled child's own
+* closing words (`createSettlementMessage` in `@deepseek-ai/dsh-subagent`).
+* Everything after it is the member's text; everything before it is the
+* runtime's template, which is exactly what a report must not carry.
+*/
+const CLOSING_MARKER = "Its closing message:";
+/** What the same notice says instead of {@link CLOSING_MARKER} for a silent child. */
+const NO_CLOSING_MESSAGE = "It left no closing message.";
+/** The line the same notice appends for a structured return value. */
+const STRUCTURED_PREFIX = "Structured result: ";
+/**
+* Did this member's last word in the leader's mailbox come FROM it?
+*
+* A member with no live agent has three possible histories, and the mailbox
+* separates the one that looked like a cold member: it ran, reported back, and
+* was reaped. The test is the LAST row that names the member, not "any row from
+* it": a report from an earlier round must not disguise a delivery that has been
+* addressed to it since, because that delivery may simply not have woken it yet
+* — the over-claim this guard exists for. A row addressed to it therefore
+* outranks any older report of its own.
+*
+* The feed is bounded (`maxRecentMessages`), so an old enough report can be
+* evicted; the target then falls back to `cold`, which under-claims rather than
+* over-claims, and `cold` no longer asserts "never started".
+* @param mailbox - the leader's durable mailbox rows, newest last.
+* @param memberId - the member's session id, which is also a row's `from`.
+* @returns true when the member's most recent mailbox row is its own.
+*/
+function reportedBack(mailbox, memberId) {
+	for (let index = mailbox.length - 1; index >= 0; index -= 1) {
+		const row = mailbox[index];
+		if (row.from === memberId) return true;
+		if (row.to === memberId) return false;
+	}
+	return false;
+}
+/**
+* The LAST mailbox row this member wrote, whose text is what it said.
+*
+* Mailbox rows are the durable surface: a report that reached the leader in an
+* earlier process is still here after a restart, with the delivered text (a
+* `team_send` reply) or the notice's one-line account on it. It is read LAST,
+* because a live queue or a spliced row is the same message with its full
+* content; this one is the fallback for the case where neither was observed.
+* @param mailbox - the leader's durable mailbox rows, newest last.
+* @param memberId - the member's session id, which is also a row's `from`.
+* @returns its newest own row, or undefined when it has none.
+*/
+function mailboxRowOf(mailbox, memberId) {
+	for (let index = mailbox.length - 1; index >= 0; index -= 1) {
+		const row = mailbox[index];
+		if (row.from === memberId) return row;
+	}
+}
+/**
+* What one member's delivered message says, with the runtime's template removed
+* and the result bounded to {@link WAIT_REPORT_MAX_CHARS}.
+*
+* The content is read as blocks because that is what a message is: every `text`
+* block is the member's own words and they are joined with newlines, while a
+* non-text block (an image, an attachment) cannot be carried through a tool
+* result at all — it is skipped and counted, and the count is stated in the text
+* so the leader knows something was dropped rather than silently losing it.
+*
+* Two shapes arrive here, and only one of them is templated:
+* - a `team_send` relay (`team-message`), whose content IS what the member wrote;
+* - a settlement notice (`subagent-settled`), which the harness builds as
+*   `summary`, then `Its closing message:`, then the child's closing text, then
+*   possibly `Structured result: …` and a diagnostic. The member's words are
+*   what sits after the marker — everything before it is the runtime speaking
+*   about the member, and a report that carried it would attribute a template
+*   sentence to the teammate. The summary is the fallback, not the body: a child
+*   that left no closing text at all ("It left no closing message.") still
+*   finished, and its one-line account is then the only thing to report.
+* @param message - one delivered message, from the inbox queue or a spliced row.
+* @returns the report text, or undefined when the message carries nothing.
+*/
+function reportTextOf(message) {
+	const texts = [];
+	let omitted = 0;
+	for (const block of message.content) {
+		if (block.type !== "text") {
+			omitted += 1;
+			continue;
+		}
+		if (block.text.trim() !== "") texts.push(block.text);
+	}
+	const source = typeof message.source === "object" && message.source !== null ? message.source : void 0;
+	const summary = typeof source?.["summary"] === "string" && source["summary"].trim() !== "" ? source["summary"].trim() : void 0;
+	const closing = source?.["kind"] === "subagent-settled" ? closingWords(texts, summary) : texts.join("\n").trim();
+	const body = closing !== "" ? closing : summary;
+	if (body === void 0) return void 0;
+	return truncateReport(omitted === 0 ? body : `${body}\n${nonTextNote(omitted)}`);
+}
+/**
+* The member's own words inside one settlement notice, template removed.
+*
+* The marker is the precise half: `Its closing message:` is what the continuation
+* manager puts directly in front of the child's text, so slicing at it cannot
+* mistake a member's sentence for a template line, and the two runtime trailers
+* after the child's words (`Structured result: …`, a diagnostic) are dropped by
+* what they are. Stripping lines by pattern is only the fallback, for a notice
+* that carries no marker at all (an older row, or a re-shaped notice whose writer
+* kept the summary but dropped the separator).
+* @param texts - the message's non-empty text blocks, in order.
+* @param summary - the notice's own one-line account, when it has one.
+* @returns the member's words, or an empty string when it wrote none.
+*/
+function closingWords(texts, summary) {
+	const marker = texts.indexOf(CLOSING_MARKER);
+	if (marker >= 0) return texts.slice(marker + 1).filter((line) => !line.startsWith(STRUCTURED_PREFIX) && line !== NO_CLOSING_MESSAGE).join("\n").trim();
+	return texts.filter((line) => line !== summary && line !== NO_CLOSING_MESSAGE && !line.startsWith(STRUCTURED_PREFIX)).join("\n").trim();
+}
+/** How a skipped block is disclosed inside the report text. */
+function nonTextNote(count) {
+	return `[+${count} non-text block${count === 1 ? "" : "s"} omitted]`;
+}
+/**
+* Bound one report to {@link WAIT_REPORT_MAX_CHARS}, head kept and the cut marked.
+*
+* The ellipsis is inside the bound, not after it, so the ceiling is one number a
+* caller can rely on; `…` rather than a sentence of our own keeps the truncation
+* visible without pretending to be the member's own words.
+* @param text - the report text, of any length.
+* @returns the text itself when it fits, else its head and `…`.
+*/
+function truncateReport(text) {
+	if (text.length <= 2e3) return text;
+	return `${text.slice(0, 1999)}…`;
+}
+/**
+* The sender one queued leader-inbox message is attributed to, or undefined
+* when the message is not a teammate report at all.
+*
+* Two kinds carry a member's report into the leader's inbox:
+* - `team-message`, built by this plugin's `deliver` for an explicit
+*   `team_send` reply (`senderSessionId`, `senderName`, `chainId`, `hop`);
+* - `subagent-settled`, built by the harness's continuation manager when the
+*   child's turn ends (`form: 'notice'`, `summary`, `senderSessionId`). This is
+*   what a member that simply ANSWERS leaves behind — the reported bug's shape.
+* Reading the sender, not the text, is what makes the answer per-member.
+* @param source - the message's durable attribution.
+* @returns the sender's session id, or undefined for any other source.
+*/
+function reportSenderOf(source) {
+	if (typeof source !== "object" || source === null) return void 0;
+	const record = source;
+	const kind = record["kind"];
+	if (kind !== "team-message" && kind !== "subagent-settled") return void 0;
+	const sender = record["senderSessionId"];
+	return typeof sender === "string" ? sender : void 0;
+}
+//#endregion
 //#region src/service.ts
 /**
 * The agent-team service: roster, mailbox routing with its relation-based
@@ -1249,30 +1431,6 @@ const WAIT_DEFAULT_MS = 12e4;
 * this only makes a stuck roster invisible for longer.
 */
 const WAIT_MAX_MS = 6e5;
-/**
-* Longest report text one `team_wait` answer carries, in characters.
-*
-* A finished member's closing message is the answer the leader was waiting for,
-* but a tool result becomes model-visible context on every later step of that
-* turn, so one verbose member could otherwise spend a whole context window on
-* its own transcript — and a wait over five members multiplies that by five.
-* The deadline is `WAIT_REPORT_MAX_CHARS` per report, head kept, tail replaced
-* by `…` (see {@link truncateReport}): the conclusion of a report starts where
-* the report starts, while the part that overflows is nearly always the
-* supporting detail a leader that needs it can ask for with one more message.
-*/
-const WAIT_REPORT_MAX_CHARS = 2e3;
-/**
-* The line the continuation manager puts in front of a settled child's own
-* closing words (`createSettlementMessage` in `@deepseek-ai/dsh-subagent`).
-* Everything after it is the member's text; everything before it is the
-* runtime's template, which is exactly what a report must not carry.
-*/
-const CLOSING_MARKER = "Its closing message:";
-/** What the same notice says instead of {@link CLOSING_MARKER} for a silent child. */
-const NO_CLOSING_MESSAGE = "It left no closing message.";
-/** The line the same notice appends for a structured return value. */
-const STRUCTURED_PREFIX = "Structured result: ";
 /**
 * How long `team_wait` lets a just-accepted delivery settle before it reads the
 * roster. `team_send` is asynchronous by contract: its prompt is accepted into
@@ -1386,10 +1544,43 @@ var TeamService = class extends Service {
 	* @param record - the WHOLE post-change roster fact.
 	*/
 	publish(leader, record) {
-		try {
+		this.commit(leader, record.op, () => {
 			appendPluginRecord(leader.session, TEAM_MEMBER_RECORD, record);
+		});
+	}
+	/**
+	* Commit one MEMBER-side task change to the LEADER's log.
+	*
+	* The same durability contract as {@link publish}, for the same reason seen
+	* from the other side: the closing member's tool result is committed to the
+	* MEMBER's log, so without this the leader's fold — and therefore a refreshed
+	* panel and a restarted host — would read the row as still open. What is
+	* published is the whole post-change row in the fact shape the leader's own
+	* `team_task` already projects, so both authorships fold through one arm.
+	* @param leader - the leader whose session log carries the team.
+	* @param task - the WHOLE post-change task.
+	*/
+	publishTask(leader, task) {
+		const record = {
+			team: "task",
+			task
+		};
+		this.commit(leader, "task", () => {
+			appendPluginRecord(leader.session, TEAM_TASK_RECORD, record);
+		});
+	}
+	/**
+	* The shared half of {@link publish} and {@link publishTask}: append, report a
+	* refusal instead of failing the already-applied change, checkpoint the log.
+	* @param leader - the leader whose session log receives the record.
+	* @param label - what changed, for the log line a refusal writes.
+	* @param append - the append itself, which alone may refuse.
+	*/
+	commit(leader, label, append) {
+		try {
+			append();
 		} catch (error) {
-			this.ctx.logger.warn("dsh-team: publishing %s to the session log failed: %s", record.op, String(error));
+			this.ctx.logger.warn("dsh-team: publishing %s to the session log failed: %s", label, String(error));
 			return;
 		}
 		this.ctx.sessions.flush(leader.session);
@@ -1515,9 +1706,10 @@ var TeamService = class extends Service {
 		return { deliveries };
 	}
 	/**
-	* Create or update one shared task. Writes are the leader's: a teammate's
-	* own tool calls land in its own log, which the leader's durable team state
-	* never reads — teammates report, and the leader records the outcome.
+	* Create or update one shared task. This is the leader's WRITE half: the
+	* shape of the list (title, owner, status, note) is set here and nowhere
+	* else, while a teammate's one write is the close in {@link closeTask} — a
+	* member cannot create a row, rename one, or hand one to somebody else.
 	* @param leader - the acting leader agent.
 	* @param spec - a new task (title) or an update to an existing one (taskId).
 	* @returns the whole post-change task.
@@ -1551,6 +1743,47 @@ var TeamService = class extends Service {
 			...spec.note !== void 0 ? { note: spec.note } : {}
 		};
 		actor.team.tasks.set(task.taskId, task);
+		this.ctx.emit("team/changed", { leaderId: actor.leader.id });
+		return task;
+	}
+	/**
+	* Close ONE task the acting teammate owns.
+	*
+	* The narrow half of {@link upsertTask}, and narrow on purpose: a teammate may
+	* set `done` and record a note on a row that is assigned to ITSELF, nothing
+	* more. Ownership is the check that matters — a member must not be able to
+	* close a peer's row (the peer may still be working, and a closed row is the
+	* leader's evidence that work finished), and must not be able to hand a row to
+	* itself first. Title, assignee and creation therefore have no arm here.
+	*
+	* The close is durable from the MEMBER'S side of a boundary that used to be
+	* one-way: a member's tool result lands in the member's own session log, which
+	* the leader's fold never reads, so this method publishes the whole post-change
+	* row to the LEADER's log itself ({@link publishTask}) — the same durable half
+	* a leader-side `team_task` gets from its tool result. Without that, a leader
+	* whose page is refreshed right after a member finishes would read the row as
+	* still open.
+	* @param member - the acting teammate agent.
+	* @param taskId - the row to close, as `team_list` shows it.
+	* @param note - one line recorded with the close, e.g. what it delivered.
+	* @returns the whole post-change task.
+	* @throws {TeamError} when the actor is not a member, the task is unknown, or
+	*   the task is assigned to somebody else (or to nobody).
+	*/
+	closeTask(member, taskId, note) {
+		const actor = this.resolveActor(member);
+		const self = actor.member;
+		if (self === void 0) throw new TeamError("UNAUTHORIZED", "only a teammate closes a task; the leader updates the whole row with team_task");
+		const previous = actor.team.tasks.get(taskId);
+		if (previous === void 0) throw new TeamError("UNKNOWN_TASK", taskId);
+		if (previous.assigneeId !== self.memberId) throw new TeamError("UNAUTHORIZED", previous.assigneeId === void 0 ? `task ${taskId} is unassigned, so only the leader can close it` : `task ${taskId} is assigned to ${previous.assigneeId}, not to you (${self.memberId})`);
+		const task = {
+			...previous,
+			status: "done",
+			...note !== void 0 ? { note } : {}
+		};
+		actor.team.tasks.set(task.taskId, task);
+		this.publishTask(actor.leader, task);
 		this.ctx.emit("team/changed", { leaderId: actor.leader.id });
 		return task;
 	}
@@ -2868,126 +3101,6 @@ function findByName(team, name) {
 	for (const member of team.members.values()) if (member.name.toLowerCase() === wanted) return member;
 }
 /**
-* Did this member's last word in the leader's mailbox come FROM it?
-*
-* A member with no live agent has three possible histories, and the mailbox
-* separates the one that looked like a cold member: it ran, reported back, and
-* was reaped. The test is the LAST row that names the member, not "any row from
-* it": a report from an earlier round must not disguise a delivery that has been
-* addressed to it since, because that delivery may simply not have woken it yet
-* — the over-claim this guard exists for. A row addressed to it therefore
-* outranks any older report of its own.
-*
-* The feed is bounded (`maxRecentMessages`), so an old enough report can be
-* evicted; the target then falls back to `cold`, which under-claims rather than
-* over-claims, and `cold` no longer asserts "never started".
-* @param mailbox - the leader's durable mailbox rows, newest last.
-* @param memberId - the member's session id, which is also a row's `from`.
-* @returns true when the member's most recent mailbox row is its own.
-*/
-function reportedBack(mailbox, memberId) {
-	for (let index = mailbox.length - 1; index >= 0; index -= 1) {
-		const row = mailbox[index];
-		if (row.from === memberId) return true;
-		if (row.to === memberId) return false;
-	}
-	return false;
-}
-/**
-* The LAST mailbox row this member wrote, whose text is what it said.
-*
-* Mailbox rows are the durable surface: a report that reached the leader in an
-* earlier process is still here after a restart, with the delivered text (a
-* `team_send` reply) or the notice's one-line account on it. It is read LAST,
-* because a live queue or a spliced row is the same message with its full
-* content; this one is the fallback for the case where neither was observed.
-* @param mailbox - the leader's durable mailbox rows, newest last.
-* @param memberId - the member's session id, which is also a row's `from`.
-* @returns its newest own row, or undefined when it has none.
-*/
-function mailboxRowOf(mailbox, memberId) {
-	for (let index = mailbox.length - 1; index >= 0; index -= 1) {
-		const row = mailbox[index];
-		if (row.from === memberId) return row;
-	}
-}
-/**
-* What one member's delivered message says, with the runtime's template removed
-* and the result bounded to {@link WAIT_REPORT_MAX_CHARS}.
-*
-* The content is read as blocks because that is what a message is: every `text`
-* block is the member's own words and they are joined with newlines, while a
-* non-text block (an image, an attachment) cannot be carried through a tool
-* result at all — it is skipped and counted, and the count is stated in the text
-* so the leader knows something was dropped rather than silently losing it.
-*
-* Two shapes arrive here, and only one of them is templated:
-* - a `team_send` relay (`team-message`), whose content IS what the member wrote;
-* - a settlement notice (`subagent-settled`), which the harness builds as
-*   `summary`, then `Its closing message:`, then the child's closing text, then
-*   possibly `Structured result: …` and a diagnostic. The member's words are
-*   what sits after the marker — everything before it is the runtime speaking
-*   about the member, and a report that carried it would attribute a template
-*   sentence to the teammate. The summary is the fallback, not the body: a child
-*   that left no closing text at all ("It left no closing message.") still
-*   finished, and its one-line account is then the only thing to report.
-* @param message - one delivered message, from the inbox queue or a spliced row.
-* @returns the report text, or undefined when the message carries nothing.
-*/
-function reportTextOf(message) {
-	const texts = [];
-	let omitted = 0;
-	for (const block of message.content) {
-		if (block.type !== "text") {
-			omitted += 1;
-			continue;
-		}
-		if (block.text.trim() !== "") texts.push(block.text);
-	}
-	const source = typeof message.source === "object" && message.source !== null ? message.source : void 0;
-	const summary = typeof source?.["summary"] === "string" && source["summary"].trim() !== "" ? source["summary"].trim() : void 0;
-	const closing = source?.["kind"] === "subagent-settled" ? closingWords(texts, summary) : texts.join("\n").trim();
-	const body = closing !== "" ? closing : summary;
-	if (body === void 0) return void 0;
-	return truncateReport(omitted === 0 ? body : `${body}\n${nonTextNote(omitted)}`);
-}
-/**
-* The member's own words inside one settlement notice, template removed.
-*
-* The marker is the precise half: `Its closing message:` is what the continuation
-* manager puts directly in front of the child's text, so slicing at it cannot
-* mistake a member's sentence for a template line, and the two runtime trailers
-* after the child's words (`Structured result: …`, a diagnostic) are dropped by
-* what they are. Stripping lines by pattern is only the fallback, for a notice
-* that carries no marker at all (an older row, or a re-shaped notice whose writer
-* kept the summary but dropped the separator).
-* @param texts - the message's non-empty text blocks, in order.
-* @param summary - the notice's own one-line account, when it has one.
-* @returns the member's words, or an empty string when it wrote none.
-*/
-function closingWords(texts, summary) {
-	const marker = texts.indexOf(CLOSING_MARKER);
-	if (marker >= 0) return texts.slice(marker + 1).filter((line) => !line.startsWith(STRUCTURED_PREFIX) && line !== NO_CLOSING_MESSAGE).join("\n").trim();
-	return texts.filter((line) => line !== summary && line !== NO_CLOSING_MESSAGE && !line.startsWith(STRUCTURED_PREFIX)).join("\n").trim();
-}
-/** How a skipped block is disclosed inside the report text. */
-function nonTextNote(count) {
-	return `[+${count} non-text block${count === 1 ? "" : "s"} omitted]`;
-}
-/**
-* Bound one report to {@link WAIT_REPORT_MAX_CHARS}, head kept and the cut marked.
-*
-* The ellipsis is inside the bound, not after it, so the ceiling is one number a
-* caller can rely on; `…` rather than a sentence of our own keeps the truncation
-* visible without pretending to be the member's own words.
-* @param text - the report text, of any length.
-* @returns the text itself when it fits, else its head and `…`.
-*/
-function truncateReport(text) {
-	if (text.length <= 2e3) return text;
-	return `${text.slice(0, 1999)}…`;
-}
-/**
 * Where the leader's log ends right now: the position a delivery boundary is
 * recorded at, and the line later spliced reports are compared against.
 *
@@ -3001,28 +3114,6 @@ function truncateReport(text) {
 */
 function logPositionOf(leader) {
 	return leader.session.seq;
-}
-/**
-* The sender one queued leader-inbox message is attributed to, or undefined
-* when the message is not a teammate report at all.
-*
-* Two kinds carry a member's report into the leader's inbox:
-* - `team-message`, built by this plugin's `deliver` for an explicit
-*   `team_send` reply (`senderSessionId`, `senderName`, `chainId`, `hop`);
-* - `subagent-settled`, built by the harness's continuation manager when the
-*   child's turn ends (`form: 'notice'`, `summary`, `senderSessionId`). This is
-*   what a member that simply ANSWERS leaves behind — the reported bug's shape.
-* Reading the sender, not the text, is what makes the answer per-member.
-* @param source - the message's durable attribution.
-* @returns the sender's session id, or undefined for any other source.
-*/
-function reportSenderOf(source) {
-	if (typeof source !== "object" || source === null) return void 0;
-	const record = source;
-	const kind = record["kind"];
-	if (kind !== "team-message" && kind !== "subagent-settled") return void 0;
-	const sender = record["senderSessionId"];
-	return typeof sender === "string" ? sender : void 0;
 }
 /**
 * Clamp one requested wait budget into the window `team_wait` honours: an
@@ -3313,6 +3404,22 @@ function memberValue(member) {
 	};
 }
 /**
+* The JSON-safe shape of one task as a team tool answers with it: the WHOLE
+* post-change row, with the optional members dropped rather than carried as
+* `undefined` (a JSON fact must not have them). Shared by the leader's
+* `team_task` and the member's `team_task_close` so the two answers — and the
+* facts the fold rebuilds from them — cannot drift apart.
+*/
+function taskValue(task) {
+	return {
+		taskId: task.taskId,
+		title: task.title,
+		status: task.status,
+		...task.assigneeId !== void 0 ? { assigneeId: task.assigneeId } : {},
+		...task.note !== void 0 ? { note: task.note } : {}
+	};
+}
+/**
 * PTC mode skips presentationMeta but durably logs finalized content. Carry
 * the same fact there, after the readable result, using only the harness's
 * existing text vocabulary. Native content and the code program's value keep
@@ -3572,7 +3679,7 @@ function sendTool(ctx, audience) {
 function taskTool(ctx) {
 	return withDispatchFact(defineTool({
 		name: "team_task",
-		description: "Create or update one row of the shared team task list — the list every teammate can read, so it is where multi-teammate work is coordinated without routing every detail through messages. The list belongs to a live team, so spawn the teammates first: a row nobody is on the roster to read changes nothing, and assigning one to a name that is not on the roster is refused. Omit task_id to create a row (title required); pass task_id to update one. Assign with a teammate name or member id. A teammate closes its own row by sending the outcome to the leader, so you rarely set status yourself.",
+		description: "Create or update one row of the shared team task list — the list every teammate can read, so it is where multi-teammate work is coordinated without routing every detail through messages. The list belongs to a live team, so spawn the teammates first: a row nobody is on the roster to read changes nothing, and assigning one to a name that is not on the roster is refused. Omit task_id to create a row (title required); pass task_id to update one. Assign with a teammate name or member id. A teammate closes its own row with its own team_task_close — that close is published into your log, so the row already reads done here and you do not relay it yourself.",
 		parameters: {
 			title: {
 				type: "string",
@@ -3629,13 +3736,63 @@ function taskTool(ctx) {
 				...args.status !== void 0 ? { status: args.status } : {},
 				...args.note !== void 0 ? { note: args.note } : {}
 			});
-			return Promise.resolve({
-				taskId: task.taskId,
-				title: task.title,
-				status: task.status,
-				...task.assigneeId !== void 0 ? { assigneeId: task.assigneeId } : {},
-				...task.note !== void 0 ? { note: task.note } : {}
-			});
+			return Promise.resolve(taskValue(task));
+		}
+	}));
+}
+/**
+* `team_task_close` — the member's one write on the shared task list.
+*
+* Deliberately NOT `taskTool` under a member audience: the full tool would hand
+* a teammate `title`, `assignee` and row creation, and a member that can rewrite
+* the list can quietly reassign, rename, or invent the work it was given. Its
+* parameters are the two fields a close needs, so there is no argument through
+* which a member could reach the other three; the service refuses anything the
+* schema does not offer ({@link TeamService.closeTask}).
+*
+* The close must also survive a refresh on the LEADER's side, and a member's own
+* tool result is committed to the MEMBER's log — which the leader's fold never
+* reads. So the service publishes the whole row to the leader's log itself; that
+* is why this tool hands back the same fact shape `team_task` does, and why it
+* is wrapped in `withDispatchFact` (PTC mode needs the fact in content).
+* @param ctx - context carrying the team service.
+* @returns the tool definition.
+*/
+function taskCloseTool(ctx) {
+	return withDispatchFact(defineTool({
+		name: "team_task_close",
+		description: "Close ONE row of the shared task list that is assigned to you, and record what you delivered. This is the only write a teammate has on that list: creating rows, renaming them and moving them between members are your leader's team_task, so there is no argument here for any of those. Pass the task_id team_list shows next to your name, plus an optional note; the row becomes done and your leader sees it on its next read, because the close is recorded in your leader's own log. A row assigned to another member is refused — send that member what you found instead. Closing a row that is already done only records the note, so a retry after a failure is safe.",
+		parameters: {
+			task_id: {
+				type: "string",
+				required: true,
+				description: "Id of the task assigned to you, as team_list shows it."
+			},
+			note: {
+				type: "string",
+				description: "One line recorded with the close, e.g. what you delivered."
+			}
+		},
+		output: {
+			schema: {
+				type: "object",
+				additionalProperties: false,
+				properties: TASK_PROPERTIES
+			},
+			render: (_args, value) => [{
+				type: "text",
+				text: `task ${value.taskId} "${value.title}" is ${value.status}` + (value.assigneeId === void 0 ? " and unassigned" : ` for ${value.assigneeId}`)
+			}],
+			presentationMeta: (_args, value) => ({
+				team: "task",
+				task: value
+			})
+		},
+		presentCall: (args) => call(`Close task ${args.task_id}`, { ...args }),
+		presentResult: (args, result) => result.isError ? done(`Close task ${args.task_id}`, `failed: ${failureText(result)}`) : done(`Task ${args.task_id} closed`),
+		isConcurrencySafe: () => false,
+		execute(args, exec) {
+			return Promise.resolve(taskValue(ctx.team.closeTask(actor(exec.agent), args.task_id, args.note)));
 		}
 	}));
 }
@@ -5030,7 +5187,7 @@ function briefing(ctx, team, child) {
 		identity,
 		reach,
 		list,
-		mine.length === 0 ? "No task on the shared list is assigned to you right now." : `Assigned to you on the shared task list: ${mine.map((task) => `${task.taskId} "${task.title}"`).join("; ")}.`,
+		mine.length === 0 ? "No task on the shared list is assigned to you right now." : `Assigned to you on the shared task list: ${mine.map((task) => `${task.taskId} "${task.title}"`).join("; ")}. Close one with team_task_close once it is done, and send the leader the outcome it cannot read off the list: the close records THAT it is done, not what you found.`,
 		...assigned === void 0 ? [] : [assigned],
 		"Nobody sees your session but you, so deliver results to the leader with team_send — a self-contained answer, not \"done\". team_send is the only delivery channel inside a team: send_message is hidden here, so do not call it. Use team_send when you need something FROM a member mid-task; the reply arrives later as its own turn, so do not wait for it in place. team_list shows the roster, the shared task list, the shared board, and recent traffic. When you have sent the outcome, stop and wait for the next message instead of starting work nobody asked for. A conversation between teammates is budgeted: it may only relay so far and one pair may not keep trading messages inside it, so put everything you need into one message rather than negotiating. Reaching the leader is never refused — when an exchange with a peer stops converging, say so to the leader and move on."
 	].join("\n");
@@ -5053,6 +5210,7 @@ function installTeammateWorld(ctx) {
 			}));
 			disposers.push(childCtx.tools.register(sendTool(ctx, "member")));
 			disposers.push(childCtx.tools.register(listTool(ctx, "member")));
+			disposers.push(childCtx.tools.register(taskCloseTool(ctx)));
 			const mailbox = hideParentMailbox(child);
 			if (mailbox !== void 0) disposers.push(mailbox);
 		} catch (error) {

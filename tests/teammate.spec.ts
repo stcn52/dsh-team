@@ -102,9 +102,30 @@ describe('composition', () => {
 
   it('equips a teammate with the mailbox, the team read, and its briefing', async () => {
     const child = compose(await spawn('Alice', { relation: 'peer' }))
-    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list'])
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list', 'team_task_close'])
     expect(child.prompt.sections).toHaveLength(1)
     expect(child.prompt.sections[0]).toMatchObject({ name: 'team-membership', order: 118 })
+  })
+
+  it('gives a teammate a close, never the leader\'s task writer', async () => {
+    const child = compose(await spawn('Alice'))
+    const names = child.tools.registered.map(tool => tool.name)
+    // `team_task` would hand a member row creation, renaming and reassignment:
+    // the leader's shape of the list stays leader-only.
+    expect(names).not.toContain('team_task')
+    expect(names).toContain('team_task_close')
+  })
+
+  it('pins the close schema to the two fields a close needs, so the other three are unreachable', async () => {
+    const child = compose(await spawn('Alice'))
+    const close = child.tools.registered.find(tool => tool.name === 'team_task_close')
+    const parameters = (close?.definition as {
+      parameters?: { properties?: Record<string, unknown> }
+    }).parameters
+    // The schema IS the permission here: no `title`, no `assignee`, no `status`,
+    // no creation path. A member cannot rename a row, move it to a peer, or
+    // invent one, because there is no argument to put those in.
+    expect(Object.keys(parameters?.properties ?? {}).sort()).toEqual(['note', 'task_id'])
   })
 
   it('unwinds every registration with the child', async () => {
@@ -128,7 +149,7 @@ describe('composition', () => {
     // `restrict()` filters what a scope INHERITS; team_send is registered into
     // this child's own layer, so the mailbox survives by construction.
     expect(child.tools.get('team_send')).toBeDefined()
-    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list'])
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list', 'team_task_close'])
   })
 
   it('composes a teammate where no send_message exists to hide', async () => {
@@ -139,7 +160,7 @@ describe('composition', () => {
     }
     const child = compose(await spawn('Alice'))
     expect(child.tools.restrictions).toEqual([])
-    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list'])
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list', 'team_task_close'])
   })
 
   it('lifts the hide with the child scope', async () => {
@@ -246,7 +267,7 @@ describe('dossier world', () => {
   it('equips a teammate with the digest of its name and the member-side tools', async () => {
     await dossiers.learn('Alice', { kind: 'lesson', text: 'run the suite before reporting', evidence: 'watched a red suite' })
     const child = compose(await spawn('Alice'))
-    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list', 'team_learn', 'team_profile'])
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list', 'team_task_close', 'team_learn', 'team_profile'])
     const section = dossierSection(child)
     expect(section).toMatchObject({ order: 121 })
     const text = section!.text()
@@ -295,7 +316,7 @@ describe('dossier world', () => {
   it('takes the dossier world off when the contribution is disposed', async () => {
     removeDossier()
     const child = compose(await spawn('Alice'))
-    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list'])
+    expect(child.tools.registered.map(tool => tool.name)).toEqual(['team_send', 'team_list', 'team_task_close'])
     expect(child.prompt.sections.map(section => section.name)).toEqual(['team-membership'])
   })
 })

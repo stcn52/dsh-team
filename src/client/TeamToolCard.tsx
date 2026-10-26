@@ -19,7 +19,7 @@ import css from './TeamChat.module.css'
  * reason this list is covered by a completeness test instead of being trusted.
  */
 export const TEAM_TOOLS = [
-  'team_spawn', 'team_send', 'team_task', 'team_relation',
+  'team_spawn', 'team_send', 'team_task', 'team_task_close', 'team_relation',
   'team_dismiss', 'team_list', 'team_note', 'team_board',
   'team_wait', 'team_learn', 'team_profile', 'team_review', 'team_forget',
 ] as const
@@ -36,7 +36,7 @@ export const TEAM_TOOLS = [
  * cannot quietly degrade to the generic card again.
  */
 export const TEAM_TOOL_NAMES = [
-  'team_spawn', 'team_send', 'team_task', 'team_relation', 'team_dismiss',
+  'team_spawn', 'team_send', 'team_task', 'team_task_close', 'team_relation', 'team_dismiss',
   'team_list', 'team_wait', 'team_note', 'team_board', 'team_learn',
   'team_profile', 'team_review', 'team_forget',
 ] as const
@@ -50,6 +50,7 @@ export type TeamToolCardProps = ToolCallViewProps & PropsLocale<'team'> & TeamIn
 
 const TITLES: Record<TeamTool, TeamKey> = {
   team_spawn: 'tool.spawn', team_send: 'tool.send', team_task: 'tool.task',
+  team_task_close: 'tool.taskClose',
   team_relation: 'tool.relation', team_dismiss: 'tool.dismiss', team_list: 'tool.list',
   team_note: 'tool.note', team_board: 'tool.board', team_wait: 'tool.wait',
   team_learn: 'tool.learn', team_profile: 'tool.profile', team_review: 'tool.review',
@@ -58,6 +59,7 @@ const TITLES: Record<TeamTool, TeamKey> = {
 
 const SUCCEEDED: Record<TeamTool, TeamKey> = {
   team_spawn: 'tool.joined', team_send: 'tool.sent', team_task: 'tool.updated',
+  team_task_close: 'tool.updated',
   team_relation: 'tool.updated', team_dismiss: 'tool.ended', team_list: 'tool.read',
   team_note: 'tool.saved', team_board: 'tool.read', team_wait: 'tool.waited',
   team_learn: 'tool.learned', team_profile: 'tool.read', team_review: 'tool.reviewed',
@@ -139,7 +141,8 @@ function presentation(tool: TeamTool, block: ToolCallBlock, state: TeamPanelStat
       caption = t('tool.recipient', { name: people[1]!.name })
       break
     }
-    case 'team_task': {
+    case 'team_task':
+    case 'team_task_close': {
       const task = fact?.team === 'task' ? fact.task : undefined
       const assignee = task === undefined ? argument(args, 'assignee') : task.assigneeId
       summary = task?.title ?? argument(args, 'title') ?? argument(args, 'task_id') ?? ''
@@ -262,7 +265,7 @@ function presentation(tool: TeamTool, block: ToolCallBlock, state: TeamPanelStat
 
 function ToolIcon({ tool }: { readonly tool: TeamTool }) {
   if (tool === 'team_send') return <IconTeamSend16 size={16} />
-  if (tool === 'team_task' || tool === 'team_learn') return <IconTeamTask16 size={16} />
+  if (tool === 'team_task' || tool === 'team_task_close' || tool === 'team_learn') return <IconTeamTask16 size={16} />
   if (tool === 'team_wait') return <IconTeamMailbox16 size={16} />
   if (tool === 'team_note' || tool === 'team_board' || tool === 'team_profile'
     || tool === 'team_review' || tool === 'team_forget') return <IconTeamWorkspace16 size={16} />

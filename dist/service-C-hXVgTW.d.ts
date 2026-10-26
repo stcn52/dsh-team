@@ -1,4 +1,5 @@
 import z from "@deepseek-ai/schemastery";
+import "@deepseek-ai/dsh-llm";
 import { SessionEvent } from "@deepseek-ai/dsh-session";
 import { Context, Service } from "@deepseek-ai/cordis";
 import { Agent } from "@deepseek-ai/dsh-agent";
@@ -218,9 +219,27 @@ type TeamMemberRecord = {
   readonly version: 1;
   readonly op: 'ended';
 };
+/**
+ * One durable task change a MEMBER made, committed to the leader's log.
+ *
+ * The payload is deliberately not a new shape: it is the `task` arm of
+ * {@link TeamFact}, exactly what the leader's own `team_task` result projects
+ * through `presentationMeta`. Reusing it means one validator ({@link readFact}
+ * → `readTask`) and one transition (`applyFact`) serve both transports, and a
+ * member-driven close cannot drift from a leader-driven update.
+ *
+ * No `version` field, unlike {@link TeamMemberRecord}: the fact shape carries
+ * its own discriminator and `readTask` rejects anything incomplete, so an
+ * unknown payload folds to nothing instead of needing an envelope version.
+ */
+type TeamTaskRecord = {
+  readonly team: 'task';
+  readonly task: TeamTaskView;
+};
 declare module '@deepseek-ai/dsh-session/types' {
   interface PluginRecordMap {
     'plugin:dsh-team/member': TeamMemberRecord;
+    'plugin:dsh-team/task': TeamTaskRecord;
   }
 }
 /**
@@ -544,6 +563,27 @@ declare class TeamService extends Service {
    */
   private publish;
   /**
+   * Commit one MEMBER-side task change to the LEADER's log.
+   *
+   * The same durability contract as {@link publish}, for the same reason seen
+   * from the other side: the closing member's tool result is committed to the
+   * MEMBER's log, so without this the leader's fold — and therefore a refreshed
+   * panel and a restarted host — would read the row as still open. What is
+   * published is the whole post-change row in the fact shape the leader's own
+   * `team_task` already projects, so both authorships fold through one arm.
+   * @param leader - the leader whose session log carries the team.
+   * @param task - the WHOLE post-change task.
+   */
+  private publishTask;
+  /**
+   * The shared half of {@link publish} and {@link publishTask}: append, report a
+   * refusal instead of failing the already-applied change, checkpoint the log.
+   * @param leader - the leader whose session log receives the record.
+   * @param label - what changed, for the log line a refusal writes.
+   * @param append - the append itself, which alone may refuse.
+   */
+  private commit;
+  /**
    * Adopt one continuable child into the team world while its scope is being
    * composed. Called from the teammate setup contribution after the child is
    * published — on cold resume the child is already on the leader's roster,
@@ -602,9 +642,10 @@ declare class TeamService extends Service {
   send(from: Agent, to: string, text: string, signal: AbortSignal): Promise<TeamDelivery>;
   send(from: Agent, to: string | readonly string[], text: string, signal: AbortSignal): Promise<TeamDelivery | TeamBroadcastResult>;
   /**
-   * Create or update one shared task. Writes are the leader's: a teammate's
-   * own tool calls land in its own log, which the leader's durable team state
-   * never reads — teammates report, and the leader records the outcome.
+   * Create or update one shared task. This is the leader's WRITE half: the
+   * shape of the list (title, owner, status, note) is set here and nowhere
+   * else, while a teammate's one write is the close in {@link closeTask} — a
+   * member cannot create a row, rename one, or hand one to somebody else.
    * @param leader - the acting leader agent.
    * @param spec - a new task (title) or an update to an existing one (taskId).
    * @returns the whole post-change task.
@@ -618,6 +659,31 @@ declare class TeamService extends Service {
     readonly status?: TeamTaskStatus;
     readonly note?: string;
   }): TeamTaskView;
+  /**
+   * Close ONE task the acting teammate owns.
+   *
+   * The narrow half of {@link upsertTask}, and narrow on purpose: a teammate may
+   * set `done` and record a note on a row that is assigned to ITSELF, nothing
+   * more. Ownership is the check that matters — a member must not be able to
+   * close a peer's row (the peer may still be working, and a closed row is the
+   * leader's evidence that work finished), and must not be able to hand a row to
+   * itself first. Title, assignee and creation therefore have no arm here.
+   *
+   * The close is durable from the MEMBER'S side of a boundary that used to be
+   * one-way: a member's tool result lands in the member's own session log, which
+   * the leader's fold never reads, so this method publishes the whole post-change
+   * row to the LEADER's log itself ({@link publishTask}) — the same durable half
+   * a leader-side `team_task` gets from its tool result. Without that, a leader
+   * whose page is refreshed right after a member finishes would read the row as
+   * still open.
+   * @param member - the acting teammate agent.
+   * @param taskId - the row to close, as `team_list` shows it.
+   * @param note - one line recorded with the close, e.g. what it delivered.
+   * @returns the whole post-change task.
+   * @throws {TeamError} when the actor is not a member, the task is unknown, or
+   *   the task is assigned to somebody else (or to nobody).
+   */
+  closeTask(member: Agent, taskId: string, note?: string): TeamTaskView;
   /**
    * Change one teammate's relationship level.
    * @param leader - the acting leader agent.

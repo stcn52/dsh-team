@@ -19,6 +19,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolCallView, ToolDefinition, ToolResultView } from '@deepseek-ai/dsh-tools'
 import type { TeamMemberFact } from './fold.ts'
+import type { TeamTaskStatus, TeamTaskView } from './contract.ts'
 import { DISPATCH_FACT_PREFIX } from './fold-dispatch.ts'
 import { TeamError } from './errors.ts'
 import type { DossierEntry, MemberDossiers } from './dossier.ts'
@@ -111,6 +112,25 @@ export function memberValue(member: TeamMemberFact): {
     ...member.model !== undefined ? { model: member.model } : {},
     ...member.effort !== undefined ? { effort: member.effort } : {},
     ...member.skills !== undefined ? { skills: member.skills } : {},
+  }
+}
+
+/**
+ * The JSON-safe shape of one task as a team tool answers with it: the WHOLE
+ * post-change row, with the optional members dropped rather than carried as
+ * `undefined` (a JSON fact must not have them). Shared by the leader's
+ * `team_task` and the member's `team_task_close` so the two answers — and the
+ * facts the fold rebuilds from them — cannot drift apart.
+ */
+export function taskValue(task: TeamTaskView): {
+  taskId: string; title: string; status: TeamTaskStatus; assigneeId?: string; note?: string
+} {
+  return {
+    taskId: task.taskId,
+    title: task.title,
+    status: task.status,
+    ...task.assigneeId !== undefined ? { assigneeId: task.assigneeId } : {},
+    ...task.note !== undefined ? { note: task.note } : {},
   }
 }
 
@@ -390,7 +410,8 @@ export function taskTool(ctx: Context): ToolDefinition {
       + 'belongs to a live team, so spawn the teammates first: a row nobody is on the roster to read changes '
       + 'nothing, and assigning one to a name that is not on the roster is refused. Omit task_id '
       + 'to create a row (title required); pass task_id to update one. Assign with a teammate name or member '
-      + 'id. A teammate closes its own row by sending the outcome to the leader, so you rarely set status yourself.',
+      + 'id. A teammate closes its own row with its own team_task_close — that close is published into your '
+      + 'log, so the row already reads done here and you do not relay it yourself.',
     parameters: {
       title: { type: 'string', description: 'Task title; required when creating.' },
       assignee: { type: 'string', description: 'Teammate name or member id; omit to leave the task unassigned.' },
@@ -423,13 +444,60 @@ export function taskTool(ctx: Context): ToolDefinition {
         ...args.status !== undefined ? { status: args.status } : {},
         ...args.note !== undefined ? { note: args.note } : {},
       })
-      return Promise.resolve({
-        taskId: task.taskId,
-        title: task.title,
-        status: task.status,
-        ...task.assigneeId !== undefined ? { assigneeId: task.assigneeId } : {},
-        ...task.note !== undefined ? { note: task.note } : {},
-      })
+      return Promise.resolve(taskValue(task))
+    },
+  }))
+}
+
+/**
+ * `team_task_close` — the member's one write on the shared task list.
+ *
+ * Deliberately NOT `taskTool` under a member audience: the full tool would hand
+ * a teammate `title`, `assignee` and row creation, and a member that can rewrite
+ * the list can quietly reassign, rename, or invent the work it was given. Its
+ * parameters are the two fields a close needs, so there is no argument through
+ * which a member could reach the other three; the service refuses anything the
+ * schema does not offer ({@link TeamService.closeTask}).
+ *
+ * The close must also survive a refresh on the LEADER's side, and a member's own
+ * tool result is committed to the MEMBER's log — which the leader's fold never
+ * reads. So the service publishes the whole row to the leader's log itself; that
+ * is why this tool hands back the same fact shape `team_task` does, and why it
+ * is wrapped in `withDispatchFact` (PTC mode needs the fact in content).
+ * @param ctx - context carrying the team service.
+ * @returns the tool definition.
+ */
+export function taskCloseTool(ctx: Context): ToolDefinition {
+  return withDispatchFact(defineTool({
+    name: 'team_task_close',
+    description:
+      'Close ONE row of the shared task list that is assigned to you, and record what you delivered. This is '
+      + 'the only write a teammate has on that list: creating rows, renaming them and moving them between '
+      + 'members are your leader\'s team_task, so there is no argument here for any of those. Pass the task_id '
+      + 'team_list shows next to your name, plus an optional note; the row becomes done and your leader sees it '
+      + 'on its next read, because the close is recorded in your leader\'s own log. A row assigned to another '
+      + 'member is refused — send that member what you found instead. Closing a row that is already done only '
+      + 'records the note, so a retry after a failure is safe.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Id of the task assigned to you, as team_list shows it.' },
+      note: { type: 'string', description: 'One line recorded with the close, e.g. what you delivered.' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: TASK_PROPERTIES },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `task ${value.taskId} "${value.title}" is ${value.status}`
+          + (value.assigneeId === undefined ? ' and unassigned' : ` for ${value.assigneeId}`),
+      }],
+      presentationMeta: (_args, value) => ({ team: 'task', task: value }),
+    },
+    presentCall: args => call(`Close task ${args.task_id}`, { ...args }),
+    presentResult: (args, result) => result.isError
+      ? done(`Close task ${args.task_id}`, `failed: ${failureText(result)}`)
+      : done(`Task ${args.task_id} closed`),
+    isConcurrencySafe: () => false,
+    execute(args, exec) {
+      return Promise.resolve(taskValue(ctx.team.closeTask(actor(exec.agent), args.task_id, args.note)))
     },
   }))
 }

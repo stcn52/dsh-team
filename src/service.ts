@@ -37,8 +37,21 @@ import {
   type TeamRelation, type TeamTaskStatus, type TeamTaskView, type TeamView,
 } from './contract.ts'
 import { TeamError } from './errors.ts'
-import { foldTeam, TEAM_MEMBER_RECORD, type TeamMemberFact, type TeamMemberRecord } from './fold.ts'
+import {
+  foldTeam, TEAM_MEMBER_RECORD, TEAM_TASK_RECORD,
+  type TeamMemberFact, type TeamMemberRecord, type TeamTaskRecord,
+} from './fold.ts'
+import { mailboxRowOf, reportedBack, reportSenderOf, reportTextOf, truncateReport } from './report.ts'
 import type { TeamConfig } from './config.ts'
+
+/**
+ * The bound on one report's text, published here because this module is the
+ * plugin's public surface: the reader that produces reports lives in
+ * `./report.ts` (see its module comment for why that seam exists), while callers
+ * — the tool schema, the renderer, the specs — address it through the service
+ * that hands reports out.
+ */
+export { WAIT_REPORT_MAX_CHARS } from './report.ts'
 
 /** Live lifecycle of one teammate, as `list_agents` names the same states. */
 export type MemberStatus = 'running' | 'idle' | 'ready'
@@ -59,34 +72,6 @@ export const WAIT_DEFAULT_MS = 120_000
  * this only makes a stuck roster invisible for longer.
  */
 export const WAIT_MAX_MS = 600_000
-
-/**
- * Longest report text one `team_wait` answer carries, in characters.
- *
- * A finished member's closing message is the answer the leader was waiting for,
- * but a tool result becomes model-visible context on every later step of that
- * turn, so one verbose member could otherwise spend a whole context window on
- * its own transcript — and a wait over five members multiplies that by five.
- * The deadline is `WAIT_REPORT_MAX_CHARS` per report, head kept, tail replaced
- * by `…` (see {@link truncateReport}): the conclusion of a report starts where
- * the report starts, while the part that overflows is nearly always the
- * supporting detail a leader that needs it can ask for with one more message.
- */
-export const WAIT_REPORT_MAX_CHARS = 2000
-
-/**
- * The line the continuation manager puts in front of a settled child's own
- * closing words (`createSettlementMessage` in `@deepseek-ai/dsh-subagent`).
- * Everything after it is the member's text; everything before it is the
- * runtime's template, which is exactly what a report must not carry.
- */
-const CLOSING_MARKER = 'Its closing message:'
-
-/** What the same notice says instead of {@link CLOSING_MARKER} for a silent child. */
-const NO_CLOSING_MESSAGE = 'It left no closing message.'
-
-/** The line the same notice appends for a structured return value. */
-const STRUCTURED_PREFIX = 'Structured result: '
 
 /**
  * How long `team_wait` lets a just-accepted delivery settle before it reads the
@@ -518,15 +503,47 @@ export class TeamService extends Service {
    * @param record - the WHOLE post-change roster fact.
    */
   private publish(leader: Agent, record: TeamMemberRecord): void {
-    try {
+    this.commit(leader, record.op, () => {
       appendPluginRecord(leader.session, TEAM_MEMBER_RECORD, record)
+    })
+  }
+
+  /**
+   * Commit one MEMBER-side task change to the LEADER's log.
+   *
+   * The same durability contract as {@link publish}, for the same reason seen
+   * from the other side: the closing member's tool result is committed to the
+   * MEMBER's log, so without this the leader's fold — and therefore a refreshed
+   * panel and a restarted host — would read the row as still open. What is
+   * published is the whole post-change row in the fact shape the leader's own
+   * `team_task` already projects, so both authorships fold through one arm.
+   * @param leader - the leader whose session log carries the team.
+   * @param task - the WHOLE post-change task.
+   */
+  private publishTask(leader: Agent, task: TeamTaskView): void {
+    const record: TeamTaskRecord = { team: 'task', task }
+    this.commit(leader, 'task', () => {
+      appendPluginRecord(leader.session, TEAM_TASK_RECORD, record)
+    })
+  }
+
+  /**
+   * The shared half of {@link publish} and {@link publishTask}: append, report a
+   * refusal instead of failing the already-applied change, checkpoint the log.
+   * @param leader - the leader whose session log receives the record.
+   * @param label - what changed, for the log line a refusal writes.
+   * @param append - the append itself, which alone may refuse.
+   */
+  private commit(leader: Agent, label: string, append: () => void): void {
+    try {
+      append()
     } catch (error: unknown) {
-      // The roster already changed in memory, and a refusal here is not worth
-      // failing a spawn whose child is live (a reentrant append is the
+      // The change already happened in memory, and a refusal here is not worth
+      // failing an operation whose side effect stands (a reentrant append is the
       // realistic cause). The divergence is reported, never swallowed.
       this.ctx.logger.warn(
         'dsh-team: publishing %s to the session log failed: %s',
-        record.op,
+        label,
         String(error),
       )
       return
@@ -707,9 +724,10 @@ export class TeamService extends Service {
   }
 
   /**
-   * Create or update one shared task. Writes are the leader's: a teammate's
-   * own tool calls land in its own log, which the leader's durable team state
-   * never reads — teammates report, and the leader records the outcome.
+   * Create or update one shared task. This is the leader's WRITE half: the
+   * shape of the list (title, owner, status, note) is set here and nowhere
+   * else, while a teammate's one write is the close in {@link closeTask} — a
+   * member cannot create a row, rename one, or hand one to somebody else.
    * @param leader - the acting leader agent.
    * @param spec - a new task (title) or an update to an existing one (taskId).
    * @returns the whole post-change task.
@@ -751,6 +769,57 @@ export class TeamService extends Service {
       ...spec.note !== undefined ? { note: spec.note } : {},
     }
     actor.team.tasks.set(task.taskId, task)
+    this.ctx.emit('team/changed', { leaderId: actor.leader.id })
+    return task
+  }
+
+  /**
+   * Close ONE task the acting teammate owns.
+   *
+   * The narrow half of {@link upsertTask}, and narrow on purpose: a teammate may
+   * set `done` and record a note on a row that is assigned to ITSELF, nothing
+   * more. Ownership is the check that matters — a member must not be able to
+   * close a peer's row (the peer may still be working, and a closed row is the
+   * leader's evidence that work finished), and must not be able to hand a row to
+   * itself first. Title, assignee and creation therefore have no arm here.
+   *
+   * The close is durable from the MEMBER'S side of a boundary that used to be
+   * one-way: a member's tool result lands in the member's own session log, which
+   * the leader's fold never reads, so this method publishes the whole post-change
+   * row to the LEADER's log itself ({@link publishTask}) — the same durable half
+   * a leader-side `team_task` gets from its tool result. Without that, a leader
+   * whose page is refreshed right after a member finishes would read the row as
+   * still open.
+   * @param member - the acting teammate agent.
+   * @param taskId - the row to close, as `team_list` shows it.
+   * @param note - one line recorded with the close, e.g. what it delivered.
+   * @returns the whole post-change task.
+   * @throws {TeamError} when the actor is not a member, the task is unknown, or
+   *   the task is assigned to somebody else (or to nobody).
+   */
+  closeTask(member: Agent, taskId: string, note?: string): TeamTaskView {
+    const actor = this.resolveActor(member)
+    const self = actor.member
+    if (self === undefined) {
+      throw new TeamError(
+        'UNAUTHORIZED',
+        'only a teammate closes a task; the leader updates the whole row with team_task',
+      )
+    }
+    const previous = actor.team.tasks.get(taskId)
+    if (previous === undefined) throw new TeamError('UNKNOWN_TASK', taskId)
+    if (previous.assigneeId !== self.memberId) {
+      throw new TeamError('UNAUTHORIZED', previous.assigneeId === undefined
+        ? `task ${taskId} is unassigned, so only the leader can close it`
+        : `task ${taskId} is assigned to ${previous.assigneeId}, not to you (${self.memberId})`)
+    }
+    const task: TeamTaskView = {
+      ...previous,
+      status: 'done',
+      ...note !== undefined ? { note } : {},
+    }
+    actor.team.tasks.set(task.taskId, task)
+    this.publishTask(actor.leader, task)
     this.ctx.emit('team/changed', { leaderId: actor.leader.id })
     return task
   }
@@ -2215,147 +2284,6 @@ function findByName(team: TeamState, name: string): TeamMemberFact | undefined {
 }
 
 /**
- * Did this member's last word in the leader's mailbox come FROM it?
- *
- * A member with no live agent has three possible histories, and the mailbox
- * separates the one that looked like a cold member: it ran, reported back, and
- * was reaped. The test is the LAST row that names the member, not "any row from
- * it": a report from an earlier round must not disguise a delivery that has been
- * addressed to it since, because that delivery may simply not have woken it yet
- * — the over-claim this guard exists for. A row addressed to it therefore
- * outranks any older report of its own.
- *
- * The feed is bounded (`maxRecentMessages`), so an old enough report can be
- * evicted; the target then falls back to `cold`, which under-claims rather than
- * over-claims, and `cold` no longer asserts "never started".
- * @param mailbox - the leader's durable mailbox rows, newest last.
- * @param memberId - the member's session id, which is also a row's `from`.
- * @returns true when the member's most recent mailbox row is its own.
- */
-function reportedBack(mailbox: readonly TeamMessageView[], memberId: string): boolean {
-  for (let index = mailbox.length - 1; index >= 0; index -= 1) {
-    const row = mailbox[index]!
-    if (row.from === memberId) return true
-    if (row.to === memberId) return false
-  }
-  return false
-}
-
-/**
- * The LAST mailbox row this member wrote, whose text is what it said.
- *
- * Mailbox rows are the durable surface: a report that reached the leader in an
- * earlier process is still here after a restart, with the delivered text (a
- * `team_send` reply) or the notice's one-line account on it. It is read LAST,
- * because a live queue or a spliced row is the same message with its full
- * content; this one is the fallback for the case where neither was observed.
- * @param mailbox - the leader's durable mailbox rows, newest last.
- * @param memberId - the member's session id, which is also a row's `from`.
- * @returns its newest own row, or undefined when it has none.
- */
-function mailboxRowOf(mailbox: readonly TeamMessageView[], memberId: string): TeamMessageView | undefined {
-  for (let index = mailbox.length - 1; index >= 0; index -= 1) {
-    const row = mailbox[index]!
-    if (row.from === memberId) return row
-  }
-  return undefined
-}
-
-/**
- * What one member's delivered message says, with the runtime's template removed
- * and the result bounded to {@link WAIT_REPORT_MAX_CHARS}.
- *
- * The content is read as blocks because that is what a message is: every `text`
- * block is the member's own words and they are joined with newlines, while a
- * non-text block (an image, an attachment) cannot be carried through a tool
- * result at all — it is skipped and counted, and the count is stated in the text
- * so the leader knows something was dropped rather than silently losing it.
- *
- * Two shapes arrive here, and only one of them is templated:
- * - a `team_send` relay (`team-message`), whose content IS what the member wrote;
- * - a settlement notice (`subagent-settled`), which the harness builds as
- *   `summary`, then `Its closing message:`, then the child's closing text, then
- *   possibly `Structured result: …` and a diagnostic. The member's words are
- *   what sits after the marker — everything before it is the runtime speaking
- *   about the member, and a report that carried it would attribute a template
- *   sentence to the teammate. The summary is the fallback, not the body: a child
- *   that left no closing text at all ("It left no closing message.") still
- *   finished, and its one-line account is then the only thing to report.
- * @param message - one delivered message, from the inbox queue or a spliced row.
- * @returns the report text, or undefined when the message carries nothing.
- */
-function reportTextOf(message: UserMessage): string | undefined {
-  const texts: string[] = []
-  let omitted = 0
-  for (const block of message.content) {
-    if (block.type !== 'text') {
-      omitted += 1
-      continue
-    }
-    if (block.text.trim() !== '') texts.push(block.text)
-  }
-  const source = typeof message.source === 'object' && message.source !== null
-    ? message.source as Record<string, unknown>
-    : undefined
-  const summary = typeof source?.['summary'] === 'string' && source['summary'].trim() !== ''
-    ? source['summary'].trim()
-    : undefined
-  const templated = source?.['kind'] === 'subagent-settled'
-  const closing = templated ? closingWords(texts, summary) : texts.join('\n').trim()
-  const body = closing !== '' ? closing : summary
-  if (body === undefined) return undefined
-  return truncateReport(omitted === 0 ? body : `${body}\n${nonTextNote(omitted)}`)
-}
-
-/**
- * The member's own words inside one settlement notice, template removed.
- *
- * The marker is the precise half: `Its closing message:` is what the continuation
- * manager puts directly in front of the child's text, so slicing at it cannot
- * mistake a member's sentence for a template line, and the two runtime trailers
- * after the child's words (`Structured result: …`, a diagnostic) are dropped by
- * what they are. Stripping lines by pattern is only the fallback, for a notice
- * that carries no marker at all (an older row, or a re-shaped notice whose writer
- * kept the summary but dropped the separator).
- * @param texts - the message's non-empty text blocks, in order.
- * @param summary - the notice's own one-line account, when it has one.
- * @returns the member's words, or an empty string when it wrote none.
- */
-function closingWords(texts: readonly string[], summary: string | undefined): string {
-  const marker = texts.indexOf(CLOSING_MARKER)
-  if (marker >= 0) {
-    return texts
-      .slice(marker + 1)
-      .filter(line => !line.startsWith(STRUCTURED_PREFIX) && line !== NO_CLOSING_MESSAGE)
-      .join('\n')
-      .trim()
-  }
-  return texts
-    .filter(line => line !== summary && line !== NO_CLOSING_MESSAGE && !line.startsWith(STRUCTURED_PREFIX))
-    .join('\n')
-    .trim()
-}
-
-/** How a skipped block is disclosed inside the report text. */
-function nonTextNote(count: number): string {
-  return `[+${count} non-text block${count === 1 ? '' : 's'} omitted]`
-}
-
-/**
- * Bound one report to {@link WAIT_REPORT_MAX_CHARS}, head kept and the cut marked.
- *
- * The ellipsis is inside the bound, not after it, so the ceiling is one number a
- * caller can rely on; `…` rather than a sentence of our own keeps the truncation
- * visible without pretending to be the member's own words.
- * @param text - the report text, of any length.
- * @returns the text itself when it fits, else its head and `…`.
- */
-function truncateReport(text: string): string {
-  if (text.length <= WAIT_REPORT_MAX_CHARS) return text
-  return `${text.slice(0, WAIT_REPORT_MAX_CHARS - 1)}…`
-}
-
-/**
  * Where the leader's log ends right now: the position a delivery boundary is
  * recorded at, and the line later spliced reports are compared against.
  *
@@ -2369,29 +2297,6 @@ function truncateReport(text: string): string {
  */
 function logPositionOf(leader: Agent): number {
   return leader.session.seq
-}
-
-/**
- * The sender one queued leader-inbox message is attributed to, or undefined
- * when the message is not a teammate report at all.
- *
- * Two kinds carry a member's report into the leader's inbox:
- * - `team-message`, built by this plugin's `deliver` for an explicit
- *   `team_send` reply (`senderSessionId`, `senderName`, `chainId`, `hop`);
- * - `subagent-settled`, built by the harness's continuation manager when the
- *   child's turn ends (`form: 'notice'`, `summary`, `senderSessionId`). This is
- *   what a member that simply ANSWERS leaves behind — the reported bug's shape.
- * Reading the sender, not the text, is what makes the answer per-member.
- * @param source - the message's durable attribution.
- * @returns the sender's session id, or undefined for any other source.
- */
-function reportSenderOf(source: unknown): string | undefined {
-  if (typeof source !== 'object' || source === null) return undefined
-  const record = source as Record<string, unknown>
-  const kind = record['kind']
-  if (kind !== 'team-message' && kind !== 'subagent-settled') return undefined
-  const sender = record['senderSessionId']
-  return typeof sender === 'string' ? sender : undefined
 }
 
 /**

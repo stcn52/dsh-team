@@ -12,16 +12,20 @@
  * Lifecycle changes that no tool call settles — a teammate spawned through the
  * admin route instead of the tool, a relation change, a dismissal — write one
  * {@link TeamMemberRecord} as a plugin record: `plugin:dsh-team/member` via
- * `appendPluginRecord`. That is the harness's own compatibility mechanism for
- * out-of-repo plugins: the record is committed with `ignorable: true`, so a
+ * `appendPluginRecord`. A shared task a MEMBER closed is the same kind of fact
+ * with the opposite authorship: the close happens in the member's own session,
+ * whose log this fold never reads, so it is published to the LEADER's log as a
+ * {@link TeamTaskRecord} (`plugin:dsh-team/task`) carrying the same task fact
+ * the tool path writes. That is the harness's own compatibility mechanism for
+ * out-of-repo plugins: both records are committed with `ignorable: true`, so a
  * reader that does not know the type retains and skips it rather than refusing
- * the log, and it never enters the model-visible surface. Inventing a RELEASED
+ * the log, and neither enters the model-visible surface. Inventing a RELEASED
  * event type would be the unsafe move: a type inside the harness catalog is
  * required-on-read, so a log written here would stop loading once this plugin
  * is gone.
  *
- * Both are plain JSON on a durable boundary, so this module validates them
- * instead of trusting them.
+ * All of them are plain JSON on a durable boundary, so this module validates
+ * them instead of trusting them.
  *
  * @module dsh-team/fold
  */
@@ -53,6 +57,17 @@ export interface TeamMemberFact {
  * `appendPluginRecord`, the event carries `ignorable: true`.
  */
 export const TEAM_MEMBER_RECORD = 'plugin:dsh-team/member'
+
+/**
+ * The record name one MEMBER-side change to the shared task list commits under.
+ *
+ * A member's tool result is written to the MEMBER's session log, which this
+ * fold never reads for the leader, so a member that closes its own row
+ * (`TeamService.closeTask`) publishes the row to the LEADER's log here.
+ * It carries the same `{ team: 'task', task }` fact the leader's own
+ * `team_task` result projects: one vocabulary, two transports, one fold.
+ */
+export const TEAM_TASK_RECORD = 'plugin:dsh-team/task'
 
 /** The plugin-record type grammar, mirrored from the session package. */
 const PLUGIN_RECORD_TYPE = /^plugin:[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/u
@@ -99,9 +114,25 @@ export type TeamMemberRecord =
   | { readonly version: 1; readonly op: 'remove'; readonly memberId: string }
   | { readonly version: 1; readonly op: 'ended' }
 
+/**
+ * One durable task change a MEMBER made, committed to the leader's log.
+ *
+ * The payload is deliberately not a new shape: it is the `task` arm of
+ * {@link TeamFact}, exactly what the leader's own `team_task` result projects
+ * through `presentationMeta`. Reusing it means one validator ({@link readFact}
+ * → `readTask`) and one transition (`applyFact`) serve both transports, and a
+ * member-driven close cannot drift from a leader-driven update.
+ *
+ * No `version` field, unlike {@link TeamMemberRecord}: the fact shape carries
+ * its own discriminator and `readTask` rejects anything incomplete, so an
+ * unknown payload folds to nothing instead of needing an envelope version.
+ */
+export type TeamTaskRecord = { readonly team: 'task'; readonly task: TeamTaskView }
+
 declare module '@deepseek-ai/dsh-session/types' {
   interface PluginRecordMap {
     'plugin:dsh-team/member': TeamMemberRecord
+    'plugin:dsh-team/task': TeamTaskRecord
   }
 }
 
@@ -530,6 +561,14 @@ export function applyTeamEvent(view: TeamView, event: SessionEvent, bound: numbe
   if (record !== undefined && record.type === TEAM_MEMBER_RECORD) {
     const fact = readMemberRecord(record.data)
     return fact === undefined ? view : applyFact(view, fact, event.time, bound)
+  }
+  // The member-side durable path: a task a teammate closed arrives here, because
+  // its own tool result was committed to ITS log. Strict on the fact kind — this
+  // record type may only carry a task, so a malformed or future payload folds to
+  // nothing instead of reaching a transition it was not meant for.
+  if (record !== undefined && record.type === TEAM_TASK_RECORD) {
+    const fact = readFact(record.data)
+    return fact !== undefined && fact.team === 'task' ? applyFact(view, fact, event.time, bound) : view
   }
   if (event.type === 'tool/result') {
     if (event.data.error !== undefined) return view

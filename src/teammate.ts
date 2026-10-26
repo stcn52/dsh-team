@@ -16,7 +16,7 @@ import type {} from '@deepseek-ai/dsh-subagent'
 import type { MemberDossiers } from './dossier.ts'
 import { TeamError } from './errors.ts'
 import type { TeamService } from './service.ts'
-import { boardTool, learnTool, listTool, noteTool, profileTool, sendTool } from './tools.ts'
+import { boardTool, learnTool, listTool, noteTool, profileTool, sendTool, taskCloseTool } from './tools.ts'
 import type { TeamWorkspace } from './workspace.ts'
 
 /** Guidance order: after the harness tool sections, before the persona. */
@@ -161,7 +161,9 @@ function briefing(ctx: Context, team: TeamService, child: Agent): string {
   const mine = team.list(child).tasks.filter(task => task.assigneeId === self.memberId && task.status !== 'done')
   const tasks = mine.length === 0
     ? 'No task on the shared list is assigned to you right now.'
-    : `Assigned to you on the shared task list: ${mine.map(task => `${task.taskId} "${task.title}"`).join('; ')}.`
+    : `Assigned to you on the shared task list: ${mine.map(task => `${task.taskId} "${task.title}"`).join('; ')}. `
+      + 'Close one with team_task_close once it is done, and send the leader the outcome it cannot read off the '
+      + 'list: the close records THAT it is done, not what you found.'
   return [
     identity,
     reach,
@@ -199,6 +201,11 @@ export function installTeammateWorld(ctx: Context): () => void {
       }))
       disposers.push(childCtx.tools.register(sendTool(ctx, 'member')))
       disposers.push(childCtx.tools.register(listTool(ctx, 'member')))
+      // The one write a member has on the shared list, and deliberately not the
+      // leader's `team_task`: see {@link taskCloseTool} for why the narrow
+      // schema — not a runtime check — is what keeps title and assignee out of
+      // a member's reach.
+      disposers.push(childCtx.tools.register(taskCloseTool(ctx)))
       // After both registrations: the restriction must be the thing that
       // leaves the mailbox visible, not something a later registration
       // re-adds. See {@link hideParentMailbox} for why it is a restriction.

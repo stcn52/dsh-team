@@ -675,6 +675,46 @@ describe('task list', () => {
       .toBe('UNKNOWN_TASK')
     expect(refusal(() => scene.service.upsertTask(alice.agent, { title: 'sneaky' }))).toBe('UNAUTHORIZED')
   })
+
+  it('lets a member close the row assigned to itself, and records its note', () => {
+    scene.service.upsertTask(scene.leader.agent, { title: 'ship it', assigneeId: 'child-1' })
+    // The close is the member's ONE write: done plus the note, the rest of the
+    // row untouched.
+    expect(scene.service.closeTask(alice.agent, 't1', 'merged')).toEqual({
+      taskId: 't1', title: 'ship it', assigneeId: 'child-1', status: 'done', note: 'merged',
+    })
+    // The leader reads the same row: one shared list, not one per side.
+    expect(scene.service.list(scene.leader.agent).tasks).toEqual([
+      { taskId: 't1', title: 'ship it', assigneeId: 'child-1', status: 'done', note: 'merged' },
+    ])
+  })
+
+  it('keeps an existing note when the close carries none, so a retry is safe', () => {
+    scene.service.upsertTask(scene.leader.agent, { title: 'ship it', assigneeId: 'child-1', note: 'on it' })
+    expect(scene.service.closeTask(alice.agent, 't1')).toMatchObject({ status: 'done', note: 'on it' })
+    expect(scene.service.closeTask(alice.agent, 't1', 'merged')).toMatchObject({ status: 'done', note: 'merged' })
+  })
+
+  it('refuses a row that is assigned to somebody else, and leaves it untouched', async () => {
+    await spawn(scene, 'Bob', { relation: 'peer', childId: 'child-2' })
+    scene.service.upsertTask(scene.leader.agent, { title: 'ship it', assigneeId: 'child-2' })
+    expect(refusal(() => scene.service.closeTask(alice.agent, 't1', 'mine now'))).toBe('UNAUTHORIZED')
+    // The refusal is not a partial write: the peer's row is exactly as it was.
+    expect(scene.service.list(scene.leader.agent).tasks).toEqual([
+      { taskId: 't1', title: 'ship it', assigneeId: 'child-2', status: 'pending' },
+    ])
+  })
+
+  it('refuses an unassigned row and an unknown row, each by its own code', () => {
+    scene.service.upsertTask(scene.leader.agent, { title: 'unowned' })
+    expect(refusal(() => scene.service.closeTask(alice.agent, 't1'))).toBe('UNAUTHORIZED')
+    expect(refusal(() => scene.service.closeTask(alice.agent, 'tX'))).toBe('UNKNOWN_TASK')
+  })
+
+  it('refuses the leader, which already has the whole row through team_task', () => {
+    scene.service.upsertTask(scene.leader.agent, { title: 'ship it', assigneeId: 'child-1' })
+    expect(refusal(() => scene.service.closeTask(scene.leader.agent, 't1'))).toBe('UNAUTHORIZED')
+  })
 })
 
 describe('relations and dismissal', () => {
