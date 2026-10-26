@@ -25,7 +25,7 @@ import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import { appendPluginRecord, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-skill'
@@ -59,6 +59,34 @@ export const WAIT_DEFAULT_MS = 120_000
  * this only makes a stuck roster invisible for longer.
  */
 export const WAIT_MAX_MS = 600_000
+
+/**
+ * Longest report text one `team_wait` answer carries, in characters.
+ *
+ * A finished member's closing message is the answer the leader was waiting for,
+ * but a tool result becomes model-visible context on every later step of that
+ * turn, so one verbose member could otherwise spend a whole context window on
+ * its own transcript — and a wait over five members multiplies that by five.
+ * The deadline is `WAIT_REPORT_MAX_CHARS` per report, head kept, tail replaced
+ * by `…` (see {@link truncateReport}): the conclusion of a report starts where
+ * the report starts, while the part that overflows is nearly always the
+ * supporting detail a leader that needs it can ask for with one more message.
+ */
+export const WAIT_REPORT_MAX_CHARS = 2000
+
+/**
+ * The line the continuation manager puts in front of a settled child's own
+ * closing words (`createSettlementMessage` in `@deepseek-ai/dsh-subagent`).
+ * Everything after it is the member's text; everything before it is the
+ * runtime's template, which is exactly what a report must not carry.
+ */
+const CLOSING_MARKER = 'Its closing message:'
+
+/** What the same notice says instead of {@link CLOSING_MARKER} for a silent child. */
+const NO_CLOSING_MESSAGE = 'It left no closing message.'
+
+/** The line the same notice appends for a structured return value. */
+const STRUCTURED_PREFIX = 'Structured result: '
 
 /**
  * How long `team_wait` lets a just-accepted delivery settle before it reads the
@@ -260,6 +288,32 @@ export interface TeamWaitResult {
   readonly cold: readonly string[]
   /** Whether the budget expired before every target settled. */
   readonly timedOut: boolean
+  /**
+   * What the members in {@link done} actually handed back, in that same order —
+   * the answer itself, not just the fact that one arrived.
+   *
+   * A `done` bucket alone leaves the leader with a name and no content: it
+   * knows a turn ended but not what the member concluded, so it has to ask
+   * again (a whole extra round trip) or guess. Every member whose report this
+   * wait could actually read contributes one entry here; a member that is
+   * finished but left nothing to read (a silent turn, a session reaped with no
+   * report in the inbox, the log, or the mailbox) has no entry, so this list is
+   * a SUBSET of {@link done} — and {@link busy} and {@link cold} members never
+   * appear in it, because nothing of theirs was read.
+   */
+  readonly reports: readonly TeamWaitReport[]
+}
+
+/** One finished member's closing words, as `team_wait` brought them back. */
+export interface TeamWaitReport {
+  /** The member, named exactly as {@link TeamWaitResult.done} names it. */
+  readonly member: string
+  /**
+   * What it handed back: the text blocks of its report, template lines removed
+   * and bounded to {@link WAIT_REPORT_MAX_CHARS} characters. An empty string
+   * never appears — a member that produced no text at all has no report here.
+   */
+  readonly text: string
 }
 
 /** What one caller asks `team_wait` to observe. */
@@ -860,7 +914,7 @@ export class TeamService extends Service {
     }
     // Nothing to observe is a complete answer, not a refusal: an empty roster and
     // an explicit empty selection have both already happened.
-    if (targets.length === 0) return { done: [], busy: [], cold: [], timedOut: false }
+    if (targets.length === 0) return { done: [], busy: [], cold: [], timedOut: false, reports: [] }
     await this.settle()
     // The settle is an await of its own, so a cancellation that lands during it
     // must still refuse rather than report a roster it stopped believing in.
@@ -984,12 +1038,19 @@ export class TeamService extends Service {
    * 4. `seen`, and no longer `running` at the end — `done`: resident and
    *    quiescent now (or reaped, which occupies no turn either).
    * 5. `seen` and still `running` — `busy`.
+   *
+   * Every member that lands in `done` also gets {@link reportOf} asked what it
+   * said, and the answer goes into `reports` when there is one. That read is
+   * taken from the same evidence the bucket itself rests on — one inbox walk,
+   * one log walk, and the mailbox — so the report a leader receives can never
+   * belong to a different round than the completion it is attached to.
    * @param actor - the team, and the leader whose inbox queue is read.
    * @param targets - the members this wait was asked about, in order.
    * @param observations - the live observation recorded per target, same order.
    * @param outcome - how the race ended.
    * @param mailbox - the leader's durable mailbox feed, newest last.
-   * @returns the four-field result.
+   * @returns the four buckets, whether time ran out, and what the done members
+   *   handed back.
    */
   private bucketOf(
     actor: Actor,
@@ -1001,17 +1062,32 @@ export class TeamService extends Service {
     const done: string[] = []
     const busy: string[] = []
     const cold: string[] = []
+    const reports: TeamWaitReport[] = []
+    // The log walk answers two questions at once (did it report, and what did it
+    // say), so it is taken once and only when something actually asks it. The
+    // judgement below asks it for a target that is neither settled nor seen — the
+    // state that cannot be read from the registry — exactly as before; the report
+    // read asks it for a member whose text is not in the queue.
+    let logged: Map<string, UserMessage> | undefined
+    const loggedReports = (): Map<string, UserMessage> => (logged ??= this.logReportMap(actor, targets))
     // Only a target that is neither settled nor seen asks where its report went,
     // so a wait whose members are all accounted for never reads the log at all —
     // and a target the precheck already settled (see {@link presettleReported})
     // does not send this scan looking for it a second time.
     const reported = observations.some(observation => !observation.seen && !observation.settled)
-      ? this.reportedInLog(actor, targets)
+      ? loggedReports()
       : undefined
+    // One finished member: its name in the bucket, and its words in `reports`
+    // when anything it left can be read.
+    const finished = (target: WaitTarget): void => {
+      done.push(target.name)
+      const text = this.reportOf(actor, target, mailbox, loggedReports)
+      if (text !== undefined) reports.push({ member: target.name, text })
+    }
     targets.forEach((target, index) => {
       const observation = observations[index]!
       if (observation.settled) {
-        done.push(target.name)
+        finished(target)
         return
       }
       if (!observation.seen) {
@@ -1025,7 +1101,7 @@ export class TeamService extends Service {
         if (reported?.has(target.memberId) === true
           || this.reportedIntoInbox(actor, target.memberId, mailbox)
           || reportedBack(mailbox, target.memberId)) {
-          done.push(target.name)
+          finished(target)
           return
         }
         cold.push(target.name)
@@ -1035,12 +1111,55 @@ export class TeamService extends Service {
       // microtask out of `busy`.
       const agent = this.ctx.agents.get(SessionId(target.memberId))
       if (agent === undefined || agent.status !== 'running') {
-        done.push(target.name)
+        finished(target)
         return
       }
       busy.push(target.name)
     })
-    return { done, busy, cold, timedOut: outcome === 'timeout' }
+    return { done, busy, cold, timedOut: outcome === 'timeout', reports }
+  }
+
+  /**
+   * What one finished member handed back, from the first place that has it.
+   *
+   * The order is the order the evidence outlives itself: the live inbox queue
+   * (the newest thing the member said, still unconsumed), then the spliced rows
+   * in the leader's own log (the durable form of the same message, and the only
+   * trace left once a boundary consumed the notice), then the durable mailbox
+   * row (a report that reached the surface and survived a restart; its text is
+   * the delivered message or the notice's own summary), and finally whatever the
+   * message's `source.summary` carried — the one-line account a settlement
+   * notice keeps when the member's closing text was empty.
+   *
+   * A member that is `done` because `whenIdle()` settled has no guaranteed report
+   * at all: it may have answered, and it may have said nothing. Both are answered
+   * here without a claim — nothing found means no entry in `reports`.
+   * @param actor - the team, and the leader whose inbox and log are read.
+   * @param target - the finished member.
+   * @param mailbox - the leader's durable mailbox feed, newest last.
+   * @param logged - the log reports, resolved lazily and only when reached.
+   * @returns the report text, or undefined when the member left nothing to read.
+   */
+  private reportOf(
+    actor: Actor,
+    target: WaitTarget,
+    mailbox: readonly TeamMessageView[],
+    logged: () => ReadonlyMap<string, UserMessage>,
+  ): string | undefined {
+    const queued = this.freshQueuedReports(actor, target.memberId, mailbox)
+    // The newest queued message is the last word it sent this round.
+    for (let index = queued.length - 1; index >= 0; index -= 1) {
+      const text = reportTextOf(queued[index]!)
+      if (text !== undefined) return text
+    }
+    const spliced = logged().get(target.memberId)
+    if (spliced !== undefined) {
+      const text = reportTextOf(spliced)
+      if (text !== undefined) return text
+    }
+    const row = mailboxRowOf(mailbox, target.memberId)
+    if (row !== undefined && row.text.trim() !== '') return truncateReport(row.text.trim())
+    return undefined
   }
 
   /**
@@ -1593,9 +1712,27 @@ export class TeamService extends Service {
    * @returns the member ids with a report after their own boundary.
    */
   private reportedInLog(actor: Actor, targets: readonly WaitTarget[]): ReadonlySet<string> {
+    return new Set(this.logReportMap(actor, targets).keys())
+  }
+
+  /**
+   * The same reverse walk as {@link reportedInLog}, keeping each member's NEWEST
+   * report instead of only the fact that one exists.
+   *
+   * The wait asks this walk two things at once — "did it report" (the bucket)
+   * and "what did it say" (the report text) — and they must be answered from one
+   * scan: two scans would stamp two different sets of freshness evidence onto
+   * one answer. Walking backwards makes the newest row the first hit for its
+   * sender, so the message kept per member is the one the leader would read next
+   * anyway.
+   * @param actor - the team, and the leader whose log is read.
+   * @param targets - the members this wait was asked about.
+   * @returns the newest spliced report per member id, past its own boundary.
+   */
+  private logReportMap(actor: Actor, targets: readonly WaitTarget[]): Map<string, UserMessage> {
     const floorOf = (memberId: string): number => actor.team.deliveredAt.get(memberId) ?? 0
     const pending = new Set(targets.map(target => target.memberId))
-    const reported = new Set<string>()
+    const reported = new Map<string, UserMessage>()
     if (pending.size === 0) return reported
     const events = actor.leader.session.snapshotEvents()
     // The oldest boundary settles how far back the walk has to go; the absolute
@@ -1608,10 +1745,10 @@ export class TeamService extends Service {
       if (event.type !== 'agent/inbox/spliced') continue
       for (const message of event.data.inserted) {
         const sender = reportSenderOf(message.source)
-        if (sender === undefined || !pending.has(sender)) continue
+        if (sender === undefined || !pending.has(sender) || reported.has(sender)) continue
         // Before this member's own delivery: an earlier round's answer.
         if (event.seq < floorOf(sender)) continue
-        reported.add(sender)
+        reported.set(sender, message)
       }
       if (reported.size === pending.size) break
     }
@@ -1643,19 +1780,46 @@ export class TeamService extends Service {
    *   current round.
    */
   private reportedIntoInbox(actor: Actor, memberId: string, mailbox: readonly TeamMessageView[]): boolean {
-    const queued: string[] = []
+    return this.freshQueuedReports(actor, memberId, mailbox).length > 0
+  }
+
+  /**
+   * The queued messages this member left in the leader's inbox about THIS round
+   * — the same read as {@link reportedIntoInbox}, keeping the messages instead
+   * of only counting them.
+   *
+   * The wait needs both halves of one question from the same read: whether a
+   * report exists (which decides the bucket) and what it says (which is the
+   * answer the bucket is worth having). Splitting them into two walks would let
+   * the two disagree about freshness, which is the one thing the boundary is
+   * there to decide.
+   * @param actor - the team, and the leader whose inbox is read.
+   * @param memberId - the member whose reports are being collected.
+   * @param mailbox - the leader's durable mailbox rows, newest last, used only
+   *   when this process never delivered to this member (no freeze boundary).
+   * @returns the queued messages, oldest first; empty when none is this round's.
+   */
+  private freshQueuedReports(
+    actor: Actor,
+    memberId: string,
+    mailbox: readonly TeamMessageView[],
+  ): readonly UserMessage[] {
+    const queued: UserMessage[] = []
+    const ids: string[] = []
     for (const message of [...actor.leader.inbox.nextTurn, ...actor.leader.inbox.nextStep]) {
-      if (reportSenderOf(message.source) === memberId) queued.push(String(message.id))
+      if (reportSenderOf(message.source) !== memberId) continue
+      queued.push(message)
+      ids.push(String(message.id))
     }
-    if (queued.length === 0) return false
+    if (queued.length === 0) return []
     const stale = actor.team.staleReports.get(memberId)
-    if (stale !== undefined) return queued.some(id => !stale.has(id))
+    if (stale !== undefined) return queued.filter((_message, index) => !stale.has(ids[index]!))
     // Nothing was delivered to this member through this live team, so a queued
     // report cannot predate a delivery this process made. The durable mailbox
     // still catches a hydrated delivery: a leader that sent a NEW task in an
     // earlier process has an outbound row nothing has answered yet.
     const mentioned = mailbox.some(row => row.from === memberId || row.to === memberId)
-    return !mentioned || reportedBack(mailbox, memberId)
+    return !mentioned || reportedBack(mailbox, memberId) ? queued : []
   }
 
   /**
@@ -1813,6 +1977,120 @@ function reportedBack(mailbox: readonly TeamMessageView[], memberId: string): bo
     if (row.to === memberId) return false
   }
   return false
+}
+
+/**
+ * The LAST mailbox row this member wrote, whose text is what it said.
+ *
+ * Mailbox rows are the durable surface: a report that reached the leader in an
+ * earlier process is still here after a restart, with the delivered text (a
+ * `team_send` reply) or the notice's one-line account on it. It is read LAST,
+ * because a live queue or a spliced row is the same message with its full
+ * content; this one is the fallback for the case where neither was observed.
+ * @param mailbox - the leader's durable mailbox rows, newest last.
+ * @param memberId - the member's session id, which is also a row's `from`.
+ * @returns its newest own row, or undefined when it has none.
+ */
+function mailboxRowOf(mailbox: readonly TeamMessageView[], memberId: string): TeamMessageView | undefined {
+  for (let index = mailbox.length - 1; index >= 0; index -= 1) {
+    const row = mailbox[index]!
+    if (row.from === memberId) return row
+  }
+  return undefined
+}
+
+/**
+ * What one member's delivered message says, with the runtime's template removed
+ * and the result bounded to {@link WAIT_REPORT_MAX_CHARS}.
+ *
+ * The content is read as blocks because that is what a message is: every `text`
+ * block is the member's own words and they are joined with newlines, while a
+ * non-text block (an image, an attachment) cannot be carried through a tool
+ * result at all — it is skipped and counted, and the count is stated in the text
+ * so the leader knows something was dropped rather than silently losing it.
+ *
+ * Two shapes arrive here, and only one of them is templated:
+ * - a `team_send` relay (`team-message`), whose content IS what the member wrote;
+ * - a settlement notice (`subagent-settled`), which the harness builds as
+ *   `summary`, then `Its closing message:`, then the child's closing text, then
+ *   possibly `Structured result: …` and a diagnostic. The member's words are
+ *   what sits after the marker — everything before it is the runtime speaking
+ *   about the member, and a report that carried it would attribute a template
+ *   sentence to the teammate. The summary is the fallback, not the body: a child
+ *   that left no closing text at all ("It left no closing message.") still
+ *   finished, and its one-line account is then the only thing to report.
+ * @param message - one delivered message, from the inbox queue or a spliced row.
+ * @returns the report text, or undefined when the message carries nothing.
+ */
+function reportTextOf(message: UserMessage): string | undefined {
+  const texts: string[] = []
+  let omitted = 0
+  for (const block of message.content) {
+    if (block.type !== 'text') {
+      omitted += 1
+      continue
+    }
+    if (block.text.trim() !== '') texts.push(block.text)
+  }
+  const source = typeof message.source === 'object' && message.source !== null
+    ? message.source as Record<string, unknown>
+    : undefined
+  const summary = typeof source?.['summary'] === 'string' && source['summary'].trim() !== ''
+    ? source['summary'].trim()
+    : undefined
+  const templated = source?.['kind'] === 'subagent-settled'
+  const closing = templated ? closingWords(texts, summary) : texts.join('\n').trim()
+  const body = closing !== '' ? closing : summary
+  if (body === undefined) return undefined
+  return truncateReport(omitted === 0 ? body : `${body}\n${nonTextNote(omitted)}`)
+}
+
+/**
+ * The member's own words inside one settlement notice, template removed.
+ *
+ * The marker is the precise half: `Its closing message:` is what the continuation
+ * manager puts directly in front of the child's text, so slicing at it cannot
+ * mistake a member's sentence for a template line, and the two runtime trailers
+ * after the child's words (`Structured result: …`, a diagnostic) are dropped by
+ * what they are. Stripping lines by pattern is only the fallback, for a notice
+ * that carries no marker at all (an older row, or a re-shaped notice whose writer
+ * kept the summary but dropped the separator).
+ * @param texts - the message's non-empty text blocks, in order.
+ * @param summary - the notice's own one-line account, when it has one.
+ * @returns the member's words, or an empty string when it wrote none.
+ */
+function closingWords(texts: readonly string[], summary: string | undefined): string {
+  const marker = texts.indexOf(CLOSING_MARKER)
+  if (marker >= 0) {
+    return texts
+      .slice(marker + 1)
+      .filter(line => !line.startsWith(STRUCTURED_PREFIX) && line !== NO_CLOSING_MESSAGE)
+      .join('\n')
+      .trim()
+  }
+  return texts
+    .filter(line => line !== summary && line !== NO_CLOSING_MESSAGE && !line.startsWith(STRUCTURED_PREFIX))
+    .join('\n')
+    .trim()
+}
+
+/** How a skipped block is disclosed inside the report text. */
+function nonTextNote(count: number): string {
+  return `[+${count} non-text block${count === 1 ? '' : 's'} omitted]`
+}
+
+/**
+ * Bound one report to {@link WAIT_REPORT_MAX_CHARS}, head kept and the cut marked.
+ *
+ * The ellipsis is inside the bound, not after it, so the ceiling is one number a
+ * caller can rely on; `…` rather than a sentence of our own keeps the truncation
+ * visible without pretending to be the member's own words.
+ * @param text - the report text, of any length.
+ * @returns the text itself when it fits, else its head and `…`.
+ */
+function truncateReport(text: string): string {
+  if (text.length <= WAIT_REPORT_MAX_CHARS) return text
+  return `${text.slice(0, WAIT_REPORT_MAX_CHARS - 1)}…`
 }
 
 /**

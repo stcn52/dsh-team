@@ -22,7 +22,10 @@ import type { TeamMemberFact } from './fold.ts'
 import { DISPATCH_FACT_PREFIX } from './fold-dispatch.ts'
 import { TeamError } from './errors.ts'
 import type { DossierEntry, MemberDossiers } from './dossier.ts'
-import { WAIT_DEFAULT_MS, WAIT_MAX_MS, type TeamSeat, type TeamService, type TeamWaitResult } from './service.ts'
+import {
+  WAIT_DEFAULT_MS, WAIT_MAX_MS, WAIT_REPORT_MAX_CHARS,
+  type TeamSeat, type TeamService, type TeamWaitResult,
+} from './service.ts'
 import { SHARED_AREA, type TeamWorkspace } from './workspace.ts'
 
 /** The acting agent; a team tool without one is a composition mistake. */
@@ -514,6 +517,17 @@ export function dismissTool(ctx: Context): ToolDefinition {
 const BOARD_RENDER_LIMIT = 10
 
 /**
+ * How much of one member's report the rendered wait answer carries per line.
+ *
+ * The schema already bounds each report to `WAIT_REPORT_MAX_CHARS`, which is the
+ * right ceiling for the structured field — a caller can use all of it. The
+ * rendered sentence is read as a summary, so a shorter bound keeps five reports
+ * from pushing the roster line out of sight; the full text is still in the
+ * structured output, one field away.
+ */
+export const REPORT_LINE_MAX_CHARS = 400
+
+/**
  * `team_list` — the shared read every member uses to decide who to talk to.
  * @param ctx - context carrying the team service.
  * @param audience - whose reading of an empty team this registration serves.
@@ -657,7 +671,10 @@ export function waitTool(ctx: Context): ToolDefinition {
     name: 'team_wait',
     description:
       'Block until teammates finish their current turn, then report who is done, who is still running, who '
-      + 'had no live session, and whether the timeout ran out. Use this — not repeated team_list calls — '
+      + 'had no live session, and whether the timeout ran out. It does not stop at names: the closing report '
+      + 'of every finished member comes back with the answer — in reports for a caller reading the fields, '
+      + 'and in the rendered text as one "name: what it said" line each — so a single wait returns what the '
+      + 'members concluded, not only that they stopped. Use this — not repeated team_list calls — '
       + 'whenever you need everyone "back" before you summarise: team_send only accepts a message and never '
       + 'answers, so this is the only call that waits for the work itself. Read the answer for what it is: it '
       + 'reports that nobody is running, not that your broadcast has been answered, and a teammate\'s reply '
@@ -721,9 +738,35 @@ export function waitTool(ctx: Context): ToolDefinition {
               + 'delivery that has not been woken yet; never a completion, but not proof it never started either.',
           },
           timedOut: { type: 'boolean', required: true },
+          reports: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                member: {
+                  type: 'string',
+                  required: true,
+                  description: 'The member, named exactly as done names it.',
+                },
+                text: {
+                  type: 'string',
+                  required: true,
+                  description:
+                    'What it handed back, runtime template lines removed and bounded to '
+                    + `${WAIT_REPORT_MAX_CHARS} characters (past that the tail becomes \u2026).`,
+                },
+              },
+            },
+            description:
+              'What each finished member actually handed back, in done order: the member and its closing '
+              + 'text. A member that is done but left nothing readable has no entry, so this is a subset of '
+              + 'done; busy and cold members never appear.',
+          },
         },
       },
-      render: (_args, value) => [{ type: 'text', text: waitSummary(value) }],
+      render: (_args, value) => [{ type: 'text', text: waitRender(value) }],
     },
     presentCall: args => ({
       card: 'generic',
@@ -750,9 +793,56 @@ export function waitTool(ctx: Context): ToolDefinition {
         busy: [...observed.busy],
         cold: [...observed.cold],
         timedOut: observed.timedOut,
+        reports: observed.reports.map(report => ({ member: report.member, text: report.text })),
       }
     },
   })
+}
+
+/**
+ * The text one `team_wait` answer puts in front of the model: the state
+ * sentence, then what each finished member handed back.
+ *
+ * The sentence itself is {@link waitSummary}, unchanged — a reader (and the
+ * conversation view's own `waitReport()` parser) recognizes the states from it.
+ * The reports are APPENDED, never woven in: one `name: text` line each, with the
+ * member's newlines flattened to spaces so one report cannot forge a second
+ * bucket clause, and the line bounded again because a report may be
+ * {@link WAIT_REPORT_MAX_CHARS} long.
+ *
+ * The separator before the block is load-bearing rather than cosmetic. The card's
+ * parser reads each bucket with `after(label)`, which takes everything from
+ * `finished: ` up to the next `;` — so a block appended straight onto
+ * `all finished: Alice` would be swallowed into the done list and the card would
+ * show a member named after the report. Ending the sentence with `;` closes the
+ * last clause before the block starts; the three label words are also defused
+ * inside the report text, so a member quoting this very sentence cannot invent a
+ * bucket that the wait never reported.
+ * @param value - the tool's resolved result.
+ * @returns the rendered tool output.
+ */
+function waitRender(value: TeamWaitResult): string {
+  const sentence = waitSummary(value)
+  // Tolerate a hand-built value: the block is additive, and the places that call
+  // `render` directly (the card specs build the four buckets themselves) predate
+  // it. Absent reads as "nobody reported", never as a crash in the renderer.
+  const reports = value.reports ?? []
+  if (reports.length === 0) return sentence
+  const lines = reports.map(report => `${report.member}: ${inlineReport(report.text)}`)
+  return `${sentence};\n${lines.join('\n')}`
+}
+
+/** One report as a single line: newlines flattened, bounded, bucket labels defused. */
+function inlineReport(text: string): string {
+  const flat = text.replace(/\s*\n\s*/gu, ' ').trim()
+  const bounded = flat.length <= REPORT_LINE_MAX_CHARS
+    ? flat
+    : `${flat.slice(0, REPORT_LINE_MAX_CHARS - 1)}…`
+  // `finished: `, `still busy: ` and `no live session: ` are the three markers a
+  // reader searches for; a colon-space after them is what makes one parse as a
+  // bucket, so only that pair is defused and the words stay readable.
+  return bounded
+    .replace(/(finished|still busy|no live session): /gu, '$1 — ')
 }
 
 /**

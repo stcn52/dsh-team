@@ -11,7 +11,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { TeamError } from '../src/errors.ts'
-import { TeamService } from '../src/service.ts'
+import { TeamService, WAIT_REPORT_MAX_CHARS } from '../src/service.ts'
 import { SHARED_AREA, TeamWorkspace, type WorkspaceEntry } from '../src/workspace.ts'
 import type { TeamConfig } from '../src/config.ts'
 import {
@@ -124,6 +124,40 @@ function settlementNotice(memberId: string, summary = 'Alice finished.'): UserMe
   return createUserMessage({
     content: [{ type: 'text', text: summary }],
     source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: SessionId(memberId) },
+  })
+}
+
+/**
+ * Build the settlement notice exactly as the harness builds it.
+ *
+ * `createSettlementMessage()` in
+ * `@deepseek-ai/dsh-subagent/lib/types/continuation-messages.js` is not a public
+ * export, so its shape is mirrored here: the runtime's one-line summary, then the
+ * literal marker `Its closing message:`, then the child's own text — or, for a
+ * silent child, `It left no closing message.` That template is exactly what the
+ * wait must strip: a report that carried it would attribute a sentence the
+ * runtime wrote about the member to the member itself.
+ * @param memberId - the child session that settled.
+ * @param closing - the child's closing text blocks; empty for a silent child.
+ * @param summary - the one-line account the notice carries, when a case wants its own.
+ * @returns the queued message.
+ */
+function settlementWithClosing(
+  memberId: string,
+  closing: readonly string[],
+  summary?: string,
+): UserMessage {
+  const line = summary ?? `Background subagent ${memberId} finished and will do no further work `
+    + 'unless you send it more.'
+  return createUserMessage({
+    content: [
+      { type: 'text', text: line },
+      { type: 'text', text: 'Its closing message:' },
+      ...closing.length === 0
+        ? [{ type: 'text' as const, text: 'It left no closing message.' }]
+        : closing.map(text => ({ type: 'text' as const, text })),
+    ],
+    source: { kind: 'subagent-settled', form: 'notice', summary: line, senderSessionId: SessionId(memberId) },
   })
 }
 
@@ -1069,7 +1103,7 @@ describe('wait', () => {
     await spawn(scene, 'Bob', { childId: 'child-2' })
 
     expect(await scene.service.wait(scene.leader.agent))
-      .toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false })
+      .toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false, reports: [] })
   })
 
   it('blocks while a member runs, and returns as soon as it is idle', async () => {
@@ -1085,7 +1119,7 @@ describe('wait', () => {
     expect(resolved).toEqual([])
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
   })
 
   /**
@@ -1112,7 +1146,7 @@ describe('wait', () => {
     expect(resolved).toEqual([])
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
   })
 
   it('re-reads the roster after the settle, so a member published meanwhile is still awaited', async () => {
@@ -1131,7 +1165,7 @@ describe('wait', () => {
     expect(resolved).toEqual([])
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
   })
 
   /**
@@ -1183,7 +1217,7 @@ describe('wait', () => {
     expect(alice.idleCalls).toBe(1)
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
   })
 
   it('reports the members still running when the budget expires, without hanging', async () => {
@@ -1194,7 +1228,7 @@ describe('wait', () => {
 
     const started = Date.now()
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 20 })
-    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], cold: [], timedOut: true })
+    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], cold: [], timedOut: true, reports: [] })
     expect(Date.now() - started).toBeLessThan(2_000)
   })
 
@@ -1216,7 +1250,7 @@ describe('wait', () => {
     await sleep(40)
     scene.agents.remove(alice.id)
 
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
     expect(Date.now() - started).toBeLessThan(500)
   })
 
@@ -1252,7 +1286,7 @@ describe('wait', () => {
     scene.agents.remove(alice.id)
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true, reports: [{ member: 'Alice', text: 'OK' }] })
   })
 
   /**
@@ -1283,7 +1317,7 @@ describe('wait', () => {
     scene.agents.remove(alice.id)
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true, reports: [{ member: 'Bob', text: 'done' }] })
   })
 
   /**
@@ -1322,7 +1356,7 @@ describe('wait', () => {
     scene.agents.remove(alice.id)
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true, reports: [] })
   })
 
   /**
@@ -1342,7 +1376,7 @@ describe('wait', () => {
     scene.leader.inbox.nextStep.push(settlementNotice(alice.id))
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true, reports: [{ member: 'Alice', text: 'Alice finished.' }] })
   })
 
   /**
@@ -1371,7 +1405,7 @@ describe('wait', () => {
     // Answered from the log BEFORE the clock starts, so the same member is
     // `done` without spending the budget — the deadline no longer decides it.
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [{ member: 'Alice', text: 'Alice finished.' }] })
   })
 
   /**
@@ -1390,7 +1424,7 @@ describe('wait', () => {
     scene.agents.remove(bob.id)
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true, reports: [{ member: 'Bob', text: 'Bob finished.' }] })
   })
 
   /**
@@ -1411,7 +1445,7 @@ describe('wait', () => {
     scene.agents.remove(alice.id)
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true, reports: [] })
   })
 
   /**
@@ -1436,14 +1470,14 @@ describe('wait', () => {
     await scene.service.send(scene.leader.agent, 'Alice', 'one more thing', signal)
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true, reports: [] })
 
     // Round two's answer, spliced after the delivery, is the one that counts —
     // and it is counted before the wait arms anything, so this one does not time
     // out either. The watermark, not the clock, is what separates the two halves.
     scene.leader.session.events.push(inboxSplicedEvent([settlementNotice(alice.id)]))
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [{ member: 'Alice', text: 'Alice finished.' }] })
   })
 
   /**
@@ -1457,7 +1491,7 @@ describe('wait', () => {
     scene.leader.inbox.nextTurn.push(queuedReply(alice.id, 'Alice'))
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true, reports: [{ member: 'Alice', text: 'OK' }] })
   })
 
   /**
@@ -1473,7 +1507,7 @@ describe('wait', () => {
     scene.leader.inbox.nextStep.push(settlementNotice(bob.id, 'Bob finished.'))
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: ['Bob'], busy: [], cold: ['Alice'], timedOut: true, reports: [{ member: 'Bob', text: 'Bob finished.' }] })
   })
 
   /**
@@ -1492,7 +1526,7 @@ describe('wait', () => {
     }))
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true, reports: [] })
   })
 
   /**
@@ -1511,7 +1545,7 @@ describe('wait', () => {
     scene.leader.inbox.nextTurn.push(queuedReply(String(scene.leader.id), 'leader', 'rebroadcast'))
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: [], busy: [], cold: ['Alice', 'Bob'], timedOut: true })
+      .toEqual({ done: [], busy: [], cold: ['Alice', 'Bob'], timedOut: true, reports: [] })
   })
 
   /**
@@ -1532,7 +1566,7 @@ describe('wait', () => {
     await scene.service.send(scene.leader.agent, 'Alice', 'one more thing', signal)
 
     expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 40 }))
-      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+      .toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true, reports: [] })
   })
 
   /**
@@ -1550,7 +1584,7 @@ describe('wait', () => {
     scene.leader.inbox.nextStep.push(settlementNotice(bob.id, 'Bob finished.'))
 
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
-    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], cold: ['Carol'], timedOut: true })
+    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], cold: ['Carol'], timedOut: true, reports: [{ member: 'Bob', text: 'Bob finished.' }] })
 
     const flat = [...observed.done, ...observed.busy, ...observed.cold]
     expect(new Set(flat).size).toBe(flat.length)
@@ -1578,7 +1612,7 @@ describe('wait', () => {
 
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 150 })
     expect(observed)
-      .toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
+      .toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true, reports: [] })
 
     const flat = [...observed.done, ...observed.busy, ...observed.cold]
     // Disjoint: no name twice.
@@ -1603,7 +1637,7 @@ describe('wait', () => {
     // Armed while the cold member is still being waited for...
     expect(live.size).toBe(1)
 
-    expect(await waiting).toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+    expect(await waiting).toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true, reports: [] })
     // ...and gone the moment the budget ended.
     expect(live.size).toBe(0)
   })
@@ -1638,7 +1672,7 @@ describe('wait', () => {
     expect(live.size).toBe(1)
 
     scene.agents.add(alice)
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
     expect(live.size).toBe(0)
   })
 
@@ -1681,12 +1715,12 @@ describe('wait', () => {
   it('answers an empty team, and an empty selection, without arming a wait', async () => {
     const scene = world()
     expect(await scene.service.wait(scene.leader.agent))
-      .toEqual({ done: [], busy: [], cold: [], timedOut: false })
+      .toEqual({ done: [], busy: [], cold: [], timedOut: false, reports: [] })
 
     const alice = await spawn(scene, 'Alice')
     alice.status = 'running'
     expect(await scene.service.wait(scene.leader.agent, { members: [], timeoutMs: 60_000 }))
-      .toEqual({ done: [], busy: [], cold: [], timedOut: false })
+      .toEqual({ done: [], busy: [], cold: [], timedOut: false, reports: [] })
     expect(alice.idleCalls).toBe(0)
   })
 
@@ -1695,7 +1729,7 @@ describe('wait', () => {
     const alice = await spawn(scene, 'Alice')
 
     expect(await scene.service.wait(scene.leader.agent, { members: ['Alice', 'alice', alice.id] }))
-      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
   })
 
   /**
@@ -1720,7 +1754,7 @@ describe('wait', () => {
     await sleep(80)
     scene.agents.remove(alice.id)
 
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
     // Seconds, not the budget: the bug returned after ~2 000 ms here.
     expect(Date.now() - started).toBeLessThan(500)
   })
@@ -1750,7 +1784,7 @@ describe('wait', () => {
     // Bob's disposal is not news about Alice's turn.
     expect(resolved).toEqual([])
 
-    expect(await waiting).toEqual({ done: [], busy: ['Alice'], cold: [], timedOut: true })
+    expect(await waiting).toEqual({ done: [], busy: ['Alice'], cold: [], timedOut: true, reports: [] })
   })
 
   /**
@@ -1769,7 +1803,7 @@ describe('wait', () => {
     expect(live.size).toBe(1)
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [] })
     expect(live.size).toBe(0)
   })
 
@@ -1784,7 +1818,7 @@ describe('wait', () => {
     await sleep(40)
     expect(live.size).toBe(1)
 
-    expect(await waiting).toEqual({ done: [], busy: ['Alice'], cold: [], timedOut: true })
+    expect(await waiting).toEqual({ done: [], busy: ['Alice'], cold: [], timedOut: true, reports: [] })
     expect(live.size).toBe(0)
   })
 
@@ -1826,7 +1860,7 @@ describe('wait', () => {
     scene.agents.remove(alice.id)
     scene.agents.remove(bob.id)
 
-    expect(await waiting).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false, reports: [] })
     expect(Date.now() - started).toBeLessThan(1_000)
   })
 
@@ -1864,7 +1898,7 @@ describe('wait', () => {
     // Seconds, not the budget: the answer was already in the log when the wait
     // began, so there was nothing left to watch.
     expect(elapsed).toBeLessThan(1_000)
-    expect(observed).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false })
+    expect(observed).toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false, reports: [{ member: 'Alice', text: 'Alice finished.' }, { member: 'Bob', text: 'Bob finished.' }] })
   })
 
   /**
@@ -1886,7 +1920,7 @@ describe('wait', () => {
     // race — the member was already answered before the window opened. Asserted
     // first, because this is the claim that is specific to the precheck.
     expect(armed).toEqual([])
-    expect(observed).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(observed).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [{ member: 'Alice', text: 'Alice finished.' }] })
   })
 
   /**
@@ -1916,7 +1950,7 @@ describe('wait', () => {
     // Precheck missed: the cold observation is armed exactly as before.
     expect(live.size).toBe(1)
 
-    expect(await waiting).toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+    expect(await waiting).toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true, reports: [] })
     // It really waited the budget out rather than answering early.
     expect(Date.now() - started).toBeGreaterThanOrEqual(120)
     expect(live.size).toBe(0)
@@ -1949,11 +1983,166 @@ describe('wait', () => {
     // log without watching, Bob was already resident. Two `agent/created` here
     // would mean the precheck left Alice on the cold path.
     expect(armed.filter(name => name === 'agent/created')).toEqual(['agent/created'])
-    expect(observed).toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
+    expect(observed).toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true, reports: [{ member: 'Alice', text: 'Alice finished.' }] })
 
     const flat = [...observed.done, ...observed.busy, ...observed.cold]
     // Disjoint: no name twice. Union: every target named exactly once.
     expect(new Set(flat).size).toBe(flat.length)
     expect([...flat].sort()).toEqual(['Alice', 'Bob', 'Carol'])
+  })
+
+  /**
+   * The extension's reason to exist: a wait that answered only "Alice is done"
+   * makes the leader ask again to learn what Alice said, which is one more round
+   * trip for a fact the wait already held. The spliced row is the durable shape of
+   * a report — what remains after a boundary consumed the queued notice — so this
+   * is the read that had all the content and used none of it.
+   */
+  it('brings back the text a finished member reported, not only its name', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.session.events.push(inboxSplicedEvent([queuedReply(alice.id, 'Alice', 'OK')]))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed.done).toEqual(['Alice'])
+    expect(observed.reports).toEqual([{ member: 'Alice', text: 'OK' }])
+  })
+
+  /**
+   * The same report, in the shape the runtime actually writes it: the settlement
+   * notice is a template ("Background subagent … finished…", "Its closing
+   * message:") wrapped around the member's text. Handing that back verbatim would
+   * put the runtime's sentence in the member's mouth, which is worse than no
+   * report at all — a leader quoting it believes the teammate said it.
+   */
+  it('strips the settlement template, leaving only what the member said', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.inbox.nextStep.push(settlementWithClosing(alice.id, ['shipped the parser fix']))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed.reports).toEqual([{ member: 'Alice', text: 'shipped the parser fix' }])
+  })
+
+  /**
+   * The empty half of the same rule. A child that produced no closing text still
+   * finished, and the one-line account remains: reporting nothing would hide a
+   * completion the wait just confirmed, while reporting the template would fake a
+   * sentence. The summary is the honest floor.
+   */
+  it('falls back to the notice summary when the member left no closing text', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    const summary = 'Background subagent child-1 finished and will do no further work unless you send it more.'
+    scene.leader.inbox.nextStep.push(settlementWithClosing(alice.id, [], summary))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed.reports).toEqual([{ member: 'Alice', text: summary }])
+  })
+
+  /**
+   * A tool result becomes model-visible input on every later step, so an
+   * unbounded report is a context window one verbose member can spend alone. The
+   * bound is the contract: exactly `WAIT_REPORT_MAX_CHARS`, head kept, cut marked
+   * with `…` so the reader knows there is more rather than believing it ended.
+   */
+  it('bounds a long report and marks the cut instead of flooding the caller', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    const long = 'a'.repeat(WAIT_REPORT_MAX_CHARS + 500)
+    scene.leader.session.events.push(inboxSplicedEvent([queuedReply(alice.id, 'Alice', long)]))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    const [report] = observed.reports
+    expect(report?.text).toHaveLength(WAIT_REPORT_MAX_CHARS)
+    expect(report?.text.endsWith('\u2026')).toBe(true)
+    // The head is preserved byte for byte: a truncation that reshaped it would be
+    // a different report, not a shorter one.
+    expect(report?.text.slice(0, -1)).toBe(long.slice(0, WAIT_REPORT_MAX_CHARS - 1))
+  })
+
+  /**
+   * `reports` is about what came back, so a member that never came back cannot be
+   * in it: Bob is still running and Carol never said a word. A report for either
+   * would be the wait inventing content, which is the failure mode the whole
+   * `cold`/`busy` split exists to prevent.
+   */
+  it('names only the members that reported, never a busy or cold one', async () => {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3 } })
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    const carol = await spawn(scene, 'Carol', { childId: 'child-3' })
+    scene.leader.session.events.push(inboxSplicedEvent([queuedReply(alice.id, 'Alice', 'reviewed: no findings')]))
+    scene.agents.remove(alice.id)
+    bob.status = 'running'
+    scene.agents.remove(carol.id)
+    carol.status = 'running'
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+    expect(observed.done).toEqual(['Alice'])
+    expect(observed.busy).toEqual(['Bob'])
+    expect(observed.cold).toEqual(['Carol'])
+    expect(observed.reports).toEqual([{ member: 'Alice', text: 'reviewed: no findings' }])
+  })
+
+  /**
+   * The other end of the same statement: a member that finishes without saying
+   * anything has no report, so `reports` is a SUBSET of `done` rather than a
+   * parallel list. An entry invented to keep the two the same length would make
+   * the leader believe a silent member answered.
+   */
+  it('leaves a finished but silent member out of reports', async () => {
+    const scene = world()
+    await spawn(scene, 'Alice')
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed.done).toEqual(['Alice'])
+    expect(observed.reports).toEqual([])
+  })
+
+  /**
+   * The queue is the FAST half of the report evidence and the only half that has
+   * anything to read while the notice is unconsumed. Reading the bucket from it
+   * and the text from somewhere else would let one answer describe two moments.
+   */
+  it('reads the report out of the live inbox while it is still queued', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.inbox.nextStep.push(queuedReply(alice.id, 'Alice', 'the diff is clean'))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed.done).toEqual(['Alice'])
+    expect(observed.reports).toEqual([{ member: 'Alice', text: 'the diff is clean' }])
+  })
+
+  /**
+   * A report is text, and a tool result cannot carry an image: the block is
+   * dropped, but the drop is disclosed inside the report so the leader knows
+   * something was attached instead of reading a report that looks complete.
+   */
+  it('discloses a dropped non-text block instead of losing it silently', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.leader.session.events.push(inboxSplicedEvent([createUserMessage({
+      content: [
+        { type: 'text', text: 'screenshot attached' },
+        { type: 'image', attachment: { id: 'img-1' } } as never,
+      ],
+      source: {
+        kind: 'team-message', form: 'relay', senderSessionId: alice.id, senderName: 'Alice', chainId: 'c1', hop: 0,
+      },
+    })]))
+    scene.agents.remove(alice.id)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed.reports).toEqual([{
+      member: 'Alice',
+      text: 'screenshot attached\n[+1 non-text block omitted]',
+    }])
   })
 })

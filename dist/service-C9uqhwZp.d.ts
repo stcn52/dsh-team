@@ -421,6 +421,31 @@ interface TeamWaitResult {
   readonly cold: readonly string[];
   /** Whether the budget expired before every target settled. */
   readonly timedOut: boolean;
+  /**
+   * What the members in {@link done} actually handed back, in that same order —
+   * the answer itself, not just the fact that one arrived.
+   *
+   * A `done` bucket alone leaves the leader with a name and no content: it
+   * knows a turn ended but not what the member concluded, so it has to ask
+   * again (a whole extra round trip) or guess. Every member whose report this
+   * wait could actually read contributes one entry here; a member that is
+   * finished but left nothing to read (a silent turn, a session reaped with no
+   * report in the inbox, the log, or the mailbox) has no entry, so this list is
+   * a SUBSET of {@link done} — and {@link busy} and {@link cold} members never
+   * appear in it, because nothing of theirs was read.
+   */
+  readonly reports: readonly TeamWaitReport[];
+}
+/** One finished member's closing words, as `team_wait` brought them back. */
+interface TeamWaitReport {
+  /** The member, named exactly as {@link TeamWaitResult.done} names it. */
+  readonly member: string;
+  /**
+   * What it handed back: the text blocks of its report, template lines removed
+   * and bounded to {@link WAIT_REPORT_MAX_CHARS} characters. An empty string
+   * never appears — a member that produced no text at all has no report here.
+   */
+  readonly text: string;
 }
 /** What one caller asks `team_wait` to observe. */
 interface TeamWaitRequest {
@@ -781,14 +806,43 @@ declare class TeamService extends Service {
    * 4. `seen`, and no longer `running` at the end — `done`: resident and
    *    quiescent now (or reaped, which occupies no turn either).
    * 5. `seen` and still `running` — `busy`.
+   *
+   * Every member that lands in `done` also gets {@link reportOf} asked what it
+   * said, and the answer goes into `reports` when there is one. That read is
+   * taken from the same evidence the bucket itself rests on — one inbox walk,
+   * one log walk, and the mailbox — so the report a leader receives can never
+   * belong to a different round than the completion it is attached to.
    * @param actor - the team, and the leader whose inbox queue is read.
    * @param targets - the members this wait was asked about, in order.
    * @param observations - the live observation recorded per target, same order.
    * @param outcome - how the race ended.
    * @param mailbox - the leader's durable mailbox feed, newest last.
-   * @returns the four-field result.
+   * @returns the four buckets, whether time ran out, and what the done members
+   *   handed back.
    */
   private bucketOf;
+  /**
+   * What one finished member handed back, from the first place that has it.
+   *
+   * The order is the order the evidence outlives itself: the live inbox queue
+   * (the newest thing the member said, still unconsumed), then the spliced rows
+   * in the leader's own log (the durable form of the same message, and the only
+   * trace left once a boundary consumed the notice), then the durable mailbox
+   * row (a report that reached the surface and survived a restart; its text is
+   * the delivered message or the notice's own summary), and finally whatever the
+   * message's `source.summary` carried — the one-line account a settlement
+   * notice keeps when the member's closing text was empty.
+   *
+   * A member that is `done` because `whenIdle()` settled has no guaranteed report
+   * at all: it may have answered, and it may have said nothing. Both are answered
+   * here without a claim — nothing found means no entry in `reports`.
+   * @param actor - the team, and the leader whose inbox and log are read.
+   * @param target - the finished member.
+   * @param mailbox - the leader's durable mailbox feed, newest last.
+   * @param logged - the log reports, resolved lazily and only when reached.
+   * @returns the report text, or undefined when the member left nothing to read.
+   */
+  private reportOf;
   /**
    * The one settle `wait` gives a delivery `team_send` accepted just before it.
    *
@@ -1035,6 +1089,21 @@ declare class TeamService extends Service {
    */
   private reportedInLog;
   /**
+   * The same reverse walk as {@link reportedInLog}, keeping each member's NEWEST
+   * report instead of only the fact that one exists.
+   *
+   * The wait asks this walk two things at once — "did it report" (the bucket)
+   * and "what did it say" (the report text) — and they must be answered from one
+   * scan: two scans would stamp two different sets of freshness evidence onto
+   * one answer. Walking backwards makes the newest row the first hit for its
+   * sender, so the message kept per member is the one the leader would read next
+   * anyway.
+   * @param actor - the team, and the leader whose log is read.
+   * @param targets - the members this wait was asked about.
+   * @returns the newest spliced report per member id, past its own boundary.
+   */
+  private logReportMap;
+  /**
    * Whether this round's completion is already sitting in the leader's inbox.
    *
    * The FAST half of the same question as {@link reportedInLog}, and the one
@@ -1059,6 +1128,23 @@ declare class TeamService extends Service {
    *   current round.
    */
   private reportedIntoInbox;
+  /**
+   * The queued messages this member left in the leader's inbox about THIS round
+   * — the same read as {@link reportedIntoInbox}, keeping the messages instead
+   * of only counting them.
+   *
+   * The wait needs both halves of one question from the same read: whether a
+   * report exists (which decides the bucket) and what it says (which is the
+   * answer the bucket is worth having). Splitting them into two walks would let
+   * the two disagree about freshness, which is the one thing the boundary is
+   * there to decide.
+   * @param actor - the team, and the leader whose inbox is read.
+   * @param memberId - the member whose reports are being collected.
+   * @param mailbox - the leader's durable mailbox rows, newest last, used only
+   *   when this process never delivered to this member (no freeze boundary).
+   * @returns the queued messages, oldest first; empty when none is this round's.
+   */
+  private freshQueuedReports;
   /**
    * The route this spawn runs on. A request that names its own provider or
    * model wins exactly as given; one that names neither falls back to the

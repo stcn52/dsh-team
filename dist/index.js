@@ -1250,6 +1250,30 @@ const WAIT_DEFAULT_MS = 12e4;
 */
 const WAIT_MAX_MS = 6e5;
 /**
+* Longest report text one `team_wait` answer carries, in characters.
+*
+* A finished member's closing message is the answer the leader was waiting for,
+* but a tool result becomes model-visible context on every later step of that
+* turn, so one verbose member could otherwise spend a whole context window on
+* its own transcript — and a wait over five members multiplies that by five.
+* The deadline is `WAIT_REPORT_MAX_CHARS` per report, head kept, tail replaced
+* by `…` (see {@link truncateReport}): the conclusion of a report starts where
+* the report starts, while the part that overflows is nearly always the
+* supporting detail a leader that needs it can ask for with one more message.
+*/
+const WAIT_REPORT_MAX_CHARS = 2e3;
+/**
+* The line the continuation manager puts in front of a settled child's own
+* closing words (`createSettlementMessage` in `@deepseek-ai/dsh-subagent`).
+* Everything after it is the member's text; everything before it is the
+* runtime's template, which is exactly what a report must not carry.
+*/
+const CLOSING_MARKER = "Its closing message:";
+/** What the same notice says instead of {@link CLOSING_MARKER} for a silent child. */
+const NO_CLOSING_MESSAGE = "It left no closing message.";
+/** The line the same notice appends for a structured return value. */
+const STRUCTURED_PREFIX = "Structured result: ";
+/**
 * How long `team_wait` lets a just-accepted delivery settle before it reads the
 * roster. `team_send` is asynchronous by contract: its prompt is accepted into
 * the recipient's inbox — behind which a cold recipient may also be resumed and
@@ -1744,7 +1768,8 @@ var TeamService = class extends Service {
 			done: [],
 			busy: [],
 			cold: [],
-			timedOut: false
+			timedOut: false,
+			reports: []
 		};
 		await this.settle();
 		if (cancelled()) throw new TeamError("ABORTED", "team_wait was cancelled before it observed anyone");
@@ -1847,27 +1872,45 @@ var TeamService = class extends Service {
 	* 4. `seen`, and no longer `running` at the end — `done`: resident and
 	*    quiescent now (or reaped, which occupies no turn either).
 	* 5. `seen` and still `running` — `busy`.
+	*
+	* Every member that lands in `done` also gets {@link reportOf} asked what it
+	* said, and the answer goes into `reports` when there is one. That read is
+	* taken from the same evidence the bucket itself rests on — one inbox walk,
+	* one log walk, and the mailbox — so the report a leader receives can never
+	* belong to a different round than the completion it is attached to.
 	* @param actor - the team, and the leader whose inbox queue is read.
 	* @param targets - the members this wait was asked about, in order.
 	* @param observations - the live observation recorded per target, same order.
 	* @param outcome - how the race ended.
 	* @param mailbox - the leader's durable mailbox feed, newest last.
-	* @returns the four-field result.
+	* @returns the four buckets, whether time ran out, and what the done members
+	*   handed back.
 	*/
 	bucketOf(actor, targets, observations, outcome, mailbox) {
 		const done = [];
 		const busy = [];
 		const cold = [];
-		const reported = observations.some((observation) => !observation.seen && !observation.settled) ? this.reportedInLog(actor, targets) : void 0;
+		const reports = [];
+		let logged;
+		const loggedReports = () => logged ??= this.logReportMap(actor, targets);
+		const reported = observations.some((observation) => !observation.seen && !observation.settled) ? loggedReports() : void 0;
+		const finished = (target) => {
+			done.push(target.name);
+			const text = this.reportOf(actor, target, mailbox, loggedReports);
+			if (text !== void 0) reports.push({
+				member: target.name,
+				text
+			});
+		};
 		targets.forEach((target, index) => {
 			const observation = observations[index];
 			if (observation.settled) {
-				done.push(target.name);
+				finished(target);
 				return;
 			}
 			if (!observation.seen) {
 				if (reported?.has(target.memberId) === true || this.reportedIntoInbox(actor, target.memberId, mailbox) || reportedBack(mailbox, target.memberId)) {
-					done.push(target.name);
+					finished(target);
 					return;
 				}
 				cold.push(target.name);
@@ -1875,7 +1918,7 @@ var TeamService = class extends Service {
 			}
 			const agent = this.ctx.agents.get(SessionId(target.memberId));
 			if (agent === void 0 || agent.status !== "running") {
-				done.push(target.name);
+				finished(target);
 				return;
 			}
 			busy.push(target.name);
@@ -1884,8 +1927,44 @@ var TeamService = class extends Service {
 			done,
 			busy,
 			cold,
-			timedOut: outcome === "timeout"
+			timedOut: outcome === "timeout",
+			reports
 		};
+	}
+	/**
+	* What one finished member handed back, from the first place that has it.
+	*
+	* The order is the order the evidence outlives itself: the live inbox queue
+	* (the newest thing the member said, still unconsumed), then the spliced rows
+	* in the leader's own log (the durable form of the same message, and the only
+	* trace left once a boundary consumed the notice), then the durable mailbox
+	* row (a report that reached the surface and survived a restart; its text is
+	* the delivered message or the notice's own summary), and finally whatever the
+	* message's `source.summary` carried — the one-line account a settlement
+	* notice keeps when the member's closing text was empty.
+	*
+	* A member that is `done` because `whenIdle()` settled has no guaranteed report
+	* at all: it may have answered, and it may have said nothing. Both are answered
+	* here without a claim — nothing found means no entry in `reports`.
+	* @param actor - the team, and the leader whose inbox and log are read.
+	* @param target - the finished member.
+	* @param mailbox - the leader's durable mailbox feed, newest last.
+	* @param logged - the log reports, resolved lazily and only when reached.
+	* @returns the report text, or undefined when the member left nothing to read.
+	*/
+	reportOf(actor, target, mailbox, logged) {
+		const queued = this.freshQueuedReports(actor, target.memberId, mailbox);
+		for (let index = queued.length - 1; index >= 0; index -= 1) {
+			const text = reportTextOf(queued[index]);
+			if (text !== void 0) return text;
+		}
+		const spliced = logged().get(target.memberId);
+		if (spliced !== void 0) {
+			const text = reportTextOf(spliced);
+			if (text !== void 0) return text;
+		}
+		const row = mailboxRowOf(mailbox, target.memberId);
+		if (row !== void 0 && row.text.trim() !== "") return truncateReport(row.text.trim());
 	}
 	/**
 	* The one settle `wait` gives a delivery `team_send` accepted just before it.
@@ -2391,9 +2470,26 @@ var TeamService = class extends Service {
 	* @returns the member ids with a report after their own boundary.
 	*/
 	reportedInLog(actor, targets) {
+		return new Set(this.logReportMap(actor, targets).keys());
+	}
+	/**
+	* The same reverse walk as {@link reportedInLog}, keeping each member's NEWEST
+	* report instead of only the fact that one exists.
+	*
+	* The wait asks this walk two things at once — "did it report" (the bucket)
+	* and "what did it say" (the report text) — and they must be answered from one
+	* scan: two scans would stamp two different sets of freshness evidence onto
+	* one answer. Walking backwards makes the newest row the first hit for its
+	* sender, so the message kept per member is the one the leader would read next
+	* anyway.
+	* @param actor - the team, and the leader whose log is read.
+	* @param targets - the members this wait was asked about.
+	* @returns the newest spliced report per member id, past its own boundary.
+	*/
+	logReportMap(actor, targets) {
 		const floorOf = (memberId) => actor.team.deliveredAt.get(memberId) ?? 0;
 		const pending = new Set(targets.map((target) => target.memberId));
-		const reported = /* @__PURE__ */ new Set();
+		const reported = /* @__PURE__ */ new Map();
 		if (pending.size === 0) return reported;
 		const events = actor.leader.session.snapshotEvents();
 		const floor = Math.min(...targets.map((target) => floorOf(target.memberId)));
@@ -2404,9 +2500,9 @@ var TeamService = class extends Service {
 			if (event.type !== "agent/inbox/spliced") continue;
 			for (const message of event.data.inserted) {
 				const sender = reportSenderOf(message.source);
-				if (sender === void 0 || !pending.has(sender)) continue;
+				if (sender === void 0 || !pending.has(sender) || reported.has(sender)) continue;
 				if (event.seq < floorOf(sender)) continue;
-				reported.add(sender);
+				reported.set(sender, message);
 			}
 			if (reported.size === pending.size) break;
 		}
@@ -2437,12 +2533,36 @@ var TeamService = class extends Service {
 	*   current round.
 	*/
 	reportedIntoInbox(actor, memberId, mailbox) {
+		return this.freshQueuedReports(actor, memberId, mailbox).length > 0;
+	}
+	/**
+	* The queued messages this member left in the leader's inbox about THIS round
+	* — the same read as {@link reportedIntoInbox}, keeping the messages instead
+	* of only counting them.
+	*
+	* The wait needs both halves of one question from the same read: whether a
+	* report exists (which decides the bucket) and what it says (which is the
+	* answer the bucket is worth having). Splitting them into two walks would let
+	* the two disagree about freshness, which is the one thing the boundary is
+	* there to decide.
+	* @param actor - the team, and the leader whose inbox is read.
+	* @param memberId - the member whose reports are being collected.
+	* @param mailbox - the leader's durable mailbox rows, newest last, used only
+	*   when this process never delivered to this member (no freeze boundary).
+	* @returns the queued messages, oldest first; empty when none is this round's.
+	*/
+	freshQueuedReports(actor, memberId, mailbox) {
 		const queued = [];
-		for (const message of [...actor.leader.inbox.nextTurn, ...actor.leader.inbox.nextStep]) if (reportSenderOf(message.source) === memberId) queued.push(String(message.id));
-		if (queued.length === 0) return false;
+		const ids = [];
+		for (const message of [...actor.leader.inbox.nextTurn, ...actor.leader.inbox.nextStep]) {
+			if (reportSenderOf(message.source) !== memberId) continue;
+			queued.push(message);
+			ids.push(String(message.id));
+		}
+		if (queued.length === 0) return [];
 		const stale = actor.team.staleReports.get(memberId);
-		if (stale !== void 0) return queued.some((id) => !stale.has(id));
-		return !mailbox.some((row) => row.from === memberId || row.to === memberId) || reportedBack(mailbox, memberId);
+		if (stale !== void 0) return queued.filter((_message, index) => !stale.has(ids[index]));
+		return !mailbox.some((row) => row.from === memberId || row.to === memberId) || reportedBack(mailbox, memberId) ? queued : [];
 	}
 	/**
 	* The route this spawn runs on. A request that names its own provider or
@@ -2566,6 +2686,100 @@ function reportedBack(mailbox, memberId) {
 		if (row.to === memberId) return false;
 	}
 	return false;
+}
+/**
+* The LAST mailbox row this member wrote, whose text is what it said.
+*
+* Mailbox rows are the durable surface: a report that reached the leader in an
+* earlier process is still here after a restart, with the delivered text (a
+* `team_send` reply) or the notice's one-line account on it. It is read LAST,
+* because a live queue or a spliced row is the same message with its full
+* content; this one is the fallback for the case where neither was observed.
+* @param mailbox - the leader's durable mailbox rows, newest last.
+* @param memberId - the member's session id, which is also a row's `from`.
+* @returns its newest own row, or undefined when it has none.
+*/
+function mailboxRowOf(mailbox, memberId) {
+	for (let index = mailbox.length - 1; index >= 0; index -= 1) {
+		const row = mailbox[index];
+		if (row.from === memberId) return row;
+	}
+}
+/**
+* What one member's delivered message says, with the runtime's template removed
+* and the result bounded to {@link WAIT_REPORT_MAX_CHARS}.
+*
+* The content is read as blocks because that is what a message is: every `text`
+* block is the member's own words and they are joined with newlines, while a
+* non-text block (an image, an attachment) cannot be carried through a tool
+* result at all — it is skipped and counted, and the count is stated in the text
+* so the leader knows something was dropped rather than silently losing it.
+*
+* Two shapes arrive here, and only one of them is templated:
+* - a `team_send` relay (`team-message`), whose content IS what the member wrote;
+* - a settlement notice (`subagent-settled`), which the harness builds as
+*   `summary`, then `Its closing message:`, then the child's closing text, then
+*   possibly `Structured result: …` and a diagnostic. The member's words are
+*   what sits after the marker — everything before it is the runtime speaking
+*   about the member, and a report that carried it would attribute a template
+*   sentence to the teammate. The summary is the fallback, not the body: a child
+*   that left no closing text at all ("It left no closing message.") still
+*   finished, and its one-line account is then the only thing to report.
+* @param message - one delivered message, from the inbox queue or a spliced row.
+* @returns the report text, or undefined when the message carries nothing.
+*/
+function reportTextOf(message) {
+	const texts = [];
+	let omitted = 0;
+	for (const block of message.content) {
+		if (block.type !== "text") {
+			omitted += 1;
+			continue;
+		}
+		if (block.text.trim() !== "") texts.push(block.text);
+	}
+	const source = typeof message.source === "object" && message.source !== null ? message.source : void 0;
+	const summary = typeof source?.["summary"] === "string" && source["summary"].trim() !== "" ? source["summary"].trim() : void 0;
+	const closing = source?.["kind"] === "subagent-settled" ? closingWords(texts, summary) : texts.join("\n").trim();
+	const body = closing !== "" ? closing : summary;
+	if (body === void 0) return void 0;
+	return truncateReport(omitted === 0 ? body : `${body}\n${nonTextNote(omitted)}`);
+}
+/**
+* The member's own words inside one settlement notice, template removed.
+*
+* The marker is the precise half: `Its closing message:` is what the continuation
+* manager puts directly in front of the child's text, so slicing at it cannot
+* mistake a member's sentence for a template line, and the two runtime trailers
+* after the child's words (`Structured result: …`, a diagnostic) are dropped by
+* what they are. Stripping lines by pattern is only the fallback, for a notice
+* that carries no marker at all (an older row, or a re-shaped notice whose writer
+* kept the summary but dropped the separator).
+* @param texts - the message's non-empty text blocks, in order.
+* @param summary - the notice's own one-line account, when it has one.
+* @returns the member's words, or an empty string when it wrote none.
+*/
+function closingWords(texts, summary) {
+	const marker = texts.indexOf(CLOSING_MARKER);
+	if (marker >= 0) return texts.slice(marker + 1).filter((line) => !line.startsWith(STRUCTURED_PREFIX) && line !== NO_CLOSING_MESSAGE).join("\n").trim();
+	return texts.filter((line) => line !== summary && line !== NO_CLOSING_MESSAGE && !line.startsWith(STRUCTURED_PREFIX)).join("\n").trim();
+}
+/** How a skipped block is disclosed inside the report text. */
+function nonTextNote(count) {
+	return `[+${count} non-text block${count === 1 ? "" : "s"} omitted]`;
+}
+/**
+* Bound one report to {@link WAIT_REPORT_MAX_CHARS}, head kept and the cut marked.
+*
+* The ellipsis is inside the bound, not after it, so the ceiling is one number a
+* caller can rely on; `…` rather than a sentence of our own keeps the truncation
+* visible without pretending to be the member's own words.
+* @param text - the report text, of any length.
+* @returns the text itself when it fits, else its head and `…`.
+*/
+function truncateReport(text) {
+	if (text.length <= 2e3) return text;
+	return `${text.slice(0, 1999)}…`;
 }
 /**
 * Where the leader's log ends right now: the position a delivery boundary is
@@ -3477,7 +3691,7 @@ function listTool(ctx, audience = "leader") {
 function waitTool(ctx) {
 	return defineTool({
 		name: "team_wait",
-		description: `Block until teammates finish their current turn, then report who is done, who is still running, who had no live session, and whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all done, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true, the still-running members in busy, and the members that never showed a live session in cold. An idle member counts as done, and so does a member whose session is already gone but whose report has reached you — queued in your own inbox, spliced into your own session log, or already in your mailbox: a short turn can run and be reaped before this call takes its first look, and its settlement notice waits in your inbox until your next turn starts. cold means no live session was seen for that member AND nothing from it has reached you for this round — not your inbox, not your own log, not your mailbox — so it is NOT finished as far as this call can tell — it may not have started yet, or it may have finished without writing back — and a leader that summarises it as returned work is claiming more than the wait observed. A member that never wakes therefore costs the whole budget instead of being waved through. It only observes: it never spawns, wakes, messages or cancels anyone.`,
+		description: `Block until teammates finish their current turn, then report who is done, who is still running, who had no live session, and whether the timeout ran out. It does not stop at names: the closing report of every finished member comes back with the answer — in reports for a caller reading the fields, and in the rendered text as one "name: what it said" line each — so a single wait returns what the members concluded, not only that they stopped. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all done, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true, the still-running members in busy, and the members that never showed a live session in cold. An idle member counts as done, and so does a member whose session is already gone but whose report has reached you — queued in your own inbox, spliced into your own session log, or already in your mailbox: a short turn can run and be reaped before this call takes its first look, and its settlement notice waits in your inbox until your next turn starts. cold means no live session was seen for that member AND nothing from it has reached you for this round — not your inbox, not your own log, not your mailbox — so it is NOT finished as far as this call can tell — it may not have started yet, or it may have finished without writing back — and a leader that summarises it as returned work is claiming more than the wait observed. A member that never wakes therefore costs the whole budget instead of being waved through. It only observes: it never spawns, wakes, messages or cancels anyone.`,
 		parameters: {
 			members: {
 				type: "array",
@@ -3515,12 +3729,33 @@ function waitTool(ctx) {
 					timedOut: {
 						type: "boolean",
 						required: true
+					},
+					reports: {
+						type: "array",
+						required: true,
+						items: {
+							type: "object",
+							additionalProperties: false,
+							properties: {
+								member: {
+									type: "string",
+									required: true,
+									description: "The member, named exactly as done names it."
+								},
+								text: {
+									type: "string",
+									required: true,
+									description: `What it handed back, runtime template lines removed and bounded to ${WAIT_REPORT_MAX_CHARS} characters (past that the tail becomes \u2026).`
+								}
+							}
+						},
+						description: "What each finished member actually handed back, in done order: the member and its closing text. A member that is done but left nothing readable has no entry, so this is a subset of done; busy and cold members never appear."
 					}
 				}
 			},
 			render: (_args, value) => [{
 				type: "text",
-				text: waitSummary(value)
+				text: waitRender(value)
 			}]
 		},
 		presentCall: (args) => ({
@@ -3539,10 +3774,47 @@ function waitTool(ctx) {
 				done: [...observed.done],
 				busy: [...observed.busy],
 				cold: [...observed.cold],
-				timedOut: observed.timedOut
+				timedOut: observed.timedOut,
+				reports: observed.reports.map((report) => ({
+					member: report.member,
+					text: report.text
+				}))
 			};
 		}
 	});
+}
+/**
+* The text one `team_wait` answer puts in front of the model: the state
+* sentence, then what each finished member handed back.
+*
+* The sentence itself is {@link waitSummary}, unchanged — a reader (and the
+* conversation view's own `waitReport()` parser) recognizes the states from it.
+* The reports are APPENDED, never woven in: one `name: text` line each, with the
+* member's newlines flattened to spaces so one report cannot forge a second
+* bucket clause, and the line bounded again because a report may be
+* {@link WAIT_REPORT_MAX_CHARS} long.
+*
+* The separator before the block is load-bearing rather than cosmetic. The card's
+* parser reads each bucket with `after(label)`, which takes everything from
+* `finished: ` up to the next `;` — so a block appended straight onto
+* `all finished: Alice` would be swallowed into the done list and the card would
+* show a member named after the report. Ending the sentence with `;` closes the
+* last clause before the block starts; the three label words are also defused
+* inside the report text, so a member quoting this very sentence cannot invent a
+* bucket that the wait never reported.
+* @param value - the tool's resolved result.
+* @returns the rendered tool output.
+*/
+function waitRender(value) {
+	const sentence = waitSummary(value);
+	const reports = value.reports ?? [];
+	if (reports.length === 0) return sentence;
+	return `${sentence};\n${reports.map((report) => `${report.member}: ${inlineReport(report.text)}`).join("\n")}`;
+}
+/** One report as a single line: newlines flattened, bounded, bucket labels defused. */
+function inlineReport(text) {
+	const flat = text.replace(/\s*\n\s*/gu, " ").trim();
+	return (flat.length <= 400 ? flat : `${flat.slice(0, 399)}…`).replace(/(finished|still busy|no live session): /gu, "$1 — ");
 }
 /**
 * Render one `team_wait` answer as the three states a reader must keep apart.

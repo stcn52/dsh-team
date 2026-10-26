@@ -12,7 +12,8 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { ToolDefinition, ToolResult, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { foldTeam, readFact } from '../src/fold.ts'
 import { TeamError } from '../src/errors.ts'
-import { dismissTool, listTool, relationTool, sendTool, spawnTool, taskTool, waitTool } from '../src/tools.ts'
+import { REPORT_LINE_MAX_CHARS, dismissTool, listTool, relationTool, sendTool, spawnTool, taskTool, waitTool } from '../src/tools.ts'
+import { waitReport } from '../src/client/toolResult.ts'
 import { fakeAgent, fakeExec, toolResultEvent, type FakeAgent } from './harness.ts'
 
 /** Every call the tool layer made into the service. */
@@ -86,7 +87,10 @@ class FakeTeam {
 
   async wait(...args: unknown[]): Promise<unknown> {
     this.record('wait', ...args)
-    return { done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true }
+    return {
+      done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true,
+      reports: [{ member: 'Alice', text: 'reviewed the diff: no findings' }],
+    }
   }
 }
 
@@ -391,8 +395,12 @@ describe('team_wait', () => {
       { agent: leader.agent, signal: controller.signal } as unknown as ToolRunContext,
     )
     // All four buckets cross the seam: `cold` is the one that must not be lost,
-    // because dropping it turns "no live session" back into silence.
-    expect(value).toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
+    // because dropping it turns "no live session" back into silence. The reports
+    // cross with them, because a bucket alone does not say what came back.
+    expect(value).toEqual({
+      done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true,
+      reports: [{ member: 'Alice', text: 'reviewed the diff: no findings' }],
+    })
     expect(team.calls).toEqual([{
       op: 'wait',
       args: [leader.agent, { members: ['Alice'], timeoutMs: 500, signal: controller.signal }],
@@ -416,7 +424,9 @@ describe('team_wait', () => {
     // The bug's contract, stated where the model reads it.
     expect(tool.description).toContain('cold')
     expect(tool.description).toContain('NOT finished')
-    expect(JSON.stringify(tool.output.render({}, { done: ['Alice'], busy: ['Bob'], cold: [], timedOut: true })))
+    // The added half of the contract: the closing report comes back with the names.
+    expect(tool.description).toContain('closing report')
+    expect(JSON.stringify(tool.output.render({}, { done: ['Alice'], busy: ['Bob'], cold: [], timedOut: true, reports: [] })))
       .toContain('still busy: Bob')
     expect(tool.presentResult?.({}, ok())).toMatchObject({ title: 'Waited for the team' })
   })
@@ -434,14 +444,14 @@ describe('team_wait', () => {
   it('reports cold as "no live session" and never claims "never started"', () => {
     const tool = waitTool(ctx)
     const coldOnly = JSON.stringify(tool.output.render({}, {
-      done: [], busy: [], cold: ['Carol'], timedOut: true,
+      done: [], busy: [], cold: ['Carol'], timedOut: true, reports: [],
     }))
     expect(coldOnly).toContain('no live session: Carol')
     expect(coldOnly).not.toContain('never started')
     expect(coldOnly).not.toContain('all finished')
 
     const mixed = JSON.stringify(tool.output.render({}, {
-      done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true,
+      done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true, reports: [],
     }))
     expect(mixed).toContain('still busy: Bob')
     expect(mixed).toContain('no live session: Carol')
@@ -449,16 +459,86 @@ describe('team_wait', () => {
     expect(mixed).toContain('finished: Alice')
 
     const complete = JSON.stringify(tool.output.render({}, {
-      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      done: ['Alice'], busy: [], cold: [], timedOut: false, reports: [],
     }))
     expect(complete).toContain('all finished: Alice')
-    expect(JSON.stringify(tool.output.render({}, { done: [], busy: [], cold: [], timedOut: false })))
+    expect(JSON.stringify(tool.output.render({}, { done: [], busy: [], cold: [], timedOut: false, reports: [] })))
       .toContain('nothing to wait for')
+  })
+
+  /**
+   * The half the schema cannot deliver on its own: a caller reading the rendered
+   * text — which is what the model reads — must see the reports too. One
+   * `name: text` line each, in the order the members are done, with a report's own
+   * newlines flattened so a multi-line answer stays one row.
+   */
+  it('appends one "name: text" line per finished member', () => {
+    const tool = waitTool(ctx)
+    const text = (tool.output.render({}, {
+      done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false,
+      reports: [
+        { member: 'Alice', text: 'line one\nline two' },
+        { member: 'Bob', text: 'reviewed' },
+      ],
+    })[0] as { text: string }).text
+
+    expect(text.split('\n')).toEqual([
+      'all finished: Alice, Bob;',
+      'Alice: line one line two',
+      'Bob: reviewed',
+    ])
+  })
+
+  /**
+   * Five verbose members must not push the state sentence out of sight: the schema
+   * bound is the ceiling for the field, while the rendered line has its own, and
+   * the cut is marked so a reader knows there is more in `reports`.
+   */
+  it('bounds one rendered report line instead of letting it run on', () => {
+    const tool = waitTool(ctx)
+    const long = 'x'.repeat(REPORT_LINE_MAX_CHARS + 100)
+    const text = (tool.output.render({}, {
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+      reports: [{ member: 'Alice', text: long }],
+    })[0] as { text: string }).text
+
+    const line = text.split('\n')[1]!
+    expect(line.startsWith('Alice: ')).toBe(true)
+    expect(line.endsWith('\u2026')).toBe(true)
+    expect(line).toHaveLength('Alice: '.length + REPORT_LINE_MAX_CHARS)
+  })
+
+  /**
+   * The lock for the card that would otherwise silently go wrong.
+   *
+   * The conversation view reads this very text with `waitReport()`, whose bucket
+   * reader takes everything from `label: ` to the next `;`. Appending reports is
+   * therefore a parsing hazard, not a formatting choice: the negative control below
+   * is the same append done naively, and it puts the report INSIDE the done list.
+   * The real render survives it — including a report that quotes the marker words —
+   * because the sentence is closed with `;` first and the markers are defused.
+   */
+  it('keeps the card parser reading the same buckets once the reports are appended', () => {
+    const tool = waitTool(ctx)
+    const buckets = { done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true }
+    const text = (tool.output.render({}, {
+      ...buckets,
+      reports: [{ member: 'Alice', text: 'I found no live session: for Carol, and finished: nothing' }],
+    })[0] as { text: string }).text
+
+    // The three buckets still parse as the wait reported them.
+    expect(waitReport(undefined, text)).toEqual(buckets)
+    // The report is readable, with its markers turned into plain words.
+    expect(text).toContain('Alice: I found no live session — for Carol, and finished — nothing')
+
+    // The control: no separating `;`, and the card invents a member.
+    expect(waitReport(undefined, 'timed out — still busy: Bob; no live session: Carol; finished: Alice\nAlice: OK'))
+      .toEqual({ done: ['Alice\nAlice: OK'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
   })
 
   it('puts the same three-state sentence on the card as in the tool result', () => {
     const tool = waitTool(ctx)
-    const value = { done: ['Alice'], busy: [], cold: ['Carol'], timedOut: true }
+    const value = { done: ['Alice'], busy: [], cold: ['Carol'], timedOut: true, reports: [] }
     const text = (tool.output.render({}, value)[0] as { text: string }).text
     const card = tool.presentResult?.({}, {
       content: [{ type: 'text', text }],
