@@ -22,7 +22,7 @@ import type { TeamMemberFact } from './fold.ts'
 import { DISPATCH_FACT_PREFIX } from './fold-dispatch.ts'
 import { TeamError } from './errors.ts'
 import type { DossierEntry, MemberDossiers } from './dossier.ts'
-import { WAIT_DEFAULT_MS, WAIT_MAX_MS, type TeamSeat, type TeamService } from './service.ts'
+import { WAIT_DEFAULT_MS, WAIT_MAX_MS, type TeamSeat, type TeamService, type TeamWaitResult } from './service.ts'
 import { SHARED_AREA, type TeamWorkspace } from './workspace.ts'
 
 /** The acting agent; a team tool without one is a composition mistake. */
@@ -51,6 +51,22 @@ function failureText(result: { readonly content: readonly unknown[] }): string {
   return first !== null && typeof first === 'object' && (first as { type?: unknown }).type === 'text'
     ? String((first as { text?: unknown }).text ?? 'failed')
     : 'failed'
+}
+
+/**
+ * First text block of a successful result, or undefined when it has none.
+ *
+ * A presenter only receives the finished {@link ToolResult}, not the value that
+ * produced it, so reusing the rendered text is how a card's body stays identical
+ * to what the model was told.
+ */
+function firstText(result: { readonly content: readonly unknown[] }): string | undefined {
+  const first = result.content[0]
+  if (first === null || typeof first !== 'object' || (first as { type?: unknown }).type !== 'text') {
+    return undefined
+  }
+  const text = (first as { text?: unknown }).text
+  return typeof text === 'string' ? text : undefined
 }
 
 /** Member facts as one output value and one durable fact share them. */
@@ -596,18 +612,20 @@ export function waitTool(ctx: Context): ToolDefinition {
   return defineTool({
     name: 'team_wait',
     description:
-      'Block until teammates finish their current turn, then report who is done, who is still running, and '
-      + 'whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone '
-      + '"back" before you summarise: team_send only accepts a message and never answers, so this is the only '
-      + 'call that waits for the work itself. Read the answer for what it is: it reports that nobody is '
-      + 'running, not that your broadcast has been answered — a member that is idle right now counts as done '
-      + 'even if it has not started yet, and a teammate\'s reply reaches you only when it calls team_send, '
-      + 'arriving as your own next turn (team_list shows who has actually written back). It gives a '
-      + 'just-accepted delivery a brief moment to wake its recipient, waits for every member when you name '
-      + `none, returns as soon as they are all idle, and gives up after timeout_ms (default `
-      + `${WAIT_DEFAULT_MS / 60_000} minutes, at most ${WAIT_MAX_MS / 60_000}) with timedOut: true and the `
-      + 'still-running members in busy. A member that is idle, or no longer resident, counts as done. It only '
-      + 'observes: it never spawns, wakes, messages or cancels anyone.',
+      'Block until teammates finish their current turn, then report who is done, who is still running, who '
+      + 'never started, and whether the timeout ran out. Use this — not repeated team_list calls — whenever '
+      + 'you need everyone "back" before you summarise: team_send only accepts a message and never answers, '
+      + 'so this is the only call that waits for the work itself. Read the answer for what it is: it reports '
+      + 'that nobody is running, not that your broadcast has been answered, and a teammate\'s reply reaches '
+      + 'you only when it calls team_send, arriving as your own next turn (team_list shows who has actually '
+      + 'written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for '
+      + 'every member when you name none, returns as soon as they are all done, and gives up after timeout_ms '
+      + `(default ${WAIT_DEFAULT_MS / 60_000} minutes, at most ${WAIT_MAX_MS / 60_000}) with timedOut: true, `
+      + 'the still-running members in busy, and the members that never appeared in cold. An idle member '
+      + 'counts as done. cold means those members had no live session at any point during the wait — usually '
+      + 'a delivery that has not been woken yet — so they are NOT finished and must not be summarised as if '
+      + 'they were; a member that never wakes therefore costs the whole budget instead of being waved through. '
+      + 'It only observes: it never spawns, wakes, messages or cancels anyone.',
     parameters: {
       members: {
         type: 'array',
@@ -617,7 +635,7 @@ export function waitTool(ctx: Context): ToolDefinition {
       timeout_ms: {
         type: 'integer',
         description:
-          `How long to block before reporting the rest as busy (default ${WAIT_DEFAULT_MS}, at most `
+          `How long to block before reporting the rest as busy or cold (default ${WAIT_DEFAULT_MS}, at most `
           + `${WAIT_MAX_MS}); an expired wait is a report, not a failure, so you may ask again.`,
       },
     },
@@ -630,44 +648,76 @@ export function waitTool(ctx: Context): ToolDefinition {
             type: 'array',
             required: true,
             items: { type: 'string' },
-            description: 'Members that had stopped running when the wait ended.',
+            description: 'Members confirmed finished: their turn ended inside the wait. Never a cold member.',
           },
           busy: {
             type: 'array',
             required: true,
             items: { type: 'string' },
-            description: 'Members still running when the timeout expired; empty otherwise.',
+            description: 'Members seen running that were still running when the timeout expired; empty otherwise.',
+          },
+          cold: {
+            type: 'array',
+            required: true,
+            items: { type: 'string' },
+            description:
+              'Members with no live session at any point during the wait (not resident, cold, or already '
+              + 'reaped). Usually a delivery that has not been woken yet — NOT a completion.',
           },
           timedOut: { type: 'boolean', required: true },
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.timedOut
-          ? `timed out — still running: ${value.busy.join(', ')}`
-            + (value.done.length === 0 ? '' : `; settled: ${value.done.join(', ')}`)
-          : value.done.length === 0
-            ? 'nothing to wait for'
-            : `all settled: ${value.done.join(', ')}`,
-      }],
+      render: (_args, value) => [{ type: 'text', text: waitSummary(value) }],
     },
     presentCall: args => ({
       card: 'generic',
       kind: 'read',
       title: args.members === undefined ? 'Wait for the team' : `Wait for ${args.members.join(', ')}`,
     }),
+    // The card body is the same three-state sentence the model reads: a title
+    // alone cannot tell "finished" from "never started", and that pair is the one
+    // a reviewer must not have to guess at.
     presentResult: (args, result) => result.isError
       ? done('Wait for teammates', `failed: ${failureText(result)}`)
-      : done(args.members === undefined ? 'Waited for the team' : `Waited for ${args.members.join(', ')}`),
+      : done(
+        args.members === undefined ? 'Waited for the team' : `Waited for ${args.members.join(', ')}`,
+        firstText(result),
+      ),
     async execute(args, exec) {
       const observed = await ctx.team.wait(actor(exec.agent), {
         ...args.members !== undefined ? { members: args.members } : {},
         ...args.timeout_ms !== undefined ? { timeoutMs: args.timeout_ms } : {},
         signal: exec.signal,
       })
-      return { done: [...observed.done], busy: [...observed.busy], timedOut: observed.timedOut }
+      return {
+        done: [...observed.done],
+        busy: [...observed.busy],
+        cold: [...observed.cold],
+        timedOut: observed.timedOut,
+      }
     },
   })
+}
+
+/**
+ * Render one `team_wait` answer as the three states a reader must keep apart.
+ *
+ * Every non-empty bucket gets its own clause, `busy` and `cold` first: a member
+ * that is still running and a member that never started are both "not done", and
+ * a sentence that only lists what finished would hide the difference. An expired
+ * wait says so; a complete one claims nothing about the members it never saw.
+ * @param value - the tool's resolved result.
+ * @returns the one-line summary.
+ */
+function waitSummary(value: TeamWaitResult): string {
+  const segments: string[] = []
+  if (value.busy.length > 0) segments.push(`still busy: ${value.busy.join(', ')}`)
+  if (value.cold.length > 0) segments.push(`never started: ${value.cold.join(', ')}`)
+  if (segments.length === 0) {
+    return value.done.length === 0 ? 'nothing to wait for' : `all finished: ${value.done.join(', ')}`
+  }
+  if (value.done.length > 0) segments.push(`finished: ${value.done.join(', ')}`)
+  return `${value.timedOut ? 'timed out' : 'returned early'} — ${segments.join('; ')}`
 }
 
 /** The notes one `team_board` read returns for a named key. */

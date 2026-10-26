@@ -1594,21 +1594,38 @@ var TeamService = class extends Service {
 	* Block until the named teammates stop running, or until the budget expires.
 	*
 	* Observation only: nothing here spawns, wakes, cancels, or messages a member.
-	* A member the registry no longer holds counts as done, because a reaped agent
-	* occupies no turn and reporting it busy would leave the leader waiting on a
-	* ghost. Readiness is `Agent.whenIdle()` — the harness's own quiescence signal
-	* — rather than a poll of `Agent.status`: a status sample can miss a turn that
+	* Readiness is `Agent.whenIdle()` — the harness's own quiescence signal —
+	* rather than a poll of `Agent.status`: a status sample can miss a turn that
 	* begins between two samples, while `whenIdle()` follows the activity it was
 	* observed against.
 	*
-	* The boundary this answer carries: it reports **quiescence**, not receipt. A
-	* member that is idle right now may still be holding a prompt `team_send`
-	* accepted a moment ago, and `whenIdle()` cannot see that — so one settle
-	* window runs before the first read, and a delivery that lands later than that
-	* window is indistinguishable from a member that was already idle.
+	* The answer carries three disjoint buckets (see {@link TeamWaitResult}), and
+	* the rule that used to be wrong is how `cold` is decided:
+	*
+	* - Every target is watched for the whole window, recording `seen` the moment
+	*   `agents.get()` (or an `agent/created` for it) yields a live agent, however
+	*   that agent's status reads at the time.
+	* - `whenIdle()` settling → `done`.
+	* - At the deadline: `seen` and still `running` → `busy`; `seen` but no longer
+	*   running (idle or reaped) → `done`; **never `seen` → `cold`**.
+	*
+	* A cold member is the bug this split fixes: "no agent in the registry" is not
+	* "finished", it is "never started". It is usually a `team_send` whose recipient
+	* has not been woken yet, and calling it done made a broadcast that reached
+	* nobody look like a completed round. Because nothing shorter than the caller's
+	* own budget can tell "woken in a moment" from "never woken", a cold member
+	* makes the wait run the full budget instead of answering at once.
+	*
+	* The boundary this answer still carries: it reports **quiescence**, not
+	* receipt. A member that is idle right now may already be holding a prompt
+	* `team_send` accepted a moment ago, and `whenIdle()` cannot see that — so one
+	* settle window runs before the first read, and a delivery that lands later
+	* than that window on an already-resident, already-idle member is
+	* indistinguishable from a member that was already idle.
 	* @param actorAgent - the acting leader or teammate.
 	* @param request - who to wait for, for how long, and the caller's signal.
-	* @returns who is done, who is still running, and whether time ran out.
+	* @returns who is done, who is still running, who never started, and whether
+	*   time ran out.
 	* @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place
 	*   (the leader itself included — it is the one waiting), `ABORTED` when the
 	*   caller's signal fires, `NO_TEAM`/`LEADER_AWAY` when there is no team.
@@ -1621,23 +1638,68 @@ var TeamService = class extends Service {
 		if (targets.length === 0) return {
 			done: [],
 			busy: [],
+			cold: [],
 			timedOut: false
 		};
 		await this.settle();
 		if (cancelled()) throw new TeamError("ABORTED", "team_wait was cancelled before it observed anyone");
-		const settled = /* @__PURE__ */ new Set();
-		const observing = targets.map((target) => this.observeIdle(target.memberId, settled));
-		const outcome = await this.raceWait(observing, clampWait(request.timeoutMs), request.signal);
+		const observations = targets.map(() => ({
+			seen: false,
+			settled: false
+		}));
+		const watch = /* @__PURE__ */ new Set();
+		let outcome;
+		try {
+			const observing = targets.map((target, index) => this.observeIdle(target, observations[index], watch));
+			outcome = await this.raceWait(observing, clampWait(request.timeoutMs), request.signal);
+		} finally {
+			for (const stop of watch) stop();
+			watch.clear();
+		}
+		return this.bucketOf(targets, observations, outcome);
+	}
+	/**
+	* Split the observed targets into the three disjoint buckets, from what the
+	* window actually saw rather than from one read taken at the end.
+	*
+	* The buckets are disjoint and their union is exactly `targets`: every target
+	* is named once, under the first rule that fits. Rules in order:
+	* 1. `settled` — `whenIdle()` resolved, so the member's turn really ended.
+	* 2. never `seen` — `cold`: no live agent existed for the whole window, so it
+	*    never started. It must not fall through to the quiescence rule.
+	* 3. `seen`, and no longer `running` at the end — `done`: resident and
+	*    quiescent now (or reaped, which occupies no turn either).
+	* 4. `seen` and still `running` — `busy`.
+	* @param targets - the members this wait was asked about, in order.
+	* @param observations - the live observation recorded per target, same order.
+	* @param outcome - how the race ended.
+	* @returns the four-field result.
+	*/
+	bucketOf(targets, observations, outcome) {
 		const done = [];
 		const busy = [];
-		for (const target of targets) {
+		const cold = [];
+		targets.forEach((target, index) => {
+			const observation = observations[index];
+			if (observation.settled) {
+				done.push(target.name);
+				return;
+			}
+			if (!observation.seen) {
+				cold.push(target.name);
+				return;
+			}
 			const agent = this.ctx.agents.get(SessionId(target.memberId));
-			if (settled.has(target.memberId) || agent === void 0 || agent.status !== "running") done.push(target.name);
-			else busy.push(target.name);
-		}
+			if (agent === void 0 || agent.status !== "running") {
+				done.push(target.name);
+				return;
+			}
+			busy.push(target.name);
+		});
 		return {
 			done,
 			busy,
+			cold,
 			timedOut: outcome === "timeout"
 		};
 	}
@@ -1651,6 +1713,11 @@ var TeamService = class extends Service {
 	* therefore see an idle member whose driver has not started yet. The settle
 	* runs before the budget starts, so it never shortens the wait the caller
 	* asked for.
+	*
+	* This window protects a **hot** member whose driver has not started; it is
+	* not, and must not be mistaken for, a cold-recovery budget — a resume plus a
+	* publish can take seconds, which is why {@link observeIdle} waits for the
+	* publication itself instead of relying on this delay.
 	* @returns a promise that resolves after one settle window.
 	*/
 	settle() {
@@ -1684,25 +1751,67 @@ var TeamService = class extends Service {
 		return targets;
 	}
 	/**
-	* Watch one member's idle signal, recording it in `settled`.
+	* Watch one member until its turn quiesces, recording what was seen of it.
 	*
-	* A member whose agent is already gone records as settled without asking the
-	* harness anything, and a rejected — or synchronously throwing — idle signal
-	* records as settled too: an unobservable member must not hang the leader's
-	* turn, and the next wait observes it afresh.
-	* @param memberId - the roster member to watch.
-	* @param settled - the shared set of members already accounted for.
+	* Two paths, because a member can be in one of two very different states:
+	*
+	* - **Resident** (`agents.get()` yields an agent): mark `seen`, then follow
+	*   `whenIdle()`. A rejected — or synchronously throwing — idle signal records
+	*   as settled too: an unobservable member must not hang the leader's turn, and
+	*   the next wait observes it afresh.
+	* - **Cold** (no agent yet): do NOT settle. A member with no live agent has not
+	*   finished anything, it has not started — settling it here was the bug: a
+	*   leader that broadcast to a cold member and waited got "everybody is back"
+	*   in one tick. Nothing shorter than the caller's own budget can tell "woken
+	*   in a moment" from "never woken", so subscribe to `agent/created` and join
+	*   the normal `whenIdle()` path the moment this member is published; if that
+	*   never happens, the deadline ends the wait and the target is reported cold.
+	*
+	* The registry read and the subscription happen in the same tick, with no
+	* `await` between them, so a publication cannot slip into the gap: either the
+	* read sees it or the subscription hears it.
+	* @param target - the roster member to watch.
+	* @param observation - this target's live record, updated in place.
+	* @param watch - the wait's subscription set, so an ending wait can drop it.
+	* @returns the observation promise, which never rejects and, on the cold path,
+	*   may never resolve at all — the deadline, not this promise, ends that wait.
+	*/
+	observeIdle(target, observation, watch) {
+		const release = () => {
+			observation.settled = true;
+		};
+		const agent = this.ctx.agents.get(SessionId(target.memberId));
+		if (agent !== void 0) {
+			observation.seen = true;
+			return this.idleOf(agent, release);
+		}
+		return new Promise((resolve) => {
+			let unsubscribe;
+			const stop = () => {
+				watch.delete(stop);
+				const drop = unsubscribe;
+				unsubscribe = void 0;
+				drop?.();
+			};
+			unsubscribe = this.ctx.on("agent/created", (payload) => {
+				if (payload.agent.id !== SessionId(target.memberId)) return;
+				stop();
+				observation.seen = true;
+				this.idleOf(payload.agent, release).then(resolve);
+			});
+			watch.add(stop);
+		});
+	}
+	/**
+	* The harness's own quiescence seam for one live agent, reported as `settled`.
+	* A rejection means the member became unobservable; it counts as settled for
+	* the same reason the throwing case does — the alternative is a leader's turn
+	* held hostage by one member's broken signal.
+	* @param agent - the live agent to wait on.
+	* @param release - records the member as settled.
 	* @returns the observation promise, which never rejects.
 	*/
-	observeIdle(memberId, settled) {
-		const release = () => {
-			settled.add(memberId);
-		};
-		const agent = this.ctx.agents.get(SessionId(memberId));
-		if (agent === void 0) {
-			release();
-			return Promise.resolve();
-		}
+	idleOf(agent, release) {
 		try {
 			return agent.whenIdle().then(release, release);
 		} catch {
@@ -1721,8 +1830,10 @@ var TeamService = class extends Service {
 	*
 	* A `whenIdle()` promise abandoned at the deadline or on abort cannot be
 	* cancelled — the seam takes no signal — and is a harmless remnant: its `then`
-	* only records a name in a set nobody reads again. Never await it a second
-	* time; a fresh wait starts a fresh observation instead.
+	* only flips a flag on a record the finished wait has already read. Never await
+	* it a second time; a fresh wait starts a fresh observation instead. Live
+	* `agent/created` subscriptions are NOT harmless and are the caller's to drop
+	* as soon as this race ends, on every exit.
 	* @param observing - one observation promise per member being watched.
 	* @param budget - the deadline in milliseconds, already clamped.
 	* @param signal - the caller's cancellation, when it supplied one.
@@ -2308,6 +2419,19 @@ function done(title, text) {
 function failureText(result) {
 	const first = result.content[0];
 	return first !== null && typeof first === "object" && first.type === "text" ? String(first.text ?? "failed") : "failed";
+}
+/**
+* First text block of a successful result, or undefined when it has none.
+*
+* A presenter only receives the finished {@link ToolResult}, not the value that
+* produced it, so reusing the rendered text is how a card's body stays identical
+* to what the model was told.
+*/
+function firstText(result) {
+	const first = result.content[0];
+	if (first === null || typeof first !== "object" || first.type !== "text") return;
+	const text = first.text;
+	return typeof text === "string" ? text : void 0;
 }
 /** Member facts as one output value and one durable fact share them. */
 const MEMBER_PROPERTIES = {
@@ -2910,7 +3034,7 @@ function listTool(ctx, audience = "leader") {
 function waitTool(ctx) {
 	return defineTool({
 		name: "team_wait",
-		description: `Block until teammates finish their current turn, then report who is done, who is still running, and whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered — a member that is idle right now counts as done even if it has not started yet, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all idle, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true and the still-running members in busy. A member that is idle, or no longer resident, counts as done. It only observes: it never spawns, wakes, messages or cancels anyone.`,
+		description: `Block until teammates finish their current turn, then report who is done, who is still running, who never started, and whether the timeout ran out. Use this — not repeated team_list calls — whenever you need everyone "back" before you summarise: team_send only accepts a message and never answers, so this is the only call that waits for the work itself. Read the answer for what it is: it reports that nobody is running, not that your broadcast has been answered, and a teammate's reply reaches you only when it calls team_send, arriving as your own next turn (team_list shows who has actually written back). It gives a just-accepted delivery a brief moment to wake its recipient, waits for every member when you name none, returns as soon as they are all done, and gives up after timeout_ms (default ${WAIT_DEFAULT_MS / 6e4} minutes, at most ${WAIT_MAX_MS / 6e4}) with timedOut: true, the still-running members in busy, and the members that never appeared in cold. An idle member counts as done. cold means those members had no live session at any point during the wait — usually a delivery that has not been woken yet — so they are NOT finished and must not be summarised as if they were; a member that never wakes therefore costs the whole budget instead of being waved through. It only observes: it never spawns, wakes, messages or cancels anyone.`,
 		parameters: {
 			members: {
 				type: "array",
@@ -2919,7 +3043,7 @@ function waitTool(ctx) {
 			},
 			timeout_ms: {
 				type: "integer",
-				description: `How long to block before reporting the rest as busy (default ${WAIT_DEFAULT_MS}, at most ${WAIT_MAX_MS}); an expired wait is a report, not a failure, so you may ask again.`
+				description: `How long to block before reporting the rest as busy or cold (default ${WAIT_DEFAULT_MS}, at most ${WAIT_MAX_MS}); an expired wait is a report, not a failure, so you may ask again.`
 			}
 		},
 		output: {
@@ -2931,13 +3055,19 @@ function waitTool(ctx) {
 						type: "array",
 						required: true,
 						items: { type: "string" },
-						description: "Members that had stopped running when the wait ended."
+						description: "Members confirmed finished: their turn ended inside the wait. Never a cold member."
 					},
 					busy: {
 						type: "array",
 						required: true,
 						items: { type: "string" },
-						description: "Members still running when the timeout expired; empty otherwise."
+						description: "Members seen running that were still running when the timeout expired; empty otherwise."
+					},
+					cold: {
+						type: "array",
+						required: true,
+						items: { type: "string" },
+						description: "Members with no live session at any point during the wait (not resident, cold, or already reaped). Usually a delivery that has not been woken yet — NOT a completion."
 					},
 					timedOut: {
 						type: "boolean",
@@ -2947,7 +3077,7 @@ function waitTool(ctx) {
 			},
 			render: (_args, value) => [{
 				type: "text",
-				text: value.timedOut ? `timed out — still running: ${value.busy.join(", ")}` + (value.done.length === 0 ? "" : `; settled: ${value.done.join(", ")}`) : value.done.length === 0 ? "nothing to wait for" : `all settled: ${value.done.join(", ")}`
+				text: waitSummary(value)
 			}]
 		},
 		presentCall: (args) => ({
@@ -2955,7 +3085,7 @@ function waitTool(ctx) {
 			kind: "read",
 			title: args.members === void 0 ? "Wait for the team" : `Wait for ${args.members.join(", ")}`
 		}),
-		presentResult: (args, result) => result.isError ? done("Wait for teammates", `failed: ${failureText(result)}`) : done(args.members === void 0 ? "Waited for the team" : `Waited for ${args.members.join(", ")}`),
+		presentResult: (args, result) => result.isError ? done("Wait for teammates", `failed: ${failureText(result)}`) : done(args.members === void 0 ? "Waited for the team" : `Waited for ${args.members.join(", ")}`, firstText(result)),
 		async execute(args, exec) {
 			const observed = await ctx.team.wait(actor(exec.agent), {
 				...args.members !== void 0 ? { members: args.members } : {},
@@ -2965,10 +3095,29 @@ function waitTool(ctx) {
 			return {
 				done: [...observed.done],
 				busy: [...observed.busy],
+				cold: [...observed.cold],
 				timedOut: observed.timedOut
 			};
 		}
 	});
+}
+/**
+* Render one `team_wait` answer as the three states a reader must keep apart.
+*
+* Every non-empty bucket gets its own clause, `busy` and `cold` first: a member
+* that is still running and a member that never started are both "not done", and
+* a sentence that only lists what finished would hide the difference. An expired
+* wait says so; a complete one claims nothing about the members it never saw.
+* @param value - the tool's resolved result.
+* @returns the one-line summary.
+*/
+function waitSummary(value) {
+	const segments = [];
+	if (value.busy.length > 0) segments.push(`still busy: ${value.busy.join(", ")}`);
+	if (value.cold.length > 0) segments.push(`never started: ${value.cold.join(", ")}`);
+	if (segments.length === 0) return value.done.length === 0 ? "nothing to wait for" : `all finished: ${value.done.join(", ")}`;
+	if (value.done.length > 0) segments.push(`finished: ${value.done.join(", ")}`);
+	return `${value.timedOut ? "timed out" : "returned early"} — ${segments.join("; ")}`;
 }
 /** The notes one `team_board` read returns for a named key. */
 function pickNote(held, key) {

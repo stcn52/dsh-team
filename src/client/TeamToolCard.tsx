@@ -6,15 +6,39 @@ import { readFact } from '../fold.ts'
 import { MemberAvatar } from './MemberAvatar.tsx'
 import type { TeamInjected, TeamPanelState } from './TeamStage.tsx'
 import {
-  IconTeam16, IconTeamPeer16, IconTeamSend16, IconTeamTask16, IconTeamWorkspace16,
+  IconTeam16, IconTeamMailbox16, IconTeamPeer16, IconTeamSend16, IconTeamTask16, IconTeamWorkspace16,
 } from './icons.tsx'
 import type { TeamKey } from './locales.ts'
+import { dossierReport, waitReport } from './toolResult.ts'
 import theme from './TeamStage.module.css'
 import css from './TeamChat.module.css'
 
+/**
+ * Every tool this plugin renders a card for. A wire name missing here falls to
+ * the host's generic row, which prints the call's arguments as raw JSON — the
+ * reason this list is covered by a completeness test instead of being trusted.
+ */
 export const TEAM_TOOLS = [
   'team_spawn', 'team_send', 'team_task', 'team_relation',
   'team_dismiss', 'team_list', 'team_note', 'team_board',
+  'team_wait', 'team_learn', 'team_profile', 'team_review', 'team_forget',
+] as const
+
+/**
+ * Every tool the host half registers, mirrored by hand from the `name:` fields
+ * in `src/tools.ts` (`team_profile` is registered twice, once per audience, so
+ * the unique count is one lower than the registration count).
+ *
+ * Hard-coded rather than imported on purpose: this module is reachable from the
+ * browser bundle, and the client half may not value-import a host module
+ * (`tsdown.config.ts` fails the build for it). `tests/tool-card-catalog.spec.tsx`
+ * re-reads `src/tools.ts` and fails when the two lists drift, so a new host tool
+ * cannot quietly degrade to the generic card again.
+ */
+export const TEAM_TOOL_NAMES = [
+  'team_spawn', 'team_send', 'team_task', 'team_relation', 'team_dismiss',
+  'team_list', 'team_wait', 'team_note', 'team_board', 'team_learn',
+  'team_profile', 'team_review', 'team_forget',
 ] as const
 
 type TeamTool = typeof TEAM_TOOLS[number]
@@ -27,13 +51,17 @@ export type TeamToolCardProps = ToolCallViewProps & PropsLocale<'team'> & TeamIn
 const TITLES: Record<TeamTool, TeamKey> = {
   team_spawn: 'tool.spawn', team_send: 'tool.send', team_task: 'tool.task',
   team_relation: 'tool.relation', team_dismiss: 'tool.dismiss', team_list: 'tool.list',
-  team_note: 'tool.note', team_board: 'tool.board',
+  team_note: 'tool.note', team_board: 'tool.board', team_wait: 'tool.wait',
+  team_learn: 'tool.learn', team_profile: 'tool.profile', team_review: 'tool.review',
+  team_forget: 'tool.forget',
 }
 
 const SUCCEEDED: Record<TeamTool, TeamKey> = {
   team_spawn: 'tool.joined', team_send: 'tool.sent', team_task: 'tool.updated',
   team_relation: 'tool.updated', team_dismiss: 'tool.ended', team_list: 'tool.read',
-  team_note: 'tool.saved', team_board: 'tool.read',
+  team_note: 'tool.saved', team_board: 'tool.read', team_wait: 'tool.waited',
+  team_learn: 'tool.learned', team_profile: 'tool.read', team_review: 'tool.reviewed',
+  team_forget: 'tool.forgotten',
 }
 
 function parseArgs(raw: string): Record<string, unknown> {
@@ -48,6 +76,12 @@ function parseArgs(raw: string): Record<string, unknown> {
 
 function argument(args: Record<string, unknown>, name: string): string | undefined {
   return typeof args[name] === 'string' && args[name] !== '' ? args[name] as string : undefined
+}
+
+/** A string-list argument, tolerant of a partial call that has not closed its array yet. */
+function argumentList(args: Record<string, unknown>, name: string): readonly string[] {
+  const value = args[name]
+  return Array.isArray(value) ? value.filter((row): row is string => typeof row === 'string' && row !== '') : []
 }
 
 interface Participant {
@@ -141,6 +175,79 @@ function presentation(tool: TeamTool, block: ToolCallBlock, state: TeamPanelStat
       summary = argument(args, 'key') ?? (fact?.team === 'board' && args['private'] !== true ? t('tool.notes', { count: fact.entries.length }) : '')
       caption = t(args['private'] === true ? 'tool.private' : 'tool.shared')
       break
+    case 'team_wait': {
+      // The result names members, not ids, and a request in flight has no
+      // result yet — so the card reads the fact when the tool projects one and
+      // the rendered sentence otherwise, and falls back to the request itself.
+      const report = waitReport(settled ? block.meta : undefined, output)
+      const entries: string[] = []
+      if (report.done !== undefined && report.done.length > 0) entries.push(t('tool.waitDone', { count: report.done.length }))
+      if (report.busy !== undefined && report.busy.length > 0) entries.push(t('tool.waitBusy', { count: report.busy.length }))
+      if (report.cold !== undefined && report.cold.length > 0) entries.push(t('tool.waitCold', { count: report.cold.length }))
+      if (report.timedOut === true) entries.push(t('tool.waitTimedOut'))
+      const requested = argumentList(args, 'members')
+      summary = entries.length > 0
+        ? entries.join(' · ')
+        : requested.length > 0 ? t('tool.waitFor', { names: requested.join(', ') }) : t('tool.waitNone')
+      // The counts answer "did everyone come back"; the names answer "who do I
+      // still owe a look at", which is what the next call has to name again.
+      const named = [
+        report.busy !== undefined && report.busy.length > 0 ? t('tool.waitBusyNames', { names: report.busy.join(', ') }) : '',
+        report.cold !== undefined && report.cold.length > 0 ? t('tool.waitColdNames', { names: report.cold.join(', ') }) : '',
+      ]
+      caption = named.filter(line => line !== '').join(' · ')
+      break
+    }
+    case 'team_learn': {
+      // The lesson is the arguments, so a running call already says what it
+      // will record: no result text reaches the card, and none is needed.
+      const evidence = argument(args, 'evidence')
+      const kind = t(args['kind'] === 'fact' ? 'tool.kindFact' : 'tool.kindLesson')
+      summary = argument(args, 'text') ?? ''
+      caption = evidence === undefined ? kind : `${kind} · ${t('tool.evidence', { text: evidence })}`
+      break
+    }
+    case 'team_profile': {
+      const report = dossierReport(settled ? block.meta : undefined, output)
+      const reference = argument(args, 'member') ?? report.name
+      if (reference === undefined) {
+        summary = ''
+        break
+      }
+      people = [who(reference, report.name ?? reference)]
+      summary = people[0]!.name
+      caption = report.empty === true
+        ? t('tool.profileEmpty')
+        : report.delivered !== undefined && report.reworks !== undefined && report.entries !== undefined
+          ? t('tool.profileStats', { delivered: report.delivered, reworks: report.reworks, count: report.entries })
+          : ''
+      break
+    }
+    case 'team_review': {
+      const reference = argument(args, 'member')
+      const note = argument(args, 'note')
+      if (reference !== undefined) people = [who(reference, reference)]
+      // The feedback is the point of the card; the member's name already rides
+      // on the portrait, and the outcome is the caption. A failure keeps the
+      // tool's own message and drops both, so no raw JSON reaches the reader.
+      summary = note ?? people[0]?.name ?? reference ?? ''
+      const outcome = args['outcome']
+      caption = outcome === 'accepted' ? t('tool.reviewAccepted') : outcome === 'rework' ? t('tool.reviewRework') : ''
+      break
+    }
+    case 'team_forget': {
+      const report = dossierReport(settled ? block.meta : undefined, output)
+      const reference = argument(args, 'member')
+      if (reference !== undefined) people = [who(reference, reference)]
+      summary = report.removed ?? argument(args, 'entry_id') ?? ''
+      const name = people[0]?.name
+      caption = name === undefined
+        ? ''
+        : report.remaining === undefined
+          ? t('tool.forgotFrom', { name })
+          : `${t('tool.forgotFrom', { name })} · ${t('tool.remaining', { count: report.remaining })}`
+      break
+    }
   }
 
   const failure = status === 'error' || status === 'stopped'
@@ -155,8 +262,10 @@ function presentation(tool: TeamTool, block: ToolCallBlock, state: TeamPanelStat
 
 function ToolIcon({ tool }: { readonly tool: TeamTool }) {
   if (tool === 'team_send') return <IconTeamSend16 size={16} />
-  if (tool === 'team_task') return <IconTeamTask16 size={16} />
-  if (tool === 'team_note' || tool === 'team_board') return <IconTeamWorkspace16 size={16} />
+  if (tool === 'team_task' || tool === 'team_learn') return <IconTeamTask16 size={16} />
+  if (tool === 'team_wait') return <IconTeamMailbox16 size={16} />
+  if (tool === 'team_note' || tool === 'team_board' || tool === 'team_profile'
+    || tool === 'team_review' || tool === 'team_forget') return <IconTeamWorkspace16 size={16} />
   if (tool === 'team_relation') return <IconTeamPeer16 size={16} />
   return <IconTeam16 size={16} />
 }

@@ -70,7 +70,7 @@ class FakeTeam {
 
   async wait(...args: unknown[]): Promise<unknown> {
     this.record('wait', ...args)
-    return { done: ['Alice'], busy: ['Bob'], timedOut: true }
+    return { done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true }
   }
 }
 
@@ -326,7 +326,9 @@ describe('team_wait', () => {
       args,
       { agent: leader.agent, signal: controller.signal } as unknown as ToolRunContext,
     )
-    expect(value).toEqual({ done: ['Alice'], busy: ['Bob'], timedOut: true })
+    // All four buckets cross the seam: `cold` is the one that must not be lost,
+    // because dropping it turns "never started" back into silence.
+    expect(value).toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
     expect(team.calls).toEqual([{
       op: 'wait',
       args: [leader.agent, { members: ['Alice'], timeoutMs: 500, signal: controller.signal }],
@@ -347,9 +349,51 @@ describe('team_wait', () => {
     expect(tool.description).toContain('timeout_ms')
     // The boundary the model must not misread: quiescence is not a received reply.
     expect(tool.description).toContain('has been answered')
-    expect(JSON.stringify(tool.output.render({}, { done: ['Alice'], busy: ['Bob'], timedOut: true })))
-      .toContain('still running: Bob')
+    // The bug's contract, stated where the model reads it.
+    expect(tool.description).toContain('cold')
+    expect(tool.description).toContain('NOT finished')
+    expect(JSON.stringify(tool.output.render({}, { done: ['Alice'], busy: ['Bob'], cold: [], timedOut: true })))
+      .toContain('still busy: Bob')
     expect(tool.presentResult?.({}, ok())).toMatchObject({ title: 'Waited for the team' })
+  })
+
+  /**
+   * The prose is the only place a reader can tell the three states apart, so each
+   * gets its own clause, and a wait that ended on the deadline must never read as
+   * "all finished".
+   */
+  it('keeps "never started" out of the finished sentence', () => {
+    const tool = waitTool(ctx)
+    const coldOnly = JSON.stringify(tool.output.render({}, {
+      done: [], busy: [], cold: ['Carol'], timedOut: true,
+    }))
+    expect(coldOnly).toContain('never started: Carol')
+    expect(coldOnly).not.toContain('all finished')
+
+    const mixed = JSON.stringify(tool.output.render({}, {
+      done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true,
+    }))
+    expect(mixed).toContain('still busy: Bob')
+    expect(mixed).toContain('never started: Carol')
+    expect(mixed).toContain('finished: Alice')
+
+    const complete = JSON.stringify(tool.output.render({}, {
+      done: ['Alice'], busy: [], cold: [], timedOut: false,
+    }))
+    expect(complete).toContain('all finished: Alice')
+    expect(JSON.stringify(tool.output.render({}, { done: [], busy: [], cold: [], timedOut: false })))
+      .toContain('nothing to wait for')
+  })
+
+  it('puts the same three-state sentence on the card as in the tool result', () => {
+    const tool = waitTool(ctx)
+    const value = { done: ['Alice'], busy: [], cold: ['Carol'], timedOut: true }
+    const text = (tool.output.render({}, value)[0] as { text: string }).text
+    const card = tool.presentResult?.({}, {
+      content: [{ type: 'text', text }],
+    } as unknown as ToolResult)
+    expect(card).toMatchObject({ title: 'Waited for the team', content: [{ type: 'text', text }] })
+    expect(text).toContain('never started: Carol')
   })
 })
 

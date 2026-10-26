@@ -419,6 +419,7 @@ describe('chat contributions', () => {
     expect(toolViews.map(entry => entry.key)).toEqual([
       'team_spawn', 'team_send', 'team_task', 'team_relation',
       'team_dismiss', 'team_list', 'team_note', 'team_board',
+      'team_wait', 'team_learn', 'team_profile', 'team_review', 'team_forget',
     ])
     expect(toolViews[0]!.face.hooks.team.getSnapshot().members).toEqual([])
   })

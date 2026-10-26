@@ -327,16 +327,36 @@ interface TeamListResult {
   readonly tasks: readonly TeamTaskView[];
   readonly messages: readonly TeamMessageView[];
 }
-/** What one `team_wait` observed when it returned. */
+/**
+ * What one `team_wait` observed when it returned: three disjoint buckets whose
+ * union is exactly the set of targets the wait was asked about, named in the
+ * order they were asked about, plus whether the clock ran out.
+ *
+ * The split answers two questions that must not be collapsed into one.
+ * `whenIdle()` answers "is this member's turn over" — quiescence. `cold` answers
+ * "did this member ever exist as a live session while we watched", which is the
+ * question a leader asking "is everyone back" actually depends on: a member that
+ * was never resident has not finished, it has not started, and reporting it as
+ * done turns a broadcast that woke nobody into a completed round.
+ */
 interface TeamWaitResult {
   /**
-   * Members that were not running when the wait ended, named in the order they
-   * were asked about. A member whose agent was reaped counts here: it occupies
-   * no turn, so waiting on it further would wait on a ghost.
+   * Members confirmed finished: `whenIdle()` settled during the observation, or
+   * the member was seen live during it and was no longer `running` when the wait
+   * ended (reaped included — a reaped agent occupies no turn).
    */
   readonly done: readonly string[];
-  /** Members still running when the budget expired; empty unless `timedOut`. */
+  /**
+   * Members seen live during the observation that were still `running` at the
+   * deadline. Empty unless `timedOut`.
+   */
   readonly busy: readonly string[];
+  /**
+   * Members that never once appeared as a live agent during the observation: not
+   * resident, cold, or already reaped. Usually a delivery that has not been woken
+   * yet — NEVER a completion, and never part of `done`.
+   */
+  readonly cold: readonly string[];
   /** Whether the budget expired before every target settled. */
   readonly timedOut: boolean;
 }
@@ -524,26 +544,61 @@ declare class TeamService extends Service {
    * Block until the named teammates stop running, or until the budget expires.
    *
    * Observation only: nothing here spawns, wakes, cancels, or messages a member.
-   * A member the registry no longer holds counts as done, because a reaped agent
-   * occupies no turn and reporting it busy would leave the leader waiting on a
-   * ghost. Readiness is `Agent.whenIdle()` — the harness's own quiescence signal
-   * — rather than a poll of `Agent.status`: a status sample can miss a turn that
+   * Readiness is `Agent.whenIdle()` — the harness's own quiescence signal —
+   * rather than a poll of `Agent.status`: a status sample can miss a turn that
    * begins between two samples, while `whenIdle()` follows the activity it was
    * observed against.
    *
-   * The boundary this answer carries: it reports **quiescence**, not receipt. A
-   * member that is idle right now may still be holding a prompt `team_send`
-   * accepted a moment ago, and `whenIdle()` cannot see that — so one settle
-   * window runs before the first read, and a delivery that lands later than that
-   * window is indistinguishable from a member that was already idle.
+   * The answer carries three disjoint buckets (see {@link TeamWaitResult}), and
+   * the rule that used to be wrong is how `cold` is decided:
+   *
+   * - Every target is watched for the whole window, recording `seen` the moment
+   *   `agents.get()` (or an `agent/created` for it) yields a live agent, however
+   *   that agent's status reads at the time.
+   * - `whenIdle()` settling → `done`.
+   * - At the deadline: `seen` and still `running` → `busy`; `seen` but no longer
+   *   running (idle or reaped) → `done`; **never `seen` → `cold`**.
+   *
+   * A cold member is the bug this split fixes: "no agent in the registry" is not
+   * "finished", it is "never started". It is usually a `team_send` whose recipient
+   * has not been woken yet, and calling it done made a broadcast that reached
+   * nobody look like a completed round. Because nothing shorter than the caller's
+   * own budget can tell "woken in a moment" from "never woken", a cold member
+   * makes the wait run the full budget instead of answering at once.
+   *
+   * The boundary this answer still carries: it reports **quiescence**, not
+   * receipt. A member that is idle right now may already be holding a prompt
+   * `team_send` accepted a moment ago, and `whenIdle()` cannot see that — so one
+   * settle window runs before the first read, and a delivery that lands later
+   * than that window on an already-resident, already-idle member is
+   * indistinguishable from a member that was already idle.
    * @param actorAgent - the acting leader or teammate.
    * @param request - who to wait for, for how long, and the caller's signal.
-   * @returns who is done, who is still running, and whether time ran out.
+   * @returns who is done, who is still running, who never started, and whether
+   *   time ran out.
    * @throws {TeamError} `UNKNOWN_MEMBER` for an address this team cannot place
    *   (the leader itself included — it is the one waiting), `ABORTED` when the
    *   caller's signal fires, `NO_TEAM`/`LEADER_AWAY` when there is no team.
    */
   wait(actorAgent: Agent, request?: TeamWaitRequest): Promise<TeamWaitResult>;
+  /**
+   * Split the observed targets into the three disjoint buckets, from what the
+   * window actually saw rather than from one read taken at the end.
+   *
+   * The buckets are disjoint and their union is exactly `targets`: every target
+   * is named once, under the first rule that fits. Rules in order:
+   * 1. `settled` — `whenIdle()` resolved, so the member's turn really ended.
+   * 2. never `seen` — `cold`: no live agent existed for the whole window, so it
+   *    never started. It must not fall through to the quiescence rule.
+   * 3. `seen`, and no longer `running` at the end — `done`: resident and
+   *    quiescent now (or reaped, which occupies no turn either).
+   * 4. `seen` and still `running` — `busy`.
+   * @param targets - the members this wait was asked about, in order.
+   * @param observations - the live observation recorded per target, same order.
+   * @param outcome - how the race ended.
+   * @returns the four-field result.
+   */
+  private bucketOf;
   /**
    * The one settle `wait` gives a delivery `team_send` accepted just before it.
    *
@@ -554,6 +609,11 @@ declare class TeamService extends Service {
    * therefore see an idle member whose driver has not started yet. The settle
    * runs before the budget starts, so it never shortens the wait the caller
    * asked for.
+   *
+   * This window protects a **hot** member whose driver has not started; it is
+   * not, and must not be mistaken for, a cold-recovery budget — a resume plus a
+   * publish can take seconds, which is why {@link observeIdle} waits for the
+   * publication itself instead of relying on this delay.
    * @returns a promise that resolves after one settle window.
    */
   private settle;
@@ -568,17 +628,42 @@ declare class TeamService extends Service {
    */
   private waitTargets;
   /**
-   * Watch one member's idle signal, recording it in `settled`.
+   * Watch one member until its turn quiesces, recording what was seen of it.
    *
-   * A member whose agent is already gone records as settled without asking the
-   * harness anything, and a rejected — or synchronously throwing — idle signal
-   * records as settled too: an unobservable member must not hang the leader's
-   * turn, and the next wait observes it afresh.
-   * @param memberId - the roster member to watch.
-   * @param settled - the shared set of members already accounted for.
-   * @returns the observation promise, which never rejects.
+   * Two paths, because a member can be in one of two very different states:
+   *
+   * - **Resident** (`agents.get()` yields an agent): mark `seen`, then follow
+   *   `whenIdle()`. A rejected — or synchronously throwing — idle signal records
+   *   as settled too: an unobservable member must not hang the leader's turn, and
+   *   the next wait observes it afresh.
+   * - **Cold** (no agent yet): do NOT settle. A member with no live agent has not
+   *   finished anything, it has not started — settling it here was the bug: a
+   *   leader that broadcast to a cold member and waited got "everybody is back"
+   *   in one tick. Nothing shorter than the caller's own budget can tell "woken
+   *   in a moment" from "never woken", so subscribe to `agent/created` and join
+   *   the normal `whenIdle()` path the moment this member is published; if that
+   *   never happens, the deadline ends the wait and the target is reported cold.
+   *
+   * The registry read and the subscription happen in the same tick, with no
+   * `await` between them, so a publication cannot slip into the gap: either the
+   * read sees it or the subscription hears it.
+   * @param target - the roster member to watch.
+   * @param observation - this target's live record, updated in place.
+   * @param watch - the wait's subscription set, so an ending wait can drop it.
+   * @returns the observation promise, which never rejects and, on the cold path,
+   *   may never resolve at all — the deadline, not this promise, ends that wait.
    */
   private observeIdle;
+  /**
+   * The harness's own quiescence seam for one live agent, reported as `settled`.
+   * A rejection means the member became unobservable; it counts as settled for
+   * the same reason the throwing case does — the alternative is a leader's turn
+   * held hostage by one member's broken signal.
+   * @param agent - the live agent to wait on.
+   * @param release - records the member as settled.
+   * @returns the observation promise, which never rejects.
+   */
+  private idleOf;
   /**
    * Race every idle signal against one deadline and the caller's signal.
    *
@@ -590,8 +675,10 @@ declare class TeamService extends Service {
    *
    * A `whenIdle()` promise abandoned at the deadline or on abort cannot be
    * cancelled — the seam takes no signal — and is a harmless remnant: its `then`
-   * only records a name in a set nobody reads again. Never await it a second
-   * time; a fresh wait starts a fresh observation instead.
+   * only flips a flag on a record the finished wait has already read. Never await
+   * it a second time; a fresh wait starts a fresh observation instead. Live
+   * `agent/created` subscriptions are NOT harmless and are the caller's to drop
+   * as soon as this race ends, on every exit.
    * @param observing - one observation promise per member being watched.
    * @param budget - the deadline in milliseconds, already clamped.
    * @param signal - the caller's cancellation, when it supplied one.

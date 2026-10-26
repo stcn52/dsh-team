@@ -859,13 +859,40 @@ describe('wait', () => {
     await new Promise<void>((resolve) => { setTimeout(resolve, ms) })
   }
 
+  /**
+   * Count the live `agent/created` subscriptions for the duration of one case, by
+   * wrapping this world's own `on`. Cordis keeps a listener registered until its
+   * disposer runs, and a wait gets no automatic cleanup, so the disposers a wait
+   * has NOT called are exactly the leak this measures.
+   * @param scene - the world whose context the wait subscribes on.
+   * @returns the live disposers; empty once every subscription was dropped.
+   */
+  function trackCreated(scene: World): Set<() => void> {
+    const live = new Set<() => void>()
+    const loose = scene.ctx as unknown as {
+      on: (name: string, listener: (payload: { agent: { id: string } }) => void) => () => boolean
+    }
+    const original = loose.on.bind(loose)
+    loose.on = (name, listener) => {
+      const dispose = original(name, listener)
+      if (name !== 'agent/created') return dispose
+      const tracked = (): boolean => {
+        live.delete(tracked)
+        return dispose()
+      }
+      live.add(tracked)
+      return tracked
+    }
+    return live
+  }
+
   it('returns at once with every member done when nobody is running', async () => {
     const scene = world()
     await spawn(scene, 'Alice', { childId: 'child-1' })
     await spawn(scene, 'Bob', { childId: 'child-2' })
 
     expect(await scene.service.wait(scene.leader.agent))
-      .toEqual({ done: ['Alice', 'Bob'], busy: [], timedOut: false })
+      .toEqual({ done: ['Alice', 'Bob'], busy: [], cold: [], timedOut: false })
   })
 
   it('blocks while a member runs, and returns as soon as it is idle', async () => {
@@ -881,7 +908,7 @@ describe('wait', () => {
     expect(resolved).toEqual([])
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
   })
 
   /**
@@ -908,7 +935,7 @@ describe('wait', () => {
     expect(resolved).toEqual([])
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
   })
 
   it('re-reads the roster after the settle, so a member published meanwhile is still awaited', async () => {
@@ -927,7 +954,59 @@ describe('wait', () => {
     expect(resolved).toEqual([])
 
     alice.goIdle()
-    expect(await waiting).toEqual({ done: ['Alice'], busy: [], timedOut: false })
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+  })
+
+  /**
+   * The regression lock for the reported bug: a leader that broadcasts to a cold
+   * member and waits straight away used to get "everyone is back" in one tick,
+   * because `observeIdle()` released a member with no live agent as if it had
+   * finished. A member that was never resident has not finished anything — it
+   * has not started — so it must land in `cold`, and never in `done`.
+   */
+  it('does not count a member that was never resident as done', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    // The delivery is accepted but the recipient is still cold: the roster row
+    // exists, nothing has been published for it, and nothing will be inside
+    // this window.
+    scene.agents.remove(alice.id)
+    alice.status = 'running'
+
+    const started = Date.now()
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 40 })
+    expect(observed.done).toEqual([])
+    expect(observed.busy).toEqual([])
+    expect(observed.cold).toEqual(['Alice'])
+    expect(observed.timedOut).toBe(true)
+    // It waited the budget out instead of answering in one tick.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(40)
+  })
+
+  /**
+   * The other half of the cold contract: a cold member that IS woken inside the
+   * window must then be waited for properly. The publication turns the target
+   * into a normal `whenIdle()` observation instead of an answer.
+   */
+  it('waits for a cold member that is published inside the window', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.agents.remove(alice.id)
+    alice.status = 'running'
+    // Published after the settle window, so the cold path is the one that runs.
+    setTimeout(() => { scene.agents.add(alice) }, 60)
+
+    const resolved: boolean[] = []
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 })
+      .then((value) => { resolved.push(true); return value })
+    await sleep(160)
+    // Published and running: observed, not answered.
+    expect(resolved).toEqual([])
+    // The publication was read, and the wait moved onto the harness's own signal.
+    expect(alice.idleCalls).toBe(1)
+
+    alice.goIdle()
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
   })
 
   it('reports the members still running when the budget expires, without hanging', async () => {
@@ -938,19 +1017,111 @@ describe('wait', () => {
 
     const started = Date.now()
     const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 20 })
-    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], timedOut: true })
+    expect(observed).toEqual({ done: ['Bob'], busy: ['Alice'], cold: [], timedOut: true })
     expect(Date.now() - started).toBeLessThan(2_000)
   })
 
-  it('counts a member the registry no longer holds as done, without observing it', async () => {
+  /**
+   * The reaped case, which the cold bug used to hide inside. A member that WAS
+   * resident during the window and is gone at the deadline occupies no turn, so
+   * it is done — the deadline is what keeps the wait from hanging on a ghost,
+   * not the "no agent means nothing left to do" shortcut that broke cold members.
+   */
+  it('counts a member seen resident, then reaped, as done', async () => {
     const scene = world()
     const alice = await spawn(scene, 'Alice')
     alice.status = 'running'
+
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+    await sleep(40)
     scene.agents.remove(alice.id)
 
-    expect(await scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 }))
-      .toEqual({ done: ['Alice'], busy: [], timedOut: false })
-    expect(alice.idleCalls).toBe(0)
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: true })
+  })
+
+  /**
+   * The whole point of the split, in one scene: a hot member that finishes, a hot
+   * member that does not, and a cold member that never appears. Asserting the
+   * union and the disjointness, not three separate lists, because the failure this
+   * guards against is a member landing in two buckets — or in none.
+   */
+  it('splits a mixed roster into three disjoint buckets covering every target', async () => {
+    const scene = world({ config: { ...CONFIG, maxTeammates: 3 } })
+    const alice = await spawn(scene, 'Alice', { childId: 'child-1' })
+    const bob = await spawn(scene, 'Bob', { childId: 'child-2' })
+    const carol = await spawn(scene, 'Carol', { childId: 'child-3' })
+    alice.status = 'running'
+    bob.status = 'running'
+    // Carol is the cold one: the roster row exists, no live session does.
+    scene.agents.remove(carol.id)
+    carol.status = 'running'
+    // Alice finishes inside the window; Bob never does.
+    setTimeout(() => { alice.goIdle() }, 40)
+
+    const observed = await scene.service.wait(scene.leader.agent, { timeoutMs: 150 })
+    expect(observed)
+      .toEqual({ done: ['Alice'], busy: ['Bob'], cold: ['Carol'], timedOut: true })
+
+    const flat = [...observed.done, ...observed.busy, ...observed.cold]
+    // Disjoint: no name twice.
+    expect(new Set(flat).size).toBe(flat.length)
+    // Union: every target named exactly once.
+    expect([...flat].sort()).toEqual(['Alice', 'Bob', 'Carol'])
+  })
+
+  /**
+   * A cold member is watched through one `agent/created` subscription, and a wait
+   * that ends must drop it: a listener that outlived its wait would wake a dead
+   * closure on every later publication of that session, one leak per timeout.
+   */
+  it('drops its agent/created subscription when the wait times out', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.agents.remove(alice.id)
+    const live = trackCreated(scene)
+
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 60 })
+    await sleep(40)
+    // Armed while the cold member is still being waited for...
+    expect(live.size).toBe(1)
+
+    expect(await waiting).toEqual({ done: [], busy: [], cold: ['Alice'], timedOut: true })
+    // ...and gone the moment the budget ended.
+    expect(live.size).toBe(0)
+  })
+
+  it('drops it when the caller cancels a wait over a cold member', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.agents.remove(alice.id)
+    const live = trackCreated(scene)
+    const controller = new AbortController()
+
+    const waiting = scene.service.wait(scene.leader.agent, {
+      signal: controller.signal,
+      timeoutMs: 5_000,
+    })
+    await sleep(40)
+    expect(live.size).toBe(1)
+
+    controller.abort()
+    expect(await codeOf(() => waiting)).toBe('ABORTED')
+    expect(live.size).toBe(0)
+  })
+
+  it('drops it as soon as the member it was waiting for is published', async () => {
+    const scene = world()
+    const alice = await spawn(scene, 'Alice')
+    scene.agents.remove(alice.id)
+    const live = trackCreated(scene)
+
+    const waiting = scene.service.wait(scene.leader.agent, { timeoutMs: 5_000 })
+    await sleep(40)
+    expect(live.size).toBe(1)
+
+    scene.agents.add(alice)
+    expect(await waiting).toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
+    expect(live.size).toBe(0)
   })
 
   it('refuses with ABORTED instead of reporting half a roster', async () => {
@@ -992,12 +1163,12 @@ describe('wait', () => {
   it('answers an empty team, and an empty selection, without arming a wait', async () => {
     const scene = world()
     expect(await scene.service.wait(scene.leader.agent))
-      .toEqual({ done: [], busy: [], timedOut: false })
+      .toEqual({ done: [], busy: [], cold: [], timedOut: false })
 
     const alice = await spawn(scene, 'Alice')
     alice.status = 'running'
     expect(await scene.service.wait(scene.leader.agent, { members: [], timeoutMs: 60_000 }))
-      .toEqual({ done: [], busy: [], timedOut: false })
+      .toEqual({ done: [], busy: [], cold: [], timedOut: false })
     expect(alice.idleCalls).toBe(0)
   })
 
@@ -1006,6 +1177,6 @@ describe('wait', () => {
     const alice = await spawn(scene, 'Alice')
 
     expect(await scene.service.wait(scene.leader.agent, { members: ['Alice', 'alice', alice.id] }))
-      .toEqual({ done: ['Alice'], busy: [], timedOut: false })
+      .toEqual({ done: ['Alice'], busy: [], cold: [], timedOut: false })
   })
 })
