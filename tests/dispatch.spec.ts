@@ -54,6 +54,21 @@ describe('PTC-mode result fidelity', () => {
     roundTrip(taskTool(ctx), { task_id: 't1', status: 'done' }, task)
   })
 
+  it('counts one settled task update once when both channels reach the fold', () => {
+    const task = { taskId: 't1', title: 'ship it', status: 'done', assigneeId: 'child-1', note: 'verified' }
+    const tool = taskTool(ctx)
+    const args = { task_id: 't1', status: 'done' }
+    // The same call as both log records: native mode stores `meta`, PTC mode
+    // stores the finalized envelope. Folding both is what a replay of a log
+    // written across a mode change would see, and it MUST NOT grow a row.
+    const both = foldTeam([
+      toolResultEvent(tool.output.presentationMeta?.(args, task), { time: TIME }),
+      dispatch(tool, args, task),
+    ], BOUND)
+    expect(both.tasks).toHaveLength(1)
+    expect(both.tasks[0]).toEqual(task)
+  })
+
   it('uses the resolved recipient, actual message id, and chain depth', () => {
     const view = roundTrip(sendTool(ctx, 'leader'), { to: ' ALICE ', message: 'status?' }, {
       messageId: 'm1', to: 'child-1', name: 'Alice', hop: 0,

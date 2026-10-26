@@ -17,12 +17,17 @@
 
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { appendPluginRecord, pluginRecordOf, SessionId, SessionStore, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
+import { appendPluginRecord, pluginRecordOf, SessionId, SessionStore, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
+import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { describe, expect, it } from 'vitest'
 import type { TeamConfig } from './config.ts'
 import { EMPTY_TEAM_VIEW } from './contract.ts'
 import { foldTeam, TEAM_MEMBER_RECORD, type TeamMemberRecord } from './fold.ts'
 import { TeamService } from './service.ts'
+import { taskTool } from './tools.ts'
 import { toolResultEvent, userMessageEvent, FakeSubagents } from '../tests/harness.ts'
 
 const CONFIG: TeamConfig = {
@@ -199,8 +204,10 @@ describe('the paths that were already durable', () => {
 /**
  * A real session store plus the service built over it: the leader's log is the
  * only state, which is what a browser refresh reads back.
+ * @param seed - committed events to replay into the fresh session, which is how
+ *   a restarted host reads a log it did not write.
  */
-function durableWorld(): {
+function durableWorld(seed?: readonly SessionEvent[]): {
   readonly ctx: Context
   readonly sessions: SessionStore
   readonly service: TeamService
@@ -211,7 +218,7 @@ function durableWorld(): {
   const sessions = new SessionStore(ctx)
   ctx.provide('agents', { get: () => undefined, list: () => [] })
   ctx.provide('subagents', new FakeSubagents())
-  const session = sessions.create(SessionId('leader-1'))
+  const session = sessions.create(SessionId('leader-1'), seed === undefined ? undefined : { seed })
   const leader = {
     id: SessionId('leader-1'),
     status: 'idle',
@@ -313,5 +320,94 @@ describe('through a real session log', () => {
     // so this read is the log rebuild: the same path a restarted host takes.
     expect(service.list(leader).members.map(row => [row.name, row.relation])).toEqual([['Alice', 'peer']])
     expect(log().filter(event => event.ignorable === true)).toHaveLength(1)
+  })
+})
+
+/**
+ * Run one team tool and commit the `tool/result` the agent loop writes for it,
+ * carrying the tool's own `presentationMeta` as `meta`.
+ *
+ * That is exactly the seam the fold reads — `tool/result` → `event.data.meta` →
+ * `readFacts` → `case 'task'` — so the row asserted below comes from what the
+ * TOOL produced, not a hand-written fixture. `ToolRuntime` surfaces the same
+ * meta on its success value (see `tests/dispatch.spec.ts`); the loop is what
+ * commits it alongside the result, and this helper stands in for that commit.
+ * @param session - the leader's real session log.
+ * @param tool - the team tool to execute.
+ * @param args - the tool arguments.
+ * @param agent - the acting leader.
+ * @param callId - the provider call this result answers.
+ * @returns the tool's value, as the model would receive it.
+ */
+async function settleTeamCall(
+  session: Session,
+  tool: ToolDefinition,
+  args: Record<string, unknown>,
+  agent: Agent,
+  callId: string,
+): Promise<JsonValue> {
+  const signal = new AbortController().signal
+  const value = await tool.execute(args, { agent, signal } as never) as JsonValue
+  const meta = tool.output.presentationMeta?.(args, value)
+  session.append('tool/result', {
+    turn: 1,
+    step: 1,
+    message: createToolResultMessage({ callId: ToolCallId(callId), content: [], isError: false }),
+    ...meta === undefined ? {} : { meta: meta as JsonValue },
+  }, { surfaceOp: 'append' })
+  return value
+}
+
+/**
+ * The task list rides the SAME durable half as the roster: `team_task` projects
+ * `{ team: 'task', task }` through `presentationMeta`, the harness records it as
+ * a `tool/result`, and a cold read folds it back. `ctx.emit('team/changed')` is
+ * only the same-process edge; nothing below depends on it.
+ */
+describe('the task list through a real session log', () => {
+  it('keeps a created task because the tool logged a fact, not just a change event', async () => {
+    const { ctx, leader, log } = durableWorld()
+    await settleTeamCall(leader.session, taskTool(ctx), { title: 'ship it' }, leader, 'call-1')
+
+    // The fact is in the committed log, not only in the emitted event.
+    const settled = log().filter(event => event.type === 'tool/result')
+    expect(settled).toHaveLength(1)
+    expect((settled[0]!.data as { meta?: unknown }).meta).toEqual({
+      team: 'task',
+      task: { taskId: 't1', title: 'ship it', status: 'pending' },
+    })
+    // The cold read a refreshed page performs.
+    expect(foldTeam(log(), CONFIG.maxRecentMessages).tasks)
+      .toEqual([{ taskId: 't1', title: 'ship it', status: 'pending' }])
+  })
+
+  it('updates one row in place instead of appending a second row for the same id', async () => {
+    const { ctx, leader, log } = durableWorld()
+    const tool = taskTool(ctx)
+    await settleTeamCall(leader.session, tool, { title: 'ship it' }, leader, 'call-1')
+    await settleTeamCall(leader.session, tool, { task_id: 't1', status: 'done', note: 'merged' }, leader, 'call-2')
+
+    const view = foldTeam(log(), CONFIG.maxRecentMessages)
+    // Two facts, one row: the fold upserts by taskId and the update carried the
+    // whole post-change row, so the title survives a status-only call.
+    expect(view.tasks).toHaveLength(1)
+    expect(view.tasks[0]).toEqual({ taskId: 't1', title: 'ship it', status: 'done', note: 'merged' })
+  })
+
+  it('rebuilds the whole task list on a restarted host, from the log alone', async () => {
+    const first = durableWorld()
+    const tool = taskTool(first.ctx)
+    await settleTeamCall(first.leader.session, tool, { title: 'ship it' }, first.leader, 'call-1')
+    await settleTeamCall(first.leader.session, tool, { title: 'review notes' }, first.leader, 'call-2')
+    await settleTeamCall(first.leader.session, tool, { task_id: 't1', status: 'done' }, first.leader, 'call-3')
+
+    // A restarted host: a fresh store seeded with the committed events, and a
+    // service that never touched this leader, so no in-memory map can produce
+    // the rows below.
+    const restarted = durableWorld(first.log())
+    expect(restarted.service.list(restarted.leader).tasks).toEqual([
+      { taskId: 't1', title: 'ship it', status: 'done' },
+      { taskId: 't2', title: 'review notes', status: 'pending' },
+    ])
   })
 })
